@@ -4,8 +4,21 @@ import matplotlib.pyplot as plt
 
 
 def load_data(file_path):
-    """Load sales data from a CSV file."""
+    """Load and preprocess sales data from a CSV file."""
+    # Define expected columns
+    expected_columns = ['date', 'ASIN', 'Model', 'Brand', 'units_sold']
+    
+    # Load the CSV file
     data = pd.read_csv(file_path)
+    
+    # Select only the first 5 columns if the CSV contains extra columns
+    if len(data.columns) > len(expected_columns):
+        data = data.iloc[:, :len(expected_columns)]
+    
+    # Rename columns to expected names
+    data.columns = expected_columns
+    
+    # Convert 'date' column to datetime
     data['date'] = pd.to_datetime(data['date'], errors='coerce')
     data = data.sort_values(by='date')
     return data
@@ -49,7 +62,7 @@ def forecast_demand_with_events(ts_data, holidays, horizon=52):
         holidays=holidays,
         changepoint_prior_scale=0.1,  # Increased flexibility for trends
         seasonality_prior_scale=5,   # Control seasonality fluctuation
-        holidays_prior_scale=5,      # Reduce over-reliance on holiday peaks
+        holidays_prior_scale=2,      # Reduce over-reliance on holiday peaks
     )
     model.fit(ts_data)
 
@@ -59,25 +72,7 @@ def forecast_demand_with_events(ts_data, holidays, horizon=52):
     # Smooth and clip forecasts
     forecast['yhat'] = forecast['yhat'].clip(lower=0)
     forecast['yhat'] = forecast['yhat'].rolling(window=2, min_periods=1).mean()
-    return forecast
-
-
-
-def revise_event_regressors(data):
-    """Smooth event impacts for better forecasts."""
-    data['Prime_Day'] = ((data['date'].dt.month == 7) & 
-                         (data['date'].dt.isocalendar().week == 29)).astype(float) * 0.3
-    data['Black_Friday'] = ((data['date'].dt.month == 11) & 
-                            (data['date'].dt.isocalendar().week == 47)).astype(float) * 0.4
-    data['Cyber_Monday'] = ((data['date'].dt.month == 12) & 
-                            (data['date'].dt.isocalendar().week == 48)).astype(float) * 0.3
-    data['Christmas'] = ((data['date'].dt.month == 12) & 
-                         (data['date'].dt.isocalendar().week == 51)).astype(float) * 0.2
-
-    # Add tapering for events over multiple weeks
-    data['Event_Taper'] = data[['Prime_Day', 'Black_Friday', 'Cyber_Monday', 'Christmas']].max(axis=1)
-    data['Event_Taper'] = data['Event_Taper'].rolling(window=3, min_periods=1).mean()
-    return data
+    return model, forecast
 
 
 def plot_forecast(ts_data, forecast):
@@ -114,36 +109,28 @@ def main():
     file_path = 'weekly_sales_data.csv'  # Replace with your input file
     asin = 'B0BH7GTY9C'  # Replace with your ASIN
 
-    # Load data and holidays
     data = load_data(file_path)
     holidays = create_holidays_dataframe()
     ts_data = prepare_time_series(data, asin)
 
-    # Add capacity for logistic growth (if applicable)
-    ts_data['cap'] = 2000
-    ts_data['floor'] = 0
-
-    # Forecast with advanced configuration
     forecast_horizon = 52
-    forecast = forecast_demand_with_events(ts_data, holidays, horizon=forecast_horizon)
+    model, forecast = forecast_demand_with_events(ts_data, holidays, horizon=forecast_horizon)
 
-    # Extract product details
-    product_title = data[data['ASIN'] == asin]['Product Title'].iloc[0]
+    product_title = data[data['ASIN'] == asin]['Model'].iloc[0]
     brand = data[data['ASIN'] == asin]['Brand'].iloc[0]
 
-    # Format and save output
     output = format_forecast_output(forecast, asin, product_title, brand)
     output.to_excel('sales_forecast.xlsx', index=False)
     print("Forecast saved to 'sales_forecast.xlsx'")
 
-    # Visualize results
     plot_forecast(ts_data, forecast)
 
-    # Visualize changepoints
-    from prophet.plot import add_changepoints_to_plot
+    # Plot using the Prophet model
     fig = model.plot(forecast)
-    add_changepoints_to_plot(fig.gca(), model, forecast)
+    plt.show()
 
 
 if __name__ == '__main__':
     main()
+
+
