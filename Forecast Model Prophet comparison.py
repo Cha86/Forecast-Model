@@ -62,15 +62,6 @@ def forecast_demand(ts_data, horizon=16):
     return model, forecast
 
 
-def calculate_year_to_year_increase(ts_data):
-    """Calculate year-to-year percentage increase in sales."""
-    ts_data['year'] = ts_data['ds'].dt.year
-    yearly_sales = ts_data.groupby('year')['y'].sum()
-
-    year_to_year_increase = yearly_sales.pct_change().fillna(0) * 100
-    return yearly_sales, year_to_year_increase
-
-
 def format_output_for_display(prophet_forecast, amazon_forecasts, horizon=16):
     """Format output for comparison with clean week labels and forecast values."""
     # Prepare Prophet forecast
@@ -96,7 +87,7 @@ def summarize_historical_data(ts_data):
     return summary_stats
 
 
-def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, yearly_increase, total_forecast_16, total_forecast_8):
+def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8):
     """Visualize historical data, Prophet forecast, and Amazon forecasts with summary."""
     fig, ax = plt.subplots(figsize=(16, 12))
 
@@ -134,8 +125,6 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, yearl
         f"Min: {summary_stats['min']:.0f}\n"
         f"Max: {summary_stats['max']:.0f}\n"
         f"Mean: {summary_stats['mean']:.0f}\n\n"
-        f"Year-to-Year % Increase:\n"
-        f"{yearly_increase.round(2).to_string()}\n\n"
         f"Total Forecast (16 Weeks): {total_forecast_16:.0f}\n"
         f"Total Forecast (8 Weeks): {total_forecast_8:.0f}"
     )
@@ -159,7 +148,6 @@ def main():
     model, forecast = forecast_demand(ts_data, horizon=16)
 
     # Summarize forecast and historical data
-    yearly_sales, yearly_increase = calculate_year_to_year_increase(ts_data)
     summary_stats = summarize_historical_data(ts_data)
     comparison = format_output_for_display(forecast, amazon_forecasts, horizon=16)
 
@@ -172,7 +160,7 @@ def main():
     print("Comparison and summary saved to 'forecast_comparison_summary.xlsx'")
 
     # Visualize results
-    visualize_forecast_with_comparison(ts_data, comparison, summary_stats, yearly_increase, total_forecast_16, total_forecast_8)
+    visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8)
 
 
 if __name__ == '__main__':
