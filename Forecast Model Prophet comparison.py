@@ -1,37 +1,86 @@
 import pandas as pd
+import numpy as np
 from prophet import Prophet
 import matplotlib.pyplot as plt
+import warnings
+import os
+
+warnings.filterwarnings("ignore")  # Ignore warnings for cleaner output
 
 
 def load_data(file_path):
     """Load and preprocess sales data from an Excel file."""
-    expected_columns = ['date', 'ASIN', 'Model', 'Brand', 'units_sold']
+    required_columns = ['date', 'ASIN', 'units_sold']
+    optional_columns = ['Model', 'Brand', 'price', 'promotion']
     data = pd.read_excel(file_path)
 
-    if len(data.columns) > len(expected_columns):
-        data = data.iloc[:, :len(expected_columns)]
+    missing_required = [col for col in required_columns if col not in data.columns]
+    if missing_required:
+        raise ValueError(f"Missing required columns: {missing_required}")
 
-    data.columns = expected_columns
+    present_optional_columns = [col for col in optional_columns if col in data.columns]
+    data = data[required_columns + present_optional_columns]
     data['date'] = pd.to_datetime(data['date'], errors='coerce')
     data = data.sort_values(by='date')
     return data
 
 
-def load_amazon_forecasts(file_path):
-    """Load and clean Amazon forecast data."""
-    raw_forecasts = pd.read_excel(file_path, sheet_name=None)  # Read all sheets
-    cleaned_forecasts = {}
+def load_amazon_forecasts_from_folder(folder_path, asin):
+    """Load Amazon forecast data from multiple Excel files in a folder."""
+    forecast_data = {}
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith('.xlsx'):
+            forecast_type = os.path.splitext(file_name)[0]  # File name without extension
+            forecast_type = forecast_type.replace('_', ' ').title()
 
-    for sheet_name, df in raw_forecasts.items():
-        if 'ASIN' in df.columns:
-            # Transpose and format horizontally oriented data
-            df_cleaned = df.set_index(['ASIN', 'Model', 'Brand']).T.reset_index()
-            df_cleaned.rename(columns={'index': 'Week'}, inplace=True)
-            df_cleaned = df_cleaned.reset_index(drop=True)  # Ensure proper index for slicing
-            cleaned_forecasts[sheet_name] = df_cleaned
-        else:
-            print(f"Unexpected format in sheet: {sheet_name}")
-    return cleaned_forecasts
+            file_path = os.path.join(folder_path, file_name)
+            df = pd.read_excel(file_path)
+
+            df.columns = df.columns.str.strip().str.upper()
+
+            if 'ASIN' not in df.columns:
+                print(f"Error: Column 'ASIN' not found in {file_name}")
+                continue
+
+            asin_row = df[df['ASIN'].str.upper() == asin.upper()]
+            if asin_row.empty:
+                print(f"Warning: ASIN {asin} not found in {file_name}")
+                continue
+
+            week_columns = [col for col in df.columns if 'WEEK' in col.upper()]
+            if not week_columns:
+                print(f"Warning: No week columns found in {file_name}")
+                continue
+
+            forecast_values = asin_row.iloc[0][week_columns].astype(str).str.replace(',', '').astype(float).values
+            forecast_data[forecast_type] = forecast_values
+
+    return forecast_data
+
+
+def get_holidays():
+    """Create a DataFrame of holidays."""
+    holidays_list = [
+        ('New Year\'s Day', '2023-01-01'),
+        ('Prime Day', '2023-07-16'),
+        ('Prime Day', '2023-07-17'),
+        ('Thanksgiving', '2023-11-23'),
+        ('Black Friday', '2023-11-24'),
+        ('Cyber Monday', '2023-11-27'),
+        ('Christmas', '2023-12-25'),
+        ('New Year\'s Day', '2024-01-01'),
+        ('Prime Day', '2024-07-16'),
+        ('Prime Day', '2024-07-17'),
+        ('Thanksgiving', '2024-11-28'),
+        ('Black Friday', '2024-11-29'),
+        ('Cyber Monday', '2024-12-02'),
+        ('Christmas', '2024-12-25')
+    ]
+    holidays = pd.DataFrame(holidays_list, columns=['holiday', 'ds'])
+    holidays['ds'] = pd.to_datetime(holidays['ds'])
+    holidays['lower_window'] = 0
+    holidays['upper_window'] = 1
+    return holidays
 
 
 def prepare_time_series(data, asin):
@@ -46,39 +95,31 @@ def prepare_time_series(data, asin):
 
 
 def forecast_demand(ts_data, horizon=16):
-    """Forecast demand using Prophet."""
+    """Forecast demand using Prophet with holiday effects."""
+    holidays = get_holidays()
+
     model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
         seasonality_mode='multiplicative',
-        changepoint_prior_scale=0.1,
-        seasonality_prior_scale=5
+        changepoint_prior_scale=0.2,
+        seasonality_prior_scale=10,
+        holidays=holidays
     )
+
+    model.add_seasonality(name='monthly', period=30.5, fourier_order=5)
+    model.add_seasonality(name='yearly', period=365.25, fourier_order=10)
+
     model.fit(ts_data)
 
     future = model.make_future_dataframe(periods=horizon, freq='W')
+
     forecast = model.predict(future)
     forecast['yhat'] = forecast['yhat'].clip(lower=0)
-    return model, forecast
+    forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
+    mean_forecast = forecast[['ds', 'Prophet Forecast']]
 
-
-def format_output_for_display(prophet_forecast, amazon_forecasts, horizon=16):
-    """Format output for comparison with clean week labels and forecast values."""
-    # Prepare Prophet forecast
-    prophet_forecast_horizon = prophet_forecast.iloc[-horizon:].copy()
-    prophet_forecast_horizon['yhat'] = prophet_forecast_horizon['yhat'].round().astype(int)
-    prophet_forecast_horizon = prophet_forecast_horizon[['ds', 'yhat']].rename(columns={'yhat': 'Prophet Forecast'})
-
-    # Add week labels
-    prophet_forecast_horizon['Week'] = [f"Week {i}" for i in range(len(prophet_forecast_horizon))]
-
-    # Prepare Amazon forecasts
-    comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast']].copy()
-    for sheet_name, df in amazon_forecasts.items():
-        amazon_values = df.iloc[:horizon, 1:].mean(axis=1).round().astype(int).values
-        comparison[sheet_name] = amazon_values
-
-    return comparison
+    return mean_forecast
 
 
 def summarize_historical_data(ts_data):
@@ -87,31 +128,50 @@ def summarize_historical_data(ts_data):
     return summary_stats
 
 
+def format_output_for_display(mean_forecast, forecast_data, horizon=16):
+    """Format output for comparison using dynamically loaded forecasts."""
+    prophet_forecast_horizon = mean_forecast.iloc[-horizon:].copy()
+    prophet_forecast_horizon = prophet_forecast_horizon.reset_index(drop=True)
+    prophet_forecast_horizon['Week'] = 'Week ' + prophet_forecast_horizon.index.astype(str)
+    comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast']]
+
+    for forecast_type, values in forecast_data.items():
+        values = values[:horizon]
+        forecast_df = pd.DataFrame({
+            'Week': ['Week ' + str(i) for i in range(len(values))],
+            f'Amazon {forecast_type}': values
+        })
+        comparison = comparison.merge(forecast_df, on='Week', how='left')
+
+    comparison.fillna(0, inplace=True)
+    comparison = comparison.round(1)
+    return comparison
+
+
 def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8):
     """Visualize historical data, Prophet forecast, and Amazon forecasts with summary."""
     fig, ax = plt.subplots(figsize=(16, 12))
 
-    # Plot historical data
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
 
-    # Plot Prophet forecast
     ax.plot(
-        comparison['ds'], 
-        comparison['Prophet Forecast'], 
-        label='Prophet Forecast', 
-        marker='o', 
-        linestyle='--', 
-        color='blue'
+        comparison['ds'],
+        comparison['Prophet Forecast'],
+        label='Prophet Forecast',
+        linestyle='--',
+        color='blue',
+        marker='o'
     )
 
-    # Plot Amazon forecasts for all datasets
-    for column in comparison.columns[3:]:
-        ax.plot(
-            comparison['ds'], 
-            comparison[column], 
-            label=f'{column}', 
-            linestyle='--'
-        )
+    for col in comparison.columns:
+        if col.startswith('Amazon '):
+            ax.plot(
+                comparison['ds'],
+                comparison[col],
+                label=col,
+                linestyle=':',
+                marker='x'
+            )
 
     ax.set_title('Sales Forecast Comparison')
     ax.set_xlabel('Date')
@@ -119,7 +179,6 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
     ax.legend()
     ax.grid()
 
-    # Add summary on the upper left
     summary_text = (
         f"Historical Summary:\n"
         f"Min: {summary_stats['min']:.0f}\n"
@@ -128,46 +187,42 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
         f"Total Forecast (16 Weeks): {total_forecast_16:.0f}\n"
         f"Total Forecast (8 Weeks): {total_forecast_8:.0f}"
     )
-    plt.gcf().text(0.1, 0.7, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
+    plt.gcf().text(0.02, 0.95, summary_text, fontsize=10, verticalalignment='top',
+                   bbox=dict(facecolor='white', alpha=0.8))
 
     plt.tight_layout()
     plt.show()
 
 
 def main():
+    folder_path = 'forecasts_folder'
     file_path = 'weekly_sales_data.xlsx'
-    amazon_forecast_path = 'amazon_forecasts.xlsx'
     asin = 'B091HTG6DQ'
 
-    # Load datasets
     data = load_data(file_path)
-    amazon_forecasts = load_amazon_forecasts(amazon_forecast_path)
-    
-    # Prepare data and forecast
+    forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series(data, asin)
-    model, forecast = forecast_demand(ts_data, horizon=16)
+    mean_forecast = forecast_demand(ts_data, horizon=16)
 
-    # Summarize forecast and historical data
     summary_stats = summarize_historical_data(ts_data)
-    comparison = format_output_for_display(forecast, amazon_forecasts, horizon=16)
 
-    # Calculate forecast totals
-    total_forecast_16 = comparison['Prophet Forecast'].iloc[:16].sum()
+    comparison = format_output_for_display(mean_forecast, forecast_data, horizon=16)
+
+    total_forecast_16 = comparison['Prophet Forecast'].sum()
     total_forecast_8 = comparison['Prophet Forecast'].iloc[:8].sum()
 
-    # Save results
-    comparison.to_excel('forecast_comparison_summary.xlsx', index=False)
-    print("Comparison and summary saved to 'forecast_comparison_summary.xlsx'")
+    print("Comparison DataFrame:")
+    print(comparison.head(16))
 
-    # Visualize results
+    output_file_path = os.path.abspath('forecast_comparison_summary.xlsx')
+    comparison.to_excel(output_file_path, index=False)
+    print(f"Comparison and summary saved to '{output_file_path}'")
+
     visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8)
 
 
 if __name__ == '__main__':
     main()
-
-
-
 
 
 
