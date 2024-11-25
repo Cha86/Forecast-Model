@@ -4,6 +4,10 @@ from prophet import Prophet
 import matplotlib.pyplot as plt
 import warnings
 import os
+import json
+from prophet.diagnostics import cross_validation, performance_metrics
+from prophet.plot import plot_cross_validation_metric
+from prophet.serialize import model_to_json, model_from_json
 
 warnings.filterwarnings("ignore")  # Ignore warnings for cleaner output
 
@@ -68,35 +72,36 @@ def prepare_time_series(data, asin):
     return ts_data
 
 
-def get_holidays():
-    """Create a DataFrame of holidays excluding specified ones."""
+def get_shifted_holidays():
+    """Create a DataFrame of holidays shifted two weeks earlier."""
     holidays_list = [
-        ('New Year\'s Day', '2023-01-01'),
-        ('Prime Day', '2023-07-16'),
-        ('Prime Day', '2023-07-17'),
-        ('Thanksgiving', '2023-11-23'),
-        ('Black Friday', '2023-11-24'),
-        ('Cyber Monday', '2023-11-27'),
-        ('Christmas', '2023-12-25'),
-        ('New Year\'s Day', '2024-01-01'),
-        ('Prime Day', '2024-07-16'),
-        ('Prime Day', '2024-07-17'),
-        ('Thanksgiving', '2024-11-28'),
-        ('Black Friday', '2024-11-29'),
-        ('Cyber Monday', '2024-12-02'),
-        ('Christmas', '2024-12-25')
+        # Shifted holidays for pre-event stocking
+        ('Prime Day', '2023-06-27'),
+        ('Prime Day', '2023-06-28'),
+        ('Black Friday', '2023-11-10'),
+        ('Cyber Monday', '2023-11-13'),
+        ('Christmas', '2023-12-11'),
+        ('Prime Day', '2024-07-02'),
+        ('Prime Day', '2024-07-03'),
+        ('Black Friday', '2024-11-15'),
+        ('Cyber Monday', '2024-11-18'),
+        ('Christmas', '2024-12-09'),
+        # Estimated shifted dates for 2025
+        ('Prime Day', '2025-07-01'),
+        ('Prime Day', '2025-07-02'),
+        ('Black Friday', '2025-11-14'),
+        ('Cyber Monday', '2025-11-17'),
+        ('Christmas', '2025-12-10'),
     ]
     holidays = pd.DataFrame(holidays_list, columns=['holiday', 'ds'])
     holidays['ds'] = pd.to_datetime(holidays['ds'])
-    holidays['lower_window'] = 0
-    holidays['upper_window'] = 1
     return holidays
 
 
-def forecast_demand_with_holidays(ts_data, forecast_data, horizon=48):
-    """Forecast demand using Prophet with holiday effects and Amazon forecasts as regressors."""
-    # Create the future dataframe
-    future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
+def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=52):
+    """Forecast demand using Prophet with custom sales increase on Prime Days."""
+    # Create the future dataframe with week starting on Sunday
+    future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W-SUN')
     future = pd.DataFrame({'ds': future_dates})
 
     # Combine historical and future data
@@ -112,42 +117,67 @@ def forecast_demand_with_holidays(ts_data, forecast_data, horizon=48):
     regressor_cols = [col for col in combined_df.columns if col.startswith('Amazon_')]
     combined_df[regressor_cols] = combined_df[regressor_cols].fillna(0)
 
+    # Get the shifted holidays
+    holidays = get_shifted_holidays()
+
+    # Get the week start dates for 'Prime Day' holidays
+    prime_day_dates = holidays[holidays['holiday'] == 'Prime Day']['ds']
+    prime_day_weeks = prime_day_dates.dt.to_period('W-SUN').start_time.unique()
+
+    # Set 'prime_day' regressor to 0.275 for the weeks containing 'Prime Day' dates
+    combined_df['prime_day'] = combined_df['ds'].apply(
+        lambda x: 0.275 if x in prime_day_weeks else 0
+    )
+
     # Split back into train and future data
     train_df = combined_df[~combined_df['y'].isna()].copy()
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
 
-    holidays = get_holidays()
     model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
         seasonality_mode='multiplicative',
         holidays=holidays,
         changepoint_prior_scale=0.1,
-        seasonality_prior_scale=20
+        seasonality_prior_scale=20,
+        holidays_prior_scale=10
     )
 
     # Add regressors to the model
-    for regressor in regressor_cols:
-        model.add_regressor(regressor)
+    for regressor in regressor_cols + ['prime_day']:
+        model.add_regressor(regressor, mode='multiplicative')
 
     # Fit the model
     model.fit(train_df)
 
+    # Cross-validation
+    df_cv = cross_validation(model, initial='365 days', period='90 days', horizon='180 days')
+    df_p = performance_metrics(df_cv)
+    print("Performance Metrics:")
+    print(df_p.head())
+    
+    # Plot cross-validation metrics
+    fig = plot_cross_validation_metric(df_cv, metric='mape')
+    plt.show()
+    
     # Predict future
     forecast = model.predict(future_df)
-
+    
+    # Plot forecast components
+    fig = model.plot_components(forecast)
+    plt.show()
+    
+    # Save the model
+    with open('model.json', 'w') as fout:
+        json.dump(model_to_json(model), fout)
+    
     # Prepare the forecast dataframe
     forecast['Prophet Forecast'] = forecast['yhat'].clip(lower=0).round().astype(int)
     mean_forecast = forecast[['ds', 'Prophet Forecast']]
-
-    # Optional: Plot the model components
-    model.plot_components(forecast)
-    plt.show()
-
     return mean_forecast
 
 
-def format_output_with_folder(mean_forecast, forecast_data, horizon=48):
+def format_output_with_folder(mean_forecast, forecast_data, horizon=52):
     """Format output for comparison using dynamically loaded forecasts."""
     prophet_forecast_horizon = mean_forecast.iloc[:horizon].copy()
     prophet_forecast_horizon = prophet_forecast_horizon.reset_index(drop=True)
@@ -190,7 +220,7 @@ def visualize_forecast_with_comparison(ts_data, comparison):
                 marker='x'
             )
 
-    ax.set_title('Sales Forecast with Holidays and Amazon Forecasts')
+    ax.set_title('Sales Forecast with Custom Prime Day Increase')
     ax.set_xlabel('Date')
     ax.set_ylabel('Units Sold')
     ax.legend()
@@ -207,9 +237,9 @@ def main():
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series(data, asin)
-    mean_forecast = forecast_demand_with_holidays(ts_data, forecast_data, horizon=48)
+    mean_forecast = forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=52)
 
-    comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=48)
+    comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=52)
     print("Comparison DataFrame:")
     print(comparison)
 
@@ -222,3 +252,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
