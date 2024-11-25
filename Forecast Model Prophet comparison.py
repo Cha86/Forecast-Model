@@ -4,10 +4,6 @@ from prophet import Prophet
 import matplotlib.pyplot as plt
 import warnings
 import os
-import json
-from prophet.diagnostics import cross_validation, performance_metrics
-from prophet.plot import plot_cross_validation_metric
-from prophet.serialize import model_to_json, model_from_json
 
 warnings.filterwarnings("ignore")  # Ignore warnings for cleaner output
 
@@ -98,10 +94,10 @@ def get_shifted_holidays():
     return holidays
 
 
-def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=52):
+def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=48):
     """Forecast demand using Prophet with custom sales increase on Prime Days."""
-    # Create the future dataframe with week starting on Sunday
-    future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W-SUN')
+    # Create the future dataframe
+    future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
     # Combine historical and future data
@@ -109,24 +105,21 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=52):
 
     # Add Amazon forecasts as regressors for future dates
     for forecast_type, values in forecast_data.items():
-        values = values[:horizon]
-        regressor_values = np.concatenate([np.full(len(ts_data), np.nan), values])
-        combined_df[f'Amazon_{forecast_type}'] = regressor_values
+        # Create an extended array matching the length of combined_df
+        extended_values = np.concatenate(
+            [np.full(len(ts_data), np.nan), values[:horizon], np.full(horizon - len(values), values[-1] if len(values) > 0 else 0)]
+        )
+        extended_values = extended_values[:len(combined_df)]  # Ensure no overflow
+        combined_df[f'Amazon_{forecast_type}'] = extended_values
 
     # Fill missing values in regressors
     regressor_cols = [col for col in combined_df.columns if col.startswith('Amazon_')]
     combined_df[regressor_cols] = combined_df[regressor_cols].fillna(0)
 
-    # Get the shifted holidays
+    # Add a custom regressor for Prime Day with a 25-30% increase
     holidays = get_shifted_holidays()
-
-    # Get the week start dates for 'Prime Day' holidays
-    prime_day_dates = holidays[holidays['holiday'] == 'Prime Day']['ds']
-    prime_day_weeks = prime_day_dates.dt.to_period('W-SUN').start_time.unique()
-
-    # Set 'prime_day' regressor to 0.275 for the weeks containing 'Prime Day' dates
     combined_df['prime_day'] = combined_df['ds'].apply(
-        lambda x: 0.275 if x in prime_day_weeks else 0
+        lambda x: 0.275 if x in holidays[holidays['holiday'] == 'Prime Day']['ds'].values else 0
     )
 
     # Split back into train and future data
@@ -138,9 +131,8 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=52):
         weekly_seasonality=True,
         seasonality_mode='multiplicative',
         holidays=holidays,
-        changepoint_prior_scale=0.1,
-        seasonality_prior_scale=20,
-        holidays_prior_scale=10
+        changepoint_prior_scale=0.17,
+        seasonality_prior_scale=4.5
     )
 
     # Add regressors to the model
@@ -150,34 +142,21 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=52):
     # Fit the model
     model.fit(train_df)
 
-    # Cross-validation
-    df_cv = cross_validation(model, initial='365 days', period='90 days', horizon='180 days')
-    df_p = performance_metrics(df_cv)
-    print("Performance Metrics:")
-    print(df_p.head())
-    
-    # Plot cross-validation metrics
-    fig = plot_cross_validation_metric(df_cv, metric='mape')
-    plt.show()
-    
     # Predict future
     forecast = model.predict(future_df)
-    
-    # Plot forecast components
-    fig = model.plot_components(forecast)
-    plt.show()
-    
-    # Save the model
-    with open('model.json', 'w') as fout:
-        json.dump(model_to_json(model), fout)
-    
+
     # Prepare the forecast dataframe
     forecast['Prophet Forecast'] = forecast['yhat'].clip(lower=0).round().astype(int)
-    mean_forecast = forecast[['ds', 'Prophet Forecast']]
+    mean_forecast = forecast[['ds', 'Prophet Forecast']][:horizon]  # Restrict to week 47 (48 weeks total)
+
+    # Optional: Plot the model components
+    model.plot_components(forecast)
+    plt.show()
+
     return mean_forecast
 
 
-def format_output_with_folder(mean_forecast, forecast_data, horizon=52):
+def format_output_with_folder(mean_forecast, forecast_data, horizon=48):
     """Format output for comparison using dynamically loaded forecasts."""
     prophet_forecast_horizon = mean_forecast.iloc[:horizon].copy()
     prophet_forecast_horizon = prophet_forecast_horizon.reset_index(drop=True)
@@ -193,6 +172,7 @@ def format_output_with_folder(mean_forecast, forecast_data, horizon=52):
         comparison = comparison.merge(forecast_df, on='Week', how='left')
 
     comparison.fillna(0, inplace=True)
+    comparison.iloc[:, 3:] = comparison.iloc[:, 3:].astype(int)  # Ensure all sales are integers
     return comparison
 
 
@@ -237,9 +217,9 @@ def main():
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series(data, asin)
-    mean_forecast = forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=52)
+    mean_forecast = forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=48)
 
-    comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=52)
+    comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=48)
     print("Comparison DataFrame:")
     print(comparison)
 
@@ -252,5 +232,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
