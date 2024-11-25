@@ -7,21 +7,21 @@ import os
 
 warnings.filterwarnings("ignore")  # Ignore warnings for cleaner output
 
+
 def load_data(file_path):
     """Load and preprocess sales data from an Excel file."""
     required_columns = ['date', 'ASIN', 'units_sold']
-    optional_columns = ['Model', 'Brand', 'price', 'promotion']
     data = pd.read_excel(file_path)
 
     missing_required = [col for col in required_columns if col not in data.columns]
     if missing_required:
         raise ValueError(f"Missing required columns: {missing_required}")
 
-    present_optional_columns = [col for col in optional_columns if col in data.columns]
-    data = data[required_columns + present_optional_columns]
+    data = data[required_columns]
     data['date'] = pd.to_datetime(data['date'], errors='coerce')
     data = data.sort_values(by='date')
     return data
+
 
 def load_amazon_forecasts_from_folder(folder_path, asin):
     """Load Amazon forecast data from multiple Excel files in a folder."""
@@ -60,47 +60,70 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
 
     return forecast_data
 
+
 def prepare_time_series(data, asin):
     """Prepare time series data for Prophet."""
     ts_data = data[data['ASIN'] == asin].rename(columns={'date': 'ds', 'units_sold': 'y'})
     ts_data['y'] = ts_data['y'].interpolate().bfill().clip(lower=0)
     return ts_data
 
-def forecast_demand_with_amazon(ts_data, forecast_data, horizon=52):
-    """Forecast demand using Prophet with Amazon forecasts as regressors."""
+
+def get_holidays():
+    """Create a DataFrame of holidays excluding specified ones."""
+    holidays_list = [
+        ('New Year\'s Day', '2023-01-01'),
+        ('Prime Day', '2023-07-16'),
+        ('Prime Day', '2023-07-17'),
+        ('Thanksgiving', '2023-11-23'),
+        ('Black Friday', '2023-11-24'),
+        ('Cyber Monday', '2023-11-27'),
+        ('Christmas', '2023-12-25'),
+        ('New Year\'s Day', '2024-01-01'),
+        ('Prime Day', '2024-07-16'),
+        ('Prime Day', '2024-07-17'),
+        ('Thanksgiving', '2024-11-28'),
+        ('Black Friday', '2024-11-29'),
+        ('Cyber Monday', '2024-12-02'),
+        ('Christmas', '2024-12-25')
+    ]
+    holidays = pd.DataFrame(holidays_list, columns=['holiday', 'ds'])
+    holidays['ds'] = pd.to_datetime(holidays['ds'])
+    holidays['lower_window'] = 0
+    holidays['upper_window'] = 1
+    return holidays
+
+
+def forecast_demand_with_holidays(ts_data, forecast_data, horizon=48):
+    """Forecast demand using Prophet with holiday effects and Amazon forecasts as regressors."""
     # Create the future dataframe
-    future = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
-    future = pd.DataFrame({'ds': future})
+    future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
+    future = pd.DataFrame({'ds': future_dates})
 
     # Combine historical and future data
-    combined_df = pd.concat([ts_data[['ds', 'y']], future], ignore_index=True)
+    combined_df = pd.concat([ts_data, future], ignore_index=True)
 
-    # Add Amazon forecasts as regressors
+    # Add Amazon forecasts as regressors for future dates
     for forecast_type, values in forecast_data.items():
-        # Ensure the values array matches the combined_df length
-        full_values = np.concatenate([np.full(len(ts_data), np.nan), values])
-        if len(full_values) < len(combined_df):
-            full_values = np.append(full_values, [np.nan] * (len(combined_df) - len(full_values)))
-        elif len(full_values) > len(combined_df):
-            full_values = full_values[:len(combined_df)]
+        values = values[:horizon]
+        regressor_values = np.concatenate([np.full(len(ts_data), np.nan), values])
+        combined_df[f'Amazon_{forecast_type}'] = regressor_values
 
-        combined_df[f'Amazon_{forecast_type}'] = full_values
-
-    # Fill missing regressor values in historical data
+    # Fill missing values in regressors
     regressor_cols = [col for col in combined_df.columns if col.startswith('Amazon_')]
-    combined_df[regressor_cols] = combined_df[regressor_cols].fillna(method='ffill').fillna(0)
+    combined_df[regressor_cols] = combined_df[regressor_cols].fillna(0)
 
     # Split back into train and future data
     train_df = combined_df[~combined_df['y'].isna()].copy()
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
 
-    # Initialize Prophet model
+    holidays = get_holidays()
     model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
         seasonality_mode='multiplicative',
-        changepoint_prior_scale=0.2,
-        seasonality_prior_scale=10
+        holidays=holidays,
+        changepoint_prior_scale=0.1,
+        seasonality_prior_scale=20
     )
 
     # Add regressors to the model
@@ -117,10 +140,14 @@ def forecast_demand_with_amazon(ts_data, forecast_data, horizon=52):
     forecast['Prophet Forecast'] = forecast['yhat'].clip(lower=0).round().astype(int)
     mean_forecast = forecast[['ds', 'Prophet Forecast']]
 
+    # Optional: Plot the model components
+    model.plot_components(forecast)
+    plt.show()
+
     return mean_forecast
 
 
-def format_output_with_folder(mean_forecast, forecast_data, horizon=52):
+def format_output_with_folder(mean_forecast, forecast_data, horizon=48):
     """Format output for comparison using dynamically loaded forecasts."""
     prophet_forecast_horizon = mean_forecast.iloc[:horizon].copy()
     prophet_forecast_horizon = prophet_forecast_horizon.reset_index(drop=True)
@@ -137,6 +164,7 @@ def format_output_with_folder(mean_forecast, forecast_data, horizon=52):
 
     comparison.fillna(0, inplace=True)
     return comparison
+
 
 def visualize_forecast_with_comparison(ts_data, comparison):
     """Visualize historical data, Prophet forecast, and Amazon forecasts."""
@@ -162,13 +190,14 @@ def visualize_forecast_with_comparison(ts_data, comparison):
                 marker='x'
             )
 
-    ax.set_title('Sales Forecast Comparison')
+    ax.set_title('Sales Forecast with Holidays and Amazon Forecasts')
     ax.set_xlabel('Date')
     ax.set_ylabel('Units Sold')
     ax.legend()
     ax.grid()
     plt.tight_layout()
     plt.show()
+
 
 def main():
     folder_path = 'forecasts_folder'
@@ -178,9 +207,9 @@ def main():
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series(data, asin)
-    mean_forecast = forecast_demand_with_amazon(ts_data, forecast_data, horizon=52)
+    mean_forecast = forecast_demand_with_holidays(ts_data, forecast_data, horizon=48)
 
-    comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=52)
+    comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=48)
     print("Comparison DataFrame:")
     print(comparison)
 
@@ -190,9 +219,6 @@ def main():
 
     visualize_forecast_with_comparison(ts_data, comparison)
 
+
 if __name__ == '__main__':
     main()
-
-
-
-
