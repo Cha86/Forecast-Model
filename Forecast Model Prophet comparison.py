@@ -97,7 +97,7 @@ def get_shifted_holidays():
 
 
 def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
-    """Forecast demand using Prophet with custom sales increase on Prime Days and lag effects."""
+    """Forecast demand using Prophet and align with P70."""
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
@@ -123,7 +123,6 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
         lambda x: 0.2 if x in holidays[holidays['holiday'] == 'Prime Day']['ds'].values else 0
     )
 
-    # Handle lag values for future rows
     last_lag_value = ts_data['y'].iloc[-1] if not ts_data.empty else 0
     combined_df['lag_1_week'] = combined_df['lag_1_week'].fillna(last_lag_value)
 
@@ -137,8 +136,7 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
         holidays=holidays,
         changepoint_prior_scale=0.17,
         seasonality_prior_scale=4.5,
-        holidays_prior_scale=15,  # Adjusted for holiday effects
-        interval_width=0.9        # For quantile alignment
+        holidays_prior_scale=15
     )
 
     for regressor in regressor_cols + ['prime_day', 'lag_1_week']:
@@ -148,22 +146,22 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
 
     forecast = model.predict(future_df)
 
-    # Add quantile outputs
-    forecast['Prophet Forecast'] = forecast['yhat'].clip(lower=0).round().astype(int)
-    forecast['P10'] = forecast['yhat_lower']
-    forecast['P90'] = forecast['yhat_upper']
-    mean_forecast = forecast[['ds', 'Prophet Forecast', 'P10', 'P90']][:horizon]
+    # Adjust forecast to P70
+    forecast['Prophet Forecast'] = (
+        0.9 * forecast['yhat_upper'] + 0.1 * forecast['yhat']
+    ).clip(lower=0).round().astype(int)
+
+    mean_forecast = forecast[['ds', 'Prophet Forecast']][:horizon]
 
     return mean_forecast
-
 
 
 def format_output_with_folder(mean_forecast, forecast_data, horizon=20):
     """Format output for comparison using dynamically loaded forecasts."""
     prophet_forecast_horizon = mean_forecast.iloc[:horizon].copy()
-    prophet_forecast_horizon = prophet_forecast_horizon.reset_index(drop=True)
+
     prophet_forecast_horizon['Week'] = 'Week ' + prophet_forecast_horizon.index.astype(str)
-    comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast', 'P10', 'P90']]
+    comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast']]
 
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
@@ -176,6 +174,8 @@ def format_output_with_folder(mean_forecast, forecast_data, horizon=20):
     comparison.fillna(0, inplace=True)
     comparison.iloc[:, 3:] = comparison.iloc[:, 3:].astype(int)
     return comparison.iloc[:horizon]
+
+
 
 
 def visualize_forecast_with_comparison(ts_data, comparison):
