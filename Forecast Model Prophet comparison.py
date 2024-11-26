@@ -179,15 +179,11 @@ def calculate_summary_statistics(ts_data, forecast_df, horizon):
     return summary_stats, total_forecast_16, total_forecast_8, max_forecast, min_forecast, max_week, min_week
 
 
-
 def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, max_forecast, min_forecast, max_week, min_week):
     """Visualize historical data, Prophet forecast, and Amazon forecasts with summary."""
     fig, ax = plt.subplots(figsize=(16, 12))
 
-    # Plot historical data
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
-
-    # Plot Prophet forecast
     ax.plot(
         comparison['ds'], 
         comparison['Prophet Forecast'], 
@@ -197,7 +193,6 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
         color='blue'
     )
 
-    # Plot Amazon forecasts
     for column in comparison.columns[3:]:
         ax.plot(
             comparison['ds'], 
@@ -212,7 +207,6 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
     ax.legend()
     ax.grid()
 
-    # Add summary on the upper left
     summary_text = (
         f"Historical Summary:\n"
         f"Range: {summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}\n"
@@ -229,15 +223,14 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
         f"Min Forecast: {min_forecast:.0f} (Week of {min_week.strftime('%Y-%m-%d')})"
     )
     plt.gcf().text(0.1, 0.7, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
-
     plt.tight_layout()
     plt.show()
 
 
 def main():
-    folder_path = 'forecasts_folder'
+    folder_path = 'forecasts_folder2'
     file_path = 'weekly_sales_data.xlsx'
-    asin = 'B091HTG6DQ'
+    asin = 'B08KGVH7YC'
 
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
@@ -259,4 +252,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
