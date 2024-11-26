@@ -61,10 +61,19 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
     return forecast_data
 
 
-def prepare_time_series(data, asin):
-    """Prepare time series data for Prophet."""
+def add_lag_features(ts_data, lag_weeks=1):
+    """Add lag-based regressor features."""
+    ts_data = ts_data.copy()
+    ts_data[f'lag_{lag_weeks}_week'] = ts_data['y'].shift(lag_weeks)
+    ts_data[f'lag_{lag_weeks}_week'].fillna(0, inplace=True)  # Replace NaN with 0
+    return ts_data
+
+
+def prepare_time_series_with_lags(data, asin, lag_weeks=1):
+    """Prepare time series data for Prophet with lag features."""
     ts_data = data[data['ASIN'] == asin].rename(columns={'date': 'ds', 'units_sold': 'y'})
     ts_data['y'] = ts_data['y'].interpolate().bfill().clip(lower=0)
+    ts_data = add_lag_features(ts_data, lag_weeks)
     return ts_data
 
 
@@ -88,7 +97,7 @@ def get_shifted_holidays():
 
 
 def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
-    """Forecast demand using Prophet with custom sales increase on Prime Days."""
+    """Forecast demand using Prophet with custom sales increase on Prime Days and lag effects."""
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
@@ -114,6 +123,10 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
         lambda x: 0.2 if x in holidays[holidays['holiday'] == 'Prime Day']['ds'].values else 0
     )
 
+    # Handle lag values for future rows
+    last_lag_value = ts_data['y'].iloc[-1] if not ts_data.empty else 0
+    combined_df['lag_1_week'] = combined_df['lag_1_week'].fillna(last_lag_value)
+
     train_df = combined_df[~combined_df['y'].isna()].copy()
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
 
@@ -123,20 +136,26 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
         seasonality_mode='multiplicative',
         holidays=holidays,
         changepoint_prior_scale=0.17,
-        seasonality_prior_scale=4.5
+        seasonality_prior_scale=4.5,
+        holidays_prior_scale=15,  # Adjusted for holiday effects
+        interval_width=0.9        # For quantile alignment
     )
 
-    for regressor in regressor_cols + ['prime_day']:
+    for regressor in regressor_cols + ['prime_day', 'lag_1_week']:
         model.add_regressor(regressor, mode='multiplicative')
 
     model.fit(train_df)
 
     forecast = model.predict(future_df)
 
+    # Add quantile outputs
     forecast['Prophet Forecast'] = forecast['yhat'].clip(lower=0).round().astype(int)
-    mean_forecast = forecast[['ds', 'Prophet Forecast']][:horizon]
+    forecast['P10'] = forecast['yhat_lower']
+    forecast['P90'] = forecast['yhat_upper']
+    mean_forecast = forecast[['ds', 'Prophet Forecast', 'P10', 'P90']][:horizon]
 
     return mean_forecast
+
 
 
 def format_output_with_folder(mean_forecast, forecast_data, horizon=20):
@@ -144,7 +163,7 @@ def format_output_with_folder(mean_forecast, forecast_data, horizon=20):
     prophet_forecast_horizon = mean_forecast.iloc[:horizon].copy()
     prophet_forecast_horizon = prophet_forecast_horizon.reset_index(drop=True)
     prophet_forecast_horizon['Week'] = 'Week ' + prophet_forecast_horizon.index.astype(str)
-    comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast']]
+    comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast', 'P10', 'P90']]
 
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
@@ -159,28 +178,8 @@ def format_output_with_folder(mean_forecast, forecast_data, horizon=20):
     return comparison.iloc[:horizon]
 
 
-def calculate_summary_statistics(ts_data, forecast_df, horizon):
-    """Calculate summary statistics for visualization."""
-    summary_stats = {
-        "min": ts_data["y"].min(),
-        "max": ts_data["y"].max(),
-        "mean": ts_data["y"].mean(),
-        "median": ts_data["y"].median(),
-        "std_dev": ts_data["y"].std(),
-        "total_sales": ts_data["y"].sum(),
-        "data_range": (ts_data["ds"].min(), ts_data["ds"].max())
-    }
-    total_forecast_16 = forecast_df['Prophet Forecast'][:16].sum()
-    total_forecast_8 = forecast_df['Prophet Forecast'][:8].sum()
-    max_forecast = forecast_df['Prophet Forecast'].max()
-    min_forecast = forecast_df['Prophet Forecast'].min()
-    max_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmax(), 'ds']
-    min_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmin(), 'ds']
-    return summary_stats, total_forecast_16, total_forecast_8, max_forecast, min_forecast, max_week, min_week
-
-
-def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, max_forecast, min_forecast, max_week, min_week):
-    """Visualize historical data, Prophet forecast, and Amazon forecasts with summary."""
+def visualize_forecast_with_comparison(ts_data, comparison):
+    """Visualize historical data, Prophet forecast, and Amazon forecasts."""
     fig, ax = plt.subplots(figsize=(16, 12))
 
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
@@ -188,41 +187,19 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
         comparison['ds'], 
         comparison['Prophet Forecast'], 
         label='Prophet Forecast', 
-        marker='o', 
         linestyle='--', 
-        color='blue'
+        color='blue', 
+        marker='o'
     )
 
-    for column in comparison.columns[3:]:
-        ax.plot(
-            comparison['ds'], 
-            comparison[column], 
-            label=f'{column}', 
-            linestyle='--'
-        )
+    for col in comparison.columns[3:]:
+        ax.plot(comparison['ds'], comparison[col], label=col, linestyle=':', marker='x')
 
     ax.set_title('Sales Forecast Comparison')
     ax.set_xlabel('Date')
     ax.set_ylabel('Units Sold')
     ax.legend()
     ax.grid()
-
-    summary_text = (
-        f"Historical Summary:\n"
-        f"Range: {summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}\n"
-        f"Min: {summary_stats['min']:.0f}\n"
-        f"Max: {summary_stats['max']:.0f}\n"
-        f"Mean: {summary_stats['mean']:.0f}\n"
-        f"Median: {summary_stats['median']:.0f}\n"
-        f"Std Dev: {summary_stats['std_dev']:.0f}\n"
-        f"Total Historical Sales: {summary_stats['total_sales']:.0f} units\n\n"
-        f"Forecast Summary:\n"
-        f"Total Forecast (16 Weeks): {total_forecast_16:.0f}\n"
-        f"Total Forecast (8 Weeks): {total_forecast_8:.0f}\n"
-        f"Max Forecast: {max_forecast:.0f} (Week of {max_week.strftime('%Y-%m-%d')})\n"
-        f"Min Forecast: {min_forecast:.0f} (Week of {min_week.strftime('%Y-%m-%d')})"
-    )
-    plt.gcf().text(0.1, 0.7, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
     plt.tight_layout()
     plt.show()
 
@@ -234,12 +211,10 @@ def main():
 
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
-    ts_data = prepare_time_series(data, asin)
+    ts_data = prepare_time_series_with_lags(data, asin, lag_weeks=1)
     mean_forecast = forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20)
 
     comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=20)
-    summary_stats, total_forecast_16, total_forecast_8, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, mean_forecast, horizon=20)
-    
     print("Comparison DataFrame:")
     print(comparison)
 
@@ -247,7 +222,7 @@ def main():
     comparison.to_excel(output_file_path, index=False)
     print(f"Comparison and summary saved to '{output_file_path}'")
 
-    visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, max_forecast, min_forecast, max_week, min_week)
+    visualize_forecast_with_comparison(ts_data, comparison)
 
 
 if __name__ == '__main__':
