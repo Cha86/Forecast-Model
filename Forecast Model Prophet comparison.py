@@ -241,8 +241,8 @@ def main():
 
     horizon = 20
     param_grid = {
-        'changepoint_prior_scale': [0.1, 0.2, 0.3],
-        'seasonality_prior_scale': [4.5, 10, 15],
+        'changepoint_prior_scale': [0.1, 0.15, 0.17, 0.2, 0.3],
+        'seasonality_prior_scale': [3, 4.5, 6, 10],
         'holidays_prior_scale': [10, 15, 20]
     }
 
