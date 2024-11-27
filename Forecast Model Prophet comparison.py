@@ -230,6 +230,61 @@ def visualize_forecast_with_comparison(ts_data, comparison):
     plt.show()
 
 
+def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
+    """
+    Adjust forecast weights dynamically for yhat and yhat_upper.
+    
+    Parameters:
+        forecast (pd.DataFrame): Prophet forecast output.
+        yhat_weight (float): Weight for yhat (median forecast).
+        yhat_upper_weight (float): Weight for yhat_upper (upper bound forecast).
+    
+    Returns:
+        pd.DataFrame: Adjusted forecast with new weights applied.
+    """
+    forecast['Prophet Forecast'] = (
+        yhat_weight * forecast['yhat'] + yhat_upper_weight * forecast['yhat_upper']
+    ).clip(lower=0).round().astype(int)
+    return forecast
+
+
+def find_best_forecast_weights(forecast, comparison, weights):
+    """
+    Find the best weight combination for yhat and yhat_upper by comparing to Amazon's forecasts.
+    
+    Parameters:
+        forecast (pd.DataFrame): Prophet forecast output.
+        comparison (pd.DataFrame): Comparison DataFrame with Amazon forecasts.
+        weights (list of tuple): List of weight pairs (yhat_weight, yhat_upper_weight).
+    
+    Returns:
+        tuple: Best weight combination and RMSE values for each combination.
+    """
+    best_rmse = float('inf')
+    best_weights = None
+    rmse_results = {}
+
+    for yhat_weight, yhat_upper_weight in weights:
+        # Adjust the forecast with current weights
+        adjusted_forecast = adjust_forecast_weights(forecast.copy(), yhat_weight, yhat_upper_weight)
+
+        # Compute RMSE for each Amazon forecast
+        rmse_values = {}
+        for amazon_col in comparison.columns[3:]:  # Amazon forecasts start from column index 3
+            rmse = np.sqrt(((comparison[amazon_col] - adjusted_forecast['Prophet Forecast']) ** 2).mean())
+            rmse_values[amazon_col] = rmse
+        
+        avg_rmse = np.mean(list(rmse_values.values()))
+        rmse_results[(yhat_weight, yhat_upper_weight)] = avg_rmse
+
+        if avg_rmse < best_rmse:
+            best_rmse = avg_rmse
+            best_weights = (yhat_weight, yhat_upper_weight)
+    
+    return best_weights, rmse_results
+
+
+# Example usage in the main function
 def main():
     folder_path = 'forecasts_folder2'
     file_path = 'weekly_sales_data.xlsx'
@@ -239,37 +294,33 @@ def main():
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series_with_lags(data, asin, lag_weeks=1)
 
-    horizon = 20
-    param_grid = {
-        'changepoint_prior_scale': [0.1, 0.15, 0.17, 0.2, 0.3],
-        'seasonality_prior_scale': [3, 4.5, 6, 10],
-        'holidays_prior_scale': [10, 15, 20]
-    }
-
-    # Optimize Prophet parameters
-    best_params = optimize_prophet_params(ts_data, forecast_data, None, param_grid, horizon)
-
-    if best_params:
-        print("Best Parameters Found:")
-        print(f"Changepoint Prior Scale: {best_params['changepoint_prior_scale']}")
-        print(f"Seasonality Prior Scale: {best_params['seasonality_prior_scale']}")
-        print(f"Holidays Prior Scale: {best_params['holidays_prior_scale']}")
-    else:
-        print("No best parameters found. Using default values.")
-
-    # Forecast using the best parameters
-    forecast = forecast_with_custom_params(
+    best_params = optimize_prophet_params(ts_data, forecast_data, horizon=20)
+    forecast = forecast_demand_with_custom_increase(
         ts_data, forecast_data,
         best_params['changepoint_prior_scale'],
         best_params['seasonality_prior_scale'],
         best_params['holidays_prior_scale'],
-        horizon
+        horizon=20
     )
 
-    comparison = format_output_with_forecasts(forecast, forecast_data, horizon)
+    comparison = format_output_with_folder(forecast, forecast_data, horizon=20)
     print("Comparison DataFrame:")
     print(comparison)
 
+    # Adjust weights dynamically
+    weights_to_test = [(0.9, 0.1), (0.8, 0.2), (0.7, 0.3), (0.6, 0.4), (0.5, 0.5)]
+    best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights_to_test)
+
+    print("\nBest Weight Combination Found:")
+    print(f"yhat_weight: {best_weights[0]}, yhat_upper_weight: {best_weights[1]}")
+    print("RMSE Results for Each Weight Combination:")
+    for weights, rmse in rmse_results.items():
+        print(f"Weights (yhat: {weights[0]}, yhat_upper: {weights[1]}): RMSE = {rmse}")
+
+    # Apply the best weights to the forecast
+    forecast = adjust_forecast_weights(forecast, *best_weights)
+
+    # Save and visualize the results
     output_file_path = os.path.abspath('forecast_comparison_summary.xlsx')
     comparison.to_excel(output_file_path, index=False)
     print(f"Comparison and summary saved to '{output_file_path}'")
