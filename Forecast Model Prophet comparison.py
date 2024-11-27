@@ -249,6 +249,14 @@ def main():
     # Optimize Prophet parameters
     best_params = optimize_prophet_params(ts_data, forecast_data, None, param_grid, horizon)
 
+    if best_params:
+        print("Best Parameters Found:")
+        print(f"Changepoint Prior Scale: {best_params['changepoint_prior_scale']}")
+        print(f"Seasonality Prior Scale: {best_params['seasonality_prior_scale']}")
+        print(f"Holidays Prior Scale: {best_params['holidays_prior_scale']}")
+    else:
+        print("No best parameters found. Using default values.")
+
     # Forecast using the best parameters
     forecast = forecast_with_custom_params(
         ts_data, forecast_data,
