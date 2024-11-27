@@ -97,7 +97,7 @@ def get_shifted_holidays():
 
 
 def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
-    """Forecast demand using Prophet and align with P70."""
+    """Forecast demand using Prophet and align with the best percentile."""
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
@@ -145,21 +145,21 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
     model.fit(train_df)
 
     forecast = model.predict(future_df)
+    return forecast
 
-    # Adjust forecast to P70
+
+def adjust_forecast_to_best_percentile(forecast, best_percentile):
+    """Adjust the forecast to the specified percentile."""
+    weight = best_percentile / 100
     forecast['Prophet Forecast'] = (
-        0.9 * forecast['yhat_upper'] + 0.1 * forecast['yhat']
-    ).clip(lower=0).round().astype(int)
-
-    mean_forecast = forecast[['ds', 'Prophet Forecast']][:horizon]
-
-    return mean_forecast
+        forecast['yhat'] * (1 - weight) + forecast['yhat_upper'] * weight
+    ).clip(lower=0).round()
+    return forecast
 
 
-def format_output_with_folder(mean_forecast, forecast_data, horizon=20):
+def format_output_with_folder(forecast, forecast_data, horizon=20):
     """Format output for comparison using dynamically loaded forecasts."""
-    prophet_forecast_horizon = mean_forecast.iloc[:horizon].copy()
-
+    prophet_forecast_horizon = forecast[['ds', 'Prophet Forecast']][:horizon].copy()
     prophet_forecast_horizon['Week'] = 'Week ' + prophet_forecast_horizon.index.astype(str)
     comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast']]
 
@@ -173,29 +173,51 @@ def format_output_with_folder(mean_forecast, forecast_data, horizon=20):
 
     comparison.fillna(0, inplace=True)
     comparison.iloc[:, 3:] = comparison.iloc[:, 3:].astype(int)
-    return comparison.iloc[:horizon]
+    return comparison
 
 
+def test_percentiles_and_compare_forecasts(comparison, forecast, percentiles):
+    """Test different percentiles and compare RMSE values with Amazon forecasts."""
+    rmse_results = {}
+    for percentile in percentiles:
+        weight = percentile / 100
+        adjusted_forecast = (
+            forecast['yhat'] * (1 - weight) + forecast['yhat_upper'] * weight
+        )
+
+        rmse_values = {}
+        for amazon_col in comparison.columns[3:]:
+            rmse = np.sqrt(((comparison[amazon_col] - adjusted_forecast) ** 2).mean())
+            rmse_values[amazon_col] = rmse
+
+        avg_rmse = np.mean(list(rmse_values.values()))
+        rmse_results[percentile] = avg_rmse
+
+    best_percentile = min(rmse_results, key=rmse_results.get)
+    return best_percentile
 
 
-def visualize_forecast_with_comparison(ts_data, comparison):
-    """Visualize historical data, Prophet forecast, and Amazon forecasts."""
+def visualize_forecast_with_comparison(ts_data, comparison, best_percentile):
+    """Visualize historical data, Prophet forecast, and Amazon forecasts with best percentile."""
     fig, ax = plt.subplots(figsize=(16, 12))
 
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
+
+    # Plot adjusted Prophet forecast
     ax.plot(
-        comparison['ds'], 
-        comparison['Prophet Forecast'], 
-        label='Prophet Forecast', 
-        linestyle='--', 
-        color='blue', 
+        comparison['ds'],
+        comparison['Prophet Forecast'],
+        label=f'Prophet Forecast (Adjusted to P{best_percentile})',
+        linestyle='--',
+        color='blue',
         marker='o'
     )
 
+    # Plot Amazon forecasts
     for col in comparison.columns[3:]:
         ax.plot(comparison['ds'], comparison[col], label=col, linestyle=':', marker='x')
 
-    ax.set_title('Sales Forecast Comparison')
+    ax.set_title(f'Sales Forecast Comparison (Best Percentile: P{best_percentile})')
     ax.set_xlabel('Date')
     ax.set_ylabel('Units Sold')
     ax.legend()
@@ -212,17 +234,23 @@ def main():
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series_with_lags(data, asin, lag_weeks=1)
-    mean_forecast = forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20)
+    forecast = forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20)
 
-    comparison = format_output_with_folder(mean_forecast, forecast_data, horizon=20)
-    print("Comparison DataFrame:")
-    print(comparison)
+    comparison = format_output_with_folder(forecast, forecast_data, horizon=20)
 
-    output_file_path = os.path.abspath('forecast_comparison_summary.xlsx')
-    comparison.to_excel(output_file_path, index=False)
-    print(f"Comparison and summary saved to '{output_file_path}'")
+    # Find the best percentile
+    best_percentile = test_percentiles_and_compare_forecasts(comparison, forecast, [50, 60, 70, 80, 90])
 
-    visualize_forecast_with_comparison(ts_data, comparison)
+    # Adjust the forecast to the best percentile
+    forecast = adjust_forecast_to_best_percentile(forecast, best_percentile)
+
+    # Update the comparison DataFrame with adjusted forecast
+    comparison = format_output_with_folder(forecast, forecast_data, horizon=20)
+
+    print(f"Comparison DataFrame:\n{comparison}")
+    print(f"Best Amazon Forecast Model: P{best_percentile}")
+
+    visualize_forecast_with_comparison(ts_data, comparison, best_percentile)
 
 
 if __name__ == '__main__':
