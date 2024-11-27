@@ -96,8 +96,11 @@ def get_shifted_holidays():
     return holidays
 
 
-def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
-    """Forecast demand using Prophet and align with the best percentile."""
+def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=20):
+    """Forecast demand using Prophet with custom parameters."""
+    print(f"Testing: changepoint_prior_scale={changepoint_prior_scale}, "
+          f"seasonality_prior_scale={seasonality_prior_scale}, holidays_prior_scale={holidays_prior_scale}")
+
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
@@ -123,9 +126,6 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
         lambda x: 0.2 if x in holidays[holidays['holiday'] == 'Prime Day']['ds'].values else 0
     )
 
-    last_lag_value = ts_data['y'].iloc[-1] if not ts_data.empty else 0
-    combined_df['lag_1_week'] = combined_df['lag_1_week'].fillna(last_lag_value)
-
     train_df = combined_df[~combined_df['y'].isna()].copy()
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
 
@@ -134,90 +134,94 @@ def forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20):
         weekly_seasonality=True,
         seasonality_mode='multiplicative',
         holidays=holidays,
-        changepoint_prior_scale=0.17,
-        seasonality_prior_scale=4.5,
-        holidays_prior_scale=15
+        changepoint_prior_scale=changepoint_prior_scale,
+        seasonality_prior_scale=seasonality_prior_scale,
+        holidays_prior_scale=holidays_prior_scale
     )
 
-    for regressor in regressor_cols + ['prime_day', 'lag_1_week']:
+    for regressor in regressor_cols + ['prime_day']:
         model.add_regressor(regressor, mode='multiplicative')
 
     model.fit(train_df)
 
     forecast = model.predict(future_df)
-    return forecast
+    forecast['Prophet Forecast'] = forecast['yhat']
+    return forecast[['ds', 'Prophet Forecast']]
 
 
-def adjust_forecast_to_best_percentile(forecast, best_percentile):
-    """Adjust the forecast to the specified percentile."""
-    weight = best_percentile / 100
-    forecast['Prophet Forecast'] = (
-        forecast['yhat'] * (1 - weight) + forecast['yhat_upper'] * weight
-    ).clip(lower=0).round()
-    return forecast
+def optimize_prophet_params(ts_data, forecast_data, comparison, param_grid, horizon=20):
+    """Optimize Prophet parameters to minimize RMSE against Amazon forecasts."""
+    print("Starting optimization...")
+    best_rmse = float('inf')
+    best_params = None
+
+    for changepoint_prior_scale in param_grid['changepoint_prior_scale']:
+        for seasonality_prior_scale in param_grid['seasonality_prior_scale']:
+            for holidays_prior_scale in param_grid['holidays_prior_scale']:
+                try:
+                    forecast = forecast_with_custom_params(
+                        ts_data, forecast_data,
+                        changepoint_prior_scale,
+                        seasonality_prior_scale,
+                        holidays_prior_scale,
+                        horizon
+                    )
+                    comparison = format_output_with_forecasts(forecast, forecast_data, horizon)
+                    rmse_values = {}
+                    for amazon_col in comparison.columns[2:]:
+                        rmse = np.sqrt(((comparison[amazon_col] - comparison['Prophet Forecast']) ** 2).mean())
+                        rmse_values[amazon_col] = rmse
+                    avg_rmse = np.mean(list(rmse_values.values()))
+
+                    if avg_rmse < best_rmse:
+                        best_rmse = avg_rmse
+                        best_params = {
+                            'changepoint_prior_scale': changepoint_prior_scale,
+                            'seasonality_prior_scale': seasonality_prior_scale,
+                            'holidays_prior_scale': holidays_prior_scale
+                        }
+                except Exception as e:
+                    print(f"Error during optimization: {e}")
+                    continue
+
+    print("Optimization complete.")
+    return best_params
 
 
-def format_output_with_folder(forecast, forecast_data, horizon=20):
-    """Format output for comparison using dynamically loaded forecasts."""
-    prophet_forecast_horizon = forecast[['ds', 'Prophet Forecast']][:horizon].copy()
-    prophet_forecast_horizon['Week'] = 'Week ' + prophet_forecast_horizon.index.astype(str)
-    comparison = prophet_forecast_horizon[['Week', 'ds', 'Prophet Forecast']]
+def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
+    """Format output for comparison using Prophet and Amazon forecasts."""
+    comparison = prophet_forecast.copy()
 
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
         forecast_df = pd.DataFrame({
-            'Week': ['Week ' + str(i) for i in range(len(values))],
+            'ds': prophet_forecast['ds'],  # Match the dates
             f'Amazon {forecast_type}': values
         })
-        comparison = comparison.merge(forecast_df, on='Week', how='left')
+        comparison = comparison.merge(forecast_df, on='ds', how='left')
 
     comparison.fillna(0, inplace=True)
-    comparison.iloc[:, 3:] = comparison.iloc[:, 3:].astype(int)
     return comparison
 
 
-def test_percentiles_and_compare_forecasts(comparison, forecast, percentiles):
-    """Test different percentiles and compare RMSE values with Amazon forecasts."""
-    rmse_results = {}
-    for percentile in percentiles:
-        weight = percentile / 100
-        adjusted_forecast = (
-            forecast['yhat'] * (1 - weight) + forecast['yhat_upper'] * weight
-        )
-
-        rmse_values = {}
-        for amazon_col in comparison.columns[3:]:
-            rmse = np.sqrt(((comparison[amazon_col] - adjusted_forecast) ** 2).mean())
-            rmse_values[amazon_col] = rmse
-
-        avg_rmse = np.mean(list(rmse_values.values()))
-        rmse_results[percentile] = avg_rmse
-
-    best_percentile = min(rmse_results, key=rmse_results.get)
-    return best_percentile
-
-
-def visualize_forecast_with_comparison(ts_data, comparison, best_percentile):
-    """Visualize historical data, Prophet forecast, and Amazon forecasts with best percentile."""
+def visualize_forecast_with_comparison(ts_data, comparison):
+    """Visualize historical data, Prophet forecast, and Amazon forecasts."""
     fig, ax = plt.subplots(figsize=(16, 12))
 
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
-
-    # Plot adjusted Prophet forecast
     ax.plot(
         comparison['ds'],
         comparison['Prophet Forecast'],
-        label=f'Prophet Forecast (Adjusted to P{best_percentile})',
+        label='Prophet Forecast',
         linestyle='--',
         color='blue',
         marker='o'
     )
 
-    # Plot Amazon forecasts
-    for col in comparison.columns[3:]:
+    for col in comparison.columns[2:]:
         ax.plot(comparison['ds'], comparison[col], label=col, linestyle=':', marker='x')
 
-    ax.set_title(f'Sales Forecast Comparison (Best Percentile: P{best_percentile})')
+    ax.set_title('Sales Forecast Comparison')
     ax.set_xlabel('Date')
     ax.set_ylabel('Units Sold')
     ax.legend()
@@ -234,23 +238,35 @@ def main():
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series_with_lags(data, asin, lag_weeks=1)
-    forecast = forecast_demand_with_custom_increase(ts_data, forecast_data, horizon=20)
 
-    comparison = format_output_with_folder(forecast, forecast_data, horizon=20)
+    horizon = 20
+    param_grid = {
+        'changepoint_prior_scale': [0.1, 0.2, 0.3],
+        'seasonality_prior_scale': [4.5, 10, 15],
+        'holidays_prior_scale': [10, 15, 20]
+    }
 
-    # Find the best percentile
-    best_percentile = test_percentiles_and_compare_forecasts(comparison, forecast, [50, 60, 70, 80, 90])
+    # Optimize Prophet parameters
+    best_params = optimize_prophet_params(ts_data, forecast_data, None, param_grid, horizon)
 
-    # Adjust the forecast to the best percentile
-    forecast = adjust_forecast_to_best_percentile(forecast, best_percentile)
+    # Forecast using the best parameters
+    forecast = forecast_with_custom_params(
+        ts_data, forecast_data,
+        best_params['changepoint_prior_scale'],
+        best_params['seasonality_prior_scale'],
+        best_params['holidays_prior_scale'],
+        horizon
+    )
 
-    # Update the comparison DataFrame with adjusted forecast
-    comparison = format_output_with_folder(forecast, forecast_data, horizon=20)
+    comparison = format_output_with_forecasts(forecast, forecast_data, horizon)
+    print("Comparison DataFrame:")
+    print(comparison)
 
-    print(f"Comparison DataFrame:\n{comparison}")
-    print(f"Best Amazon Forecast Model: P{best_percentile}")
+    output_file_path = os.path.abspath('forecast_comparison_summary.xlsx')
+    comparison.to_excel(output_file_path, index=False)
+    print(f"Comparison and summary saved to '{output_file_path}'")
 
-    visualize_forecast_with_comparison(ts_data, comparison, best_percentile)
+    visualize_forecast_with_comparison(ts_data, comparison)
 
 
 if __name__ == '__main__':
