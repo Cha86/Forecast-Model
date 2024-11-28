@@ -149,7 +149,7 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     return forecast[['ds', 'Prophet Forecast']]
 
 
-def optimize_prophet_params(ts_data, forecast_data, comparison, param_grid, horizon=20):
+def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
     """Optimize Prophet parameters to minimize RMSE against Amazon forecasts."""
     print("Starting optimization...")
     best_rmse = float('inf')
@@ -166,11 +166,7 @@ def optimize_prophet_params(ts_data, forecast_data, comparison, param_grid, hori
                         holidays_prior_scale,
                         horizon
                     )
-                    comparison = format_output_with_forecasts(forecast, forecast_data, horizon)
-                    rmse_values = {}
-                    for amazon_col in comparison.columns[2:]:
-                        rmse = np.sqrt(((comparison[amazon_col] - comparison['Prophet Forecast']) ** 2).mean())
-                        rmse_values[amazon_col] = rmse
+                    rmse_values = calculate_rmse(forecast, forecast_data, horizon)
                     avg_rmse = np.mean(list(rmse_values.values()))
 
                     if avg_rmse < best_rmse:
@@ -184,8 +180,18 @@ def optimize_prophet_params(ts_data, forecast_data, comparison, param_grid, hori
                     print(f"Error during optimization: {e}")
                     continue
 
-    print("Optimization complete.")
+    print(f"Optimization complete. Best Parameters Found: {best_params}")
     return best_params
+
+
+def calculate_rmse(forecast, forecast_data, horizon):
+    """Calculate RMSE between Prophet forecast and Amazon forecasts."""
+    comparison = forecast.copy()
+    rmse_values = {}
+    for forecast_type, values in forecast_data.items():
+        values = values[:horizon]
+        rmse_values[forecast_type] = np.sqrt(((comparison['Prophet Forecast'] - values) ** 2).mean())
+    return rmse_values
 
 
 def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
@@ -233,14 +239,6 @@ def visualize_forecast_with_comparison(ts_data, comparison):
 def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     """
     Adjust forecast weights dynamically for yhat and yhat_upper.
-    
-    Parameters:
-        forecast (pd.DataFrame): Prophet forecast output.
-        yhat_weight (float): Weight for yhat (median forecast).
-        yhat_upper_weight (float): Weight for yhat_upper (upper bound forecast).
-    
-    Returns:
-        pd.DataFrame: Adjusted forecast with new weights applied.
     """
     forecast['Prophet Forecast'] = (
         yhat_weight * forecast['yhat'] + yhat_upper_weight * forecast['yhat_upper']
@@ -251,14 +249,6 @@ def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
 def find_best_forecast_weights(forecast, comparison, weights):
     """
     Find the best weight combination for yhat and yhat_upper by comparing to Amazon's forecasts.
-    
-    Parameters:
-        forecast (pd.DataFrame): Prophet forecast output.
-        comparison (pd.DataFrame): Comparison DataFrame with Amazon forecasts.
-        weights (list of tuple): List of weight pairs (yhat_weight, yhat_upper_weight).
-    
-    Returns:
-        tuple: Best weight combination and RMSE values for each combination.
     """
     best_rmse = float('inf')
     best_weights = None
@@ -284,18 +274,28 @@ def find_best_forecast_weights(forecast, comparison, weights):
     return best_weights, rmse_results
 
 
-# Example usage in the main function
 def main():
     folder_path = 'forecasts_folder2'
     file_path = 'weekly_sales_data.xlsx'
     asin = 'B08KGVH7YC'
 
+    # Load and prepare data
     data = load_data(file_path)
     forecast_data = load_amazon_forecasts_from_folder(folder_path, asin)
     ts_data = prepare_time_series_with_lags(data, asin, lag_weeks=1)
 
-    best_params = optimize_prophet_params(ts_data, forecast_data, horizon=20)
-    forecast = forecast_demand_with_custom_increase(
+    # Define the parameter grid for optimization
+    param_grid = {
+        'changepoint_prior_scale': [0.1, 0.2, 0.3],
+        'seasonality_prior_scale': [1, 2, 3],
+        'holidays_prior_scale': [10, 15, 20]
+    }
+
+    # Perform optimization
+    best_params = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20)
+
+    # Generate forecast using the best parameters
+    forecast = forecast_with_custom_params(
         ts_data, forecast_data,
         best_params['changepoint_prior_scale'],
         best_params['seasonality_prior_scale'],
@@ -303,19 +303,22 @@ def main():
         horizon=20
     )
 
-    comparison = format_output_with_folder(forecast, forecast_data, horizon=20)
-    print("Comparison DataFrame:")
-    print(comparison)
+    # Format the comparison dataframe
+    comparison = format_output_with_forecasts(forecast, forecast_data, horizon=20)
 
-    # Adjust weights dynamically
+    # Test weights for Prophet forecasts
     weights_to_test = [(0.9, 0.1), (0.8, 0.2), (0.7, 0.3), (0.6, 0.4), (0.5, 0.5)]
     best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights_to_test)
 
-    print("\nBest Weight Combination Found:")
-    print(f"yhat_weight: {best_weights[0]}, yhat_upper_weight: {best_weights[1]}")
-    print("RMSE Results for Each Weight Combination:")
-    for weights, rmse in rmse_results.items():
-        print(f"Weights (yhat: {weights[0]}, yhat_upper: {weights[1]}): RMSE = {rmse}")
+    # Print optimization results
+    print("\nOptimization Results:")
+    print(f"Best Parameters:")
+    print(f"  Changepoint Prior Scale: {best_params['changepoint_prior_scale']}")
+    print(f"  Seasonality Prior Scale: {best_params['seasonality_prior_scale']}")
+    print(f"  Holidays Prior Scale: {best_params['holidays_prior_scale']}")
+    print("\nBest Forecast Weights:")
+    print(f"  yhat_weight: {best_weights[0]}")
+    print(f"  yhat_upper_weight: {best_weights[1]}")
 
     # Apply the best weights to the forecast
     forecast = adjust_forecast_weights(forecast, *best_weights)
@@ -330,3 +333,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
