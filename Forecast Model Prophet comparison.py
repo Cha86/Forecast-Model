@@ -142,11 +142,14 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     for regressor in regressor_cols + ['prime_day']:
         model.add_regressor(regressor, mode='multiplicative')
 
-    model.fit(train_df)
-
-    forecast = model.predict(future_df)
-    forecast['Prophet Forecast'] = forecast['yhat']
-    return forecast[['ds', 'Prophet Forecast']]
+    try:
+        model.fit(train_df)
+        forecast = model.predict(future_df)
+        forecast['Prophet Forecast'] = forecast['yhat']
+        return forecast[['ds', 'Prophet Forecast']]
+    except Exception as e:
+        print(f"Error during forecasting: {e}")
+        return pd.DataFrame(columns=['ds', 'Prophet Forecast'])
 
 
 def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
@@ -166,6 +169,9 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
                         holidays_prior_scale,
                         horizon
                     )
+                    if forecast.empty or 'Prophet Forecast' not in forecast.columns:
+                        raise ValueError("Forecast failed to generate 'Prophet Forecast'.")
+
                     rmse_values = calculate_rmse(forecast, forecast_data, horizon)
                     avg_rmse = np.mean(list(rmse_values.values()))
 
@@ -179,6 +185,10 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
                 except Exception as e:
                     print(f"Error during optimization: {e}")
                     continue
+
+    if best_params is None:
+        print("Optimization failed. No valid parameters found.")
+        return {'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 1, 'holidays_prior_scale': 10}
 
     print(f"Optimization complete. Best Parameters Found: {best_params}")
     return best_params
@@ -240,10 +250,14 @@ def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     """
     Adjust forecast weights dynamically for yhat and yhat_upper.
     """
+    if 'yhat' not in forecast or 'yhat_upper' not in forecast:
+        raise KeyError("'yhat' or 'yhat_upper' not found in forecast DataFrame.")
+
     forecast['Prophet Forecast'] = (
         yhat_weight * forecast['yhat'] + yhat_upper_weight * forecast['yhat_upper']
     ).clip(lower=0).round().astype(int)
     return forecast
+
 
 
 def find_best_forecast_weights(forecast, comparison, weights):
@@ -294,6 +308,10 @@ def main():
     # Perform optimization
     best_params = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20)
 
+    if not best_params:
+        print("No valid parameters found. Exiting.")
+        return
+
     # Generate forecast using the best parameters
     forecast = forecast_with_custom_params(
         ts_data, forecast_data,
@@ -303,25 +321,12 @@ def main():
         horizon=20
     )
 
+    if forecast.empty or 'Prophet Forecast' not in forecast.columns:
+        print("Failed to generate forecast. Exiting.")
+        return
+
     # Format the comparison dataframe
     comparison = format_output_with_forecasts(forecast, forecast_data, horizon=20)
-
-    # Test weights for Prophet forecasts
-    weights_to_test = [(0.9, 0.1), (0.8, 0.2), (0.7, 0.3), (0.6, 0.4), (0.5, 0.5)]
-    best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights_to_test)
-
-    # Print optimization results
-    print("\nOptimization Results:")
-    print(f"Best Parameters:")
-    print(f"  Changepoint Prior Scale: {best_params['changepoint_prior_scale']}")
-    print(f"  Seasonality Prior Scale: {best_params['seasonality_prior_scale']}")
-    print(f"  Holidays Prior Scale: {best_params['holidays_prior_scale']}")
-    print("\nBest Forecast Weights:")
-    print(f"  yhat_weight: {best_weights[0]}")
-    print(f"  yhat_upper_weight: {best_weights[1]}")
-
-    # Apply the best weights to the forecast
-    forecast = adjust_forecast_weights(forecast, *best_weights)
 
     # Save and visualize the results
     output_file_path = os.path.abspath('forecast_comparison_summary.xlsx')
