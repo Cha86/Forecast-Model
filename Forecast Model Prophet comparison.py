@@ -4,6 +4,8 @@ from prophet import Prophet
 import matplotlib.pyplot as plt
 import warnings
 import os
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 warnings.filterwarnings("ignore")  # Ignore warnings for cleaner output
 
@@ -220,32 +222,6 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
     return comparison
 
 
-def visualize_forecast_with_comparison(ts_data, comparison):
-    """Visualize historical data, Prophet forecast, and Amazon forecasts."""
-    fig, ax = plt.subplots(figsize=(16, 12))
-
-    ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
-    ax.plot(
-        comparison['ds'],
-        comparison['Prophet Forecast'],
-        label='Prophet Forecast',
-        linestyle='--',
-        color='blue',
-        marker='o'
-    )
-
-    for col in comparison.columns[2:]:
-        ax.plot(comparison['ds'], comparison[col], label=col, linestyle=':', marker='x')
-
-    ax.set_title('Sales Forecast Comparison')
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Units Sold')
-    ax.legend()
-    ax.grid()
-    plt.tight_layout()
-    plt.show()
-
-
 def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     """
     Adjust forecast weights dynamically for yhat and yhat_upper.
@@ -287,6 +263,139 @@ def find_best_forecast_weights(forecast, comparison, weights):
     
     return best_weights, rmse_results
 
+def calculate_summary_statistics(ts_data, forecast_df, horizon):
+    """Calculate summary statistics for visualization."""
+    summary_stats = {
+        "min": ts_data["y"].min(),
+        "max": ts_data["y"].max(),
+        "mean": ts_data["y"].mean(),
+        "median": ts_data["y"].median(),
+        "std_dev": ts_data["y"].std(),
+        "total_sales": ts_data["y"].sum(),
+        "data_range": (ts_data["ds"].min(), ts_data["ds"].max())
+    }
+    total_forecast_16 = forecast_df['Prophet Forecast'][:16].sum()
+    total_forecast_8 = forecast_df['Prophet Forecast'][:8].sum()
+    total_forecast_4 = forecast_df['Prophet Forecast'][:4].sum()
+    max_forecast = forecast_df['Prophet Forecast'].max()
+    min_forecast = forecast_df['Prophet Forecast'].min()
+    max_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmax(), 'ds']
+    min_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmin(), 'ds']
+    return summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week
+
+
+def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week):
+    """Visualize historical data, Prophet forecast, and Amazon forecasts with summary."""
+    fig, ax = plt.subplots(figsize=(16, 10))  # Adjusted figure size
+
+    # Plot historical data
+    ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
+
+    # Plot Prophet forecast
+    ax.plot(
+        comparison['ds'],
+        comparison['Prophet Forecast'],
+        label='Prophet Forecast',
+        marker='o',
+        linestyle='--',
+        color='blue'
+    )
+
+    # Plot Amazon forecasts
+    for column in comparison.columns[3:]:
+        ax.plot(
+            comparison['ds'],
+            comparison[column],
+            label=f'{column}',
+            linestyle=':'
+        )
+
+    ax.set_title('Sales Forecast Comparison')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Units Sold')
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+    ax.grid()
+
+    # Add summary text
+    summary_text = (
+        f"Historical Summary:\n"
+        f"Range: {summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}\n"
+        f"Min: {summary_stats['min']:.0f}\n"
+        f"Max: {summary_stats['max']:.0f}\n"
+        f"Mean: {summary_stats['mean']:.0f}\n"
+        f"Median: {summary_stats['median']:.0f}\n"
+        f"Std Dev: {summary_stats['std_dev']:.0f}\n"
+        f"Total Historical Sales: {summary_stats['total_sales']:.0f} units\n\n"
+        f"Forecast Summary:\n"
+        f"Total Forecast (16 Weeks): {total_forecast_16:.0f}\n"
+        f"Total Forecast (8 Weeks): {total_forecast_8:.0f}\n"
+        f"Total Forecast (4 Weeks): {total_forecast_4:.0f}\n"
+        f"Max Forecast: {max_forecast:.0f} (Week of {max_week.strftime('%Y-%m-%d')})\n"
+        f"Min Forecast: {min_forecast:.0f} (Week of {min_week.strftime('%Y-%m-%d')})"
+    )
+
+    # Dynamically place text on the figure
+    plt.gcf().text(0.78, 0.5, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8), va='center')
+
+    # Adjust layout
+    plt.subplots_adjust(right=0.75)  # Ensure space for summary
+    plt.show()
+
+def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, output_file_path):
+    """Save forecast comparison and summary to an Excel file."""
+    # Create a new workbook and add data
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Forecast Comparison"
+
+    # Write the comparison DataFrame to the first worksheet
+    for r in dataframe_to_rows(comparison, index=False, header=True):
+        ws1.append(r)
+
+    # Create a second worksheet for the summary
+    ws2 = wb.create_sheet(title="Summary")
+    summary_data = {
+        "Metric": [
+            "Historical Range",
+            "Min Sales",
+            "Max Sales",
+            "Mean Sales",
+            "Median Sales",
+            "Std Dev Sales",
+            "Total Historical Sales",
+            "Total Forecast (16 Weeks)",
+            "Total Forecast (8 Weeks)",
+            "Total Forecast (4 Weeks)",
+            "Max Forecast",
+            "Max Forecast Week",
+            "Min Forecast",
+            "Min Forecast Week"
+        ],
+        "Value": [
+            f"{summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}",
+            f"{summary_stats['min']:.0f}",
+            f"{summary_stats['max']:.0f}",
+            f"{summary_stats['mean']:.0f}",
+            f"{summary_stats['median']:.0f}",
+            f"{summary_stats['std_dev']:.0f}",
+            f"{summary_stats['total_sales']:.0f} units",
+            f"{total_forecast_16:.0f}",
+            f"{total_forecast_8:.0f}",
+            f"{total_forecast_4:.0f}",
+            f"{max_forecast:.0f}",
+            f"{max_week.strftime('%Y-%m-%d')}",
+            f"{min_forecast:.0f}",
+            f"{min_week.strftime('%Y-%m-%d')}"
+        ]
+    }
+    summary_df = pd.DataFrame(summary_data)
+    for r in dataframe_to_rows(summary_df, index=False, header=True):
+        ws2.append(r)
+
+    # Save the workbook
+    wb.save(output_file_path)
+    print(f"Comparison and summary saved to '{output_file_path}'")
+
 
 def main():
     folder_path = 'forecasts_folder2'
@@ -308,10 +417,6 @@ def main():
     # Perform optimization
     best_params = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20)
 
-    if not best_params:
-        print("No valid parameters found. Exiting.")
-        return
-
     # Generate forecast using the best parameters
     forecast = forecast_with_custom_params(
         ts_data, forecast_data,
@@ -321,21 +426,40 @@ def main():
         horizon=20
     )
 
-    if forecast.empty or 'Prophet Forecast' not in forecast.columns:
-        print("Failed to generate forecast. Exiting.")
-        return
-
     # Format the comparison dataframe
     comparison = format_output_with_forecasts(forecast, forecast_data, horizon=20)
 
+    # Calculate summary statistics
+    summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, comparison, horizon=20)
+
     # Save and visualize the results
     output_file_path = os.path.abspath('forecast_comparison_summary.xlsx')
-    comparison.to_excel(output_file_path, index=False)
-    print(f"Comparison and summary saved to '{output_file_path}'")
+    save_summary_to_excel(
+        comparison,
+        summary_stats,
+        total_forecast_16,
+        total_forecast_8,
+        total_forecast_4,
+        max_forecast,
+        min_forecast,
+        max_week,
+        min_week,
+        output_file_path
+    )
 
-    visualize_forecast_with_comparison(ts_data, comparison)
+    visualize_forecast_with_comparison(
+        ts_data,
+        comparison,
+        summary_stats,
+        total_forecast_16,
+        total_forecast_8,
+        total_forecast_4,
+        max_forecast,
+        min_forecast,
+        max_week,
+        min_week
+    )
 
 
 if __name__ == '__main__':
     main()
-
