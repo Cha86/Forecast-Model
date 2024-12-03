@@ -398,9 +398,9 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
 
 
 def main():
-    folder_path = 'forecasts_folder2'
+    folder_path = 'A520I AC'
     file_path = 'weekly_sales_data.xlsx'
-    asin = 'B08KGVH7YC'
+    asin = 'B08F7BHDLY'
 
     # Load and prepare data
     data = load_data(file_path)
@@ -409,9 +409,9 @@ def main():
 
     # Define the parameter grid for optimization
     param_grid = {
-        'changepoint_prior_scale': [0.1, 0.2, 0.3],
-        'seasonality_prior_scale': [1, 2, 3],
-        'holidays_prior_scale': [10, 15, 20]
+        'changepoint_prior_scale': [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        'seasonality_prior_scale': [0.5, 1, 2, 3, 4],
+        'holidays_prior_scale': [5, 10, 15, 20, 25]
     }
 
     # Perform optimization
