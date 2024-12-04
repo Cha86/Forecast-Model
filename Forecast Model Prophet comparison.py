@@ -11,22 +11,38 @@ warnings.filterwarnings("ignore")  # Ignore warnings for cleaner output
 
 def generate_date_from_week(row):
     """Generate datetime object from week and year."""
-    week_str = row['Week']
-    year = row['Year']
+    week_str = row['week']
+    year = row['year']
     week_number = int(week_str[1:])  # Extract week number from 'Wxx'
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
 def load_weekly_sales_data(file_path):
     """Load and preprocess weekly sales data with the specified format."""
     data = pd.read_excel(file_path)
-    required_columns = ['Product Title', 'Week', 'Year', 'units_sold', 'ASIN']
+
+    # Normalize column names
+    data.columns = data.columns.str.strip().str.lower()
+
+    required_columns = ['product title', 'week', 'year', 'units_sold', 'asin']
     missing_required = [col for col in required_columns if col not in data.columns]
     if missing_required:
         raise ValueError(f"Missing required columns: {missing_required}")
 
     data['date'] = data.apply(generate_date_from_week, axis=1)  # Generate date
-    data = data.rename(columns={'ASIN': 'asin', 'units_sold': 'y'})
+    data = data.rename(columns={'units_sold': 'y'})
     return data
+
+def load_asins_to_forecast(file_path):
+    """Load ASINs to forecast from a text or Excel file."""
+    if file_path.endswith('.txt'):
+        with open(file_path, 'r') as file:
+            asins = [line.strip() for line in file if line.strip()]
+    elif file_path.endswith('.xlsx') or file_path.endswith('.xls'):
+        df = pd.read_excel(file_path)
+        asins = df.iloc[:, 0].dropna().astype(str).tolist()
+    else:
+        raise ValueError("Unsupported file format for ASINs to Forecast file.")
+    return asins
 
 def load_amazon_forecasts_from_folder(folder_path, asin):
     """Load Amazon forecast data from multiple Excel files in a folder."""
@@ -414,6 +430,7 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
 def main():
     sales_file = 'weekly_sales_data.xlsx'  # Input file with sales data
     forecasts_folder = 'forecasts_folder'  # Folder containing Amazon forecasts
+    asins_to_forecast_file = 'ASINs to Forecast.xlsx'  # File containing ASINs to forecast
     output_file = 'consolidated_forecast.xlsx'  # Consolidated forecast output
     horizon = 20
 
@@ -427,10 +444,17 @@ def main():
     missing_asin_data = data[data['asin'].isna() | (data['asin'] == '#N/A')]
     if not missing_asin_data.empty:
         print("The following entries have no ASIN and will be noted in the forecast file:")
-        print(missing_asin_data[['Product Title', 'Week', 'Year', 'y']])
+        print(missing_asin_data[['product title', 'week', 'year', 'y']])
+
+    # Load ASINs to forecast
+    asins_to_forecast = load_asins_to_forecast(asins_to_forecast_file)
+    print(f"ASINs to forecast: {asins_to_forecast}")
 
     # Get list of valid ASINs
     asin_list = valid_data['asin'].unique()
+
+    # Filter ASINs to only those in the ASINs to Forecast file
+    asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
     # Prepare consolidated data storage
     consolidated_forecasts = {}
@@ -444,7 +468,7 @@ def main():
 
     # Loop through each valid ASIN
     for asin in asin_list:
-        product_title = valid_data[valid_data['asin'] == asin]['Product Title'].iloc[0]
+        product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
 
         print(f"\nProcessing ASIN: {asin} - {product_title}")
 
@@ -479,8 +503,7 @@ def main():
             continue
 
         # Find the best forecast weights
-        #weights = [(0.5, 0.5), (0.6, 0.4), (0.4, 0.6), (0.7, 0.3), (0.3, 0.7)]
-        weights = [(0.7, 0.3)]
+        weights = [(0.7, 0.3)]  # Using predefined weights as per your previous code
         comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
         best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights)
         print(f"Best weights for ASIN {asin}: {best_weights}")
