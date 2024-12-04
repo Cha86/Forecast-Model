@@ -19,7 +19,7 @@ def generate_date_from_week(row):
 def load_weekly_sales_data(file_path):
     """Load and preprocess weekly sales data with the specified format."""
     data = pd.read_excel(file_path)
-    required_columns = ['Product Title', 'Week', 'Month', 'Season', 'Year', 'units_sold', 'ASIN']
+    required_columns = ['Product Title', 'Week', 'Year', 'units_sold', 'ASIN']
     missing_required = [col for col in required_columns if col not in data.columns]
     if missing_required:
         raise ValueError(f"Missing required columns: {missing_required}")
@@ -28,10 +28,41 @@ def load_weekly_sales_data(file_path):
     data = data.rename(columns={'ASIN': 'asin', 'units_sold': 'y'})
     return data
 
-def load_amazon_forecasts(file_path):
-    """Load Amazon forecast data for multiple ASINs."""
-    forecast_data = pd.read_excel(file_path)
-    forecast_data.columns = forecast_data.columns.str.strip()
+def load_amazon_forecasts_from_folder(folder_path, asin):
+    """Load Amazon forecast data from multiple Excel files in a folder."""
+    forecast_data = {}
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith('.xlsx'):
+            forecast_type = os.path.splitext(file_name)[0].replace('_', ' ').title()
+            file_path = os.path.join(folder_path, file_name)
+            df = pd.read_excel(file_path)
+
+            df.columns = df.columns.str.strip().str.upper()
+            if 'ASIN' not in df.columns:
+                print(f"Error: Column 'ASIN' not found in {file_name}")
+                continue
+
+            asin_row = df[df['ASIN'].str.upper() == asin.upper()]
+            if asin_row.empty:
+                print(f"Warning: ASIN {asin} not found in {file_name}")
+                continue
+
+            week_columns = [col for col in df.columns if 'W' in col.upper()]
+            if not week_columns:
+                print(f"Warning: No week columns found in {file_name}")
+                continue
+
+            forecast_values = (
+                asin_row.iloc[0][week_columns]
+                .astype(str)
+                .str.replace(',', '')
+                .astype(float)
+                .round()
+                .astype(int)
+                .values
+            )
+            forecast_data[forecast_type] = forecast_values
+
     return forecast_data
 
 def add_lag_features(ts_data, lag_weeks=1):
@@ -68,31 +99,27 @@ def get_shifted_holidays():
     holidays['ds'] = pd.to_datetime(holidays['ds'])
     return holidays
 
-def forecast_with_custom_params(ts_data, forecast_row, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=20):
+def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=20):
     """Forecast demand using Prophet with custom parameters."""
-    asin = forecast_row['ASIN']
-    product_title = forecast_row['Product Title']
-    print(f"Forecasting for ASIN {asin}: {product_title}")
-
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
     combined_df = pd.concat([ts_data, future], ignore_index=True)
 
-    # Extract forecast values from the row
-    forecast_values = forecast_row.filter(regex='^W').values.astype(float)
-    values_to_use = forecast_values[:horizon] if len(forecast_values) > horizon else forecast_values
-    extended_values = np.concatenate(
-        [
-            np.full(len(ts_data), np.nan),
-            values_to_use,
-            np.full(max(horizon - len(values_to_use), 0), values_to_use[-1] if len(values_to_use) > 0 else 0)
-        ]
-    )
-    extended_values = extended_values[:len(combined_df)]
-    combined_df['Amazon_Forecast'] = extended_values
+    # Add forecast data as regressors
+    for forecast_type, values in forecast_data.items():
+        values_to_use = values[:horizon] if len(values) > horizon else values
+        extended_values = np.concatenate(
+            [
+                np.full(len(ts_data), np.nan),
+                values_to_use,
+                np.full(max(horizon - len(values_to_use), 0), values_to_use[-1] if len(values_to_use) > 0 else 0)
+            ]
+        )
+        extended_values = extended_values[:len(combined_df)]
+        combined_df[f'Amazon_{forecast_type}'] = extended_values
 
-    regressor_cols = ['Amazon_Forecast']
+    regressor_cols = [col for col in combined_df.columns if col.startswith('Amazon_')]
     combined_df[regressor_cols] = combined_df[regressor_cols].fillna(0)
 
     holidays = get_shifted_holidays()
@@ -122,13 +149,11 @@ def forecast_with_custom_params(ts_data, forecast_row, changepoint_prior_scale, 
         forecast['Prophet Forecast'] = forecast['yhat']
         return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']]
     except Exception as e:
-        print(f"Error during forecasting for ASIN {asin}: {e}")
+        print(f"Error during forecasting: {e}")
         return pd.DataFrame(columns=['ds', 'Prophet Forecast'])
 
-def optimize_prophet_params(ts_data, forecast_row, param_grid, horizon=20):
+def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
     """Optimize Prophet parameters to minimize RMSE against Amazon forecasts."""
-    asin = forecast_row['ASIN']
-    print(f"Starting optimization for ASIN {asin}...")
     best_rmse = float('inf')
     best_params = None
 
@@ -137,7 +162,7 @@ def optimize_prophet_params(ts_data, forecast_row, param_grid, horizon=20):
             for holidays_prior_scale in param_grid['holidays_prior_scale']:
                 try:
                     forecast = forecast_with_custom_params(
-                        ts_data, forecast_row,
+                        ts_data, forecast_data,
                         changepoint_prior_scale,
                         seasonality_prior_scale,
                         holidays_prior_scale,
@@ -146,8 +171,8 @@ def optimize_prophet_params(ts_data, forecast_row, param_grid, horizon=20):
                     if forecast.empty or 'Prophet Forecast' not in forecast.columns:
                         raise ValueError("Forecast failed to generate 'Prophet Forecast'.")
 
-                    rmse_value = calculate_rmse(forecast, forecast_row, horizon)
-                    avg_rmse = rmse_value
+                    rmse_values = calculate_rmse(forecast, forecast_data, horizon)
+                    avg_rmse = np.mean(list(rmse_values.values()))
 
                     if avg_rmse < best_rmse:
                         best_rmse = avg_rmse
@@ -157,42 +182,37 @@ def optimize_prophet_params(ts_data, forecast_row, param_grid, horizon=20):
                             'holidays_prior_scale': holidays_prior_scale
                         }
                 except Exception as e:
-                    print(f"Error during optimization for ASIN {asin}: {e}")
+                    print(f"Error during optimization: {e}")
                     continue
 
     if best_params is None:
-        print(f"Optimization failed for ASIN {asin}. Using default parameters.")
+        print("Optimization failed. Using default parameters.")
         best_params = {'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 1, 'holidays_prior_scale': 10}
 
-    print(f"Optimization complete for ASIN {asin}. Best Parameters Found: {best_params}")
     return best_params
 
-def calculate_rmse(forecast, forecast_row, horizon):
+def calculate_rmse(forecast, forecast_data, horizon):
     """Calculate RMSE between Prophet forecast and Amazon forecasts."""
-    forecast_values = forecast_row.filter(regex='^W').values.astype(float)
-    values = forecast_values[:horizon]
-    rmse_value = np.sqrt(((forecast['Prophet Forecast'] - values) ** 2).mean())
-    return rmse_value
+    rmse_values = {}
+    for forecast_type, values in forecast_data.items():
+        values = values[:horizon]
+        rmse = np.sqrt(((forecast['Prophet Forecast'] - values) ** 2).mean())
+        rmse_values[forecast_type] = rmse
+    return rmse_values
 
-def format_output_with_forecasts(prophet_forecast, forecast_row, horizon=20):
+def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
     """Format output for comparison using Prophet and Amazon forecasts."""
     comparison = prophet_forecast.copy()
-    asin = forecast_row['ASIN']
-    product_title = forecast_row['Product Title']
-    forecast_values = forecast_row.filter(regex='^W').values.astype(float)
-    values = forecast_values[:horizon]
 
-    forecast_df = pd.DataFrame({
-        'ds': prophet_forecast['ds'],  # Match the dates
-        'Amazon Forecast': values
-    })
-    comparison = comparison.merge(forecast_df, on='ds', how='left')
+    for forecast_type, values in forecast_data.items():
+        values = values[:horizon]
+        forecast_df = pd.DataFrame({
+            'ds': prophet_forecast['ds'],  # Match the dates
+            f'Amazon {forecast_type}': values
+        })
+        comparison = comparison.merge(forecast_df, on='ds', how='left')
+
     comparison.fillna(0, inplace=True)
-
-    # Add ASIN and product title
-    comparison['ASIN'] = asin
-    comparison['Product Title'] = product_title
-
     return comparison
 
 def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
@@ -215,12 +235,18 @@ def find_best_forecast_weights(forecast, comparison, weights):
         # Adjust the forecast with current weights
         adjusted_forecast = adjust_forecast_weights(forecast.copy(), yhat_weight, yhat_upper_weight)
 
-        # Compute RMSE
-        rmse = np.sqrt(((comparison['Amazon Forecast'] - adjusted_forecast['Prophet Forecast']) ** 2).mean())
-        rmse_results[(yhat_weight, yhat_upper_weight)] = rmse
+        # Compute RMSE for each Amazon forecast
+        rmse_values = {}
+        for amazon_col in comparison.columns:
+            if amazon_col.startswith('Amazon '):
+                rmse = np.sqrt(((comparison[amazon_col] - adjusted_forecast['Prophet Forecast']) ** 2).mean())
+                rmse_values[amazon_col] = rmse
 
-        if rmse < best_rmse:
-            best_rmse = rmse
+        avg_rmse = np.mean(list(rmse_values.values()))
+        rmse_results[(yhat_weight, yhat_upper_weight)] = avg_rmse
+
+        if avg_rmse < best_rmse:
+            best_rmse = avg_rmse
             best_weights = (yhat_weight, yhat_upper_weight)
 
     return best_weights, rmse_results
@@ -263,12 +289,14 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
     )
 
     # Plot Amazon forecasts
-    ax.plot(
-        comparison['ds'],
-        comparison['Amazon Forecast'],
-        label='Amazon Forecast',
-        linestyle=':'
-    )
+    for column in comparison.columns:
+        if column.startswith('Amazon '):
+            ax.plot(
+                comparison['ds'],
+                comparison[column],
+                label=f'{column}',
+                linestyle=':'
+            )
 
     ax.set_title(f'Sales Forecast Comparison for {product_title}')
     ax.set_xlabel('Date')
@@ -363,14 +391,23 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
     wb.save(output_file_path)
     print(f"Comparison and summary saved to '{output_file_path}'")
 
-def save_forecast_to_excel(output_path, consolidated_data):
+def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
     """Save all forecasts to a single Excel file."""
     wb = Workbook()
+
+    # Save forecasts for valid ASINs
     for asin, forecast_df in consolidated_data.items():
         ws = wb.create_sheet(title=str(asin)[:31])  # Limit sheet title to 31 chars
         for r in dataframe_to_rows(forecast_df, index=False, header=True):
             ws.append(r)
-    del wb['Sheet']  # Remove default sheet
+
+    # Handle missing ASINs
+    if not missing_asin_data.empty:
+        ws_missing = wb.create_sheet(title="No ASIN")
+        for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
+            ws_missing.append(r)
+
+    del wb['Sheet']  # Remove default sheet if it exists
     wb.save(output_path)
     print(f"All forecasts saved to {output_path}")
 
@@ -400,7 +437,7 @@ def main():
 
     # Define the parameter grid for optimization
     param_grid = {
-        'changepoint_prior_scale': [0.1],  # Simplified for faster execution
+        'changepoint_prior_scale': [0.1],
         'seasonality_prior_scale': [1],
         'holidays_prior_scale': [10]
     }
@@ -442,7 +479,8 @@ def main():
             continue
 
         # Find the best forecast weights
-        weights = [(0.5, 0.5), (0.6, 0.4), (0.4, 0.6), (0.7, 0.3), (0.3, 0.7)]
+        #weights = [(0.5, 0.5), (0.6, 0.4), (0.4, 0.6), (0.7, 0.3), (0.3, 0.7)]
+        weights = [(0.7, 0.3)]
         comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
         best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights)
         print(f"Best weights for ASIN {asin}: {best_weights}")
@@ -452,6 +490,10 @@ def main():
 
         # Update comparison with adjusted forecast
         comparison['Prophet Forecast'] = forecast['Prophet Forecast']
+
+        # Add ASIN and Product Title to comparison DataFrame
+        comparison['ASIN'] = asin
+        comparison['Product Title'] = product_title
 
         # Calculate summary statistics
         summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, comparison, horizon=horizon)
