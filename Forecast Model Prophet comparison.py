@@ -398,9 +398,9 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
 
 
 def main():
-    folder_path = 'A520I AC'
+    folder_path = 'M27QA ICE SA1'
     file_path = 'weekly_sales_data.xlsx'
-    asin = 'B08F7BHDLY'
+    asin = 'B08JWCHR5N'
 
     # Load and prepare data
     data = load_data(file_path)
