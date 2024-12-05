@@ -13,14 +13,13 @@ def generate_date_from_week(row):
     """Generate datetime object from week and year."""
     week_str = row['week']
     year = row['year']
-    week_number = int(week_str[1:])  # Extract week number from 'Wxx'
+    week_number = int(week_str[1:])  
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
 def load_weekly_sales_data(file_path):
     """Load and preprocess weekly sales data with the specified format."""
     data = pd.read_excel(file_path)
 
-    # Normalize column names
     data.columns = data.columns.str.strip().str.lower()
 
     required_columns = ['product title', 'week', 'year', 'units_sold', 'asin']
@@ -28,7 +27,7 @@ def load_weekly_sales_data(file_path):
     if missing_required:
         raise ValueError(f"Missing required columns: {missing_required}")
 
-    data['date'] = data.apply(generate_date_from_week, axis=1)  # Generate date
+    data['date'] = data.apply(generate_date_from_week, axis=1)  
     data = data.rename(columns={'units_sold': 'y'})
     return data
 
@@ -172,6 +171,7 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
     """Optimize Prophet parameters to minimize RMSE against Amazon forecasts."""
     best_rmse = float('inf')
     best_params = None
+    best_rmse_values = None  # To store the RMSE values of the best parameters
 
     for changepoint_prior_scale in param_grid['changepoint_prior_scale']:
         for seasonality_prior_scale in param_grid['seasonality_prior_scale']:
@@ -197,6 +197,7 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
                             'seasonality_prior_scale': seasonality_prior_scale,
                             'holidays_prior_scale': holidays_prior_scale
                         }
+                        best_rmse_values = rmse_values
                 except Exception as e:
                     print(f"Error during optimization: {e}")
                     continue
@@ -204,8 +205,9 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
     if best_params is None:
         print("Optimization failed. Using default parameters.")
         best_params = {'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 1, 'holidays_prior_scale': 10}
+        best_rmse_values = {}
 
-    return best_params
+    return best_params, best_rmse_values
 
 def calculate_rmse(forecast, forecast_data, horizon):
     """Calculate RMSE between Prophet forecast and Amazon forecasts."""
@@ -487,7 +489,11 @@ def main():
             continue
 
         # Perform optimization
-        best_params = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
+        best_params, best_rmse_values = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
+
+        # Print out the best parameters found
+        print(f"Best parameters for ASIN {asin}: {best_params}")
+        print(f"Best RMSE values for ASIN {asin}: {best_rmse_values}")
 
         # Generate forecast using the best parameters
         forecast = forecast_with_custom_params(
@@ -503,7 +509,7 @@ def main():
             continue
 
         # Find the best forecast weights
-        weights = [(0.7, 0.3)]  # Using predefined weights as per your previous code
+        weights = [(0.6, 0.4),(0.7, 0.3),(0.8, 0.2),(0.9, 0.1)] 
         comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
         best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights)
         print(f"Best weights for ASIN {asin}: {best_weights}")
