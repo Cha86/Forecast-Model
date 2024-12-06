@@ -11,14 +11,12 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 warnings.filterwarnings("ignore")  # Ignore warnings for cleaner output
 
 def generate_date_from_week(row):
-    """Generate datetime object from week and year."""
     week_str = row['week']
     year = row['year']
     week_number = int(week_str[1:])
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
 def load_weekly_sales_data(file_path):
-    """Load and preprocess weekly sales data."""
     data = pd.read_excel(file_path)
     data.columns = data.columns.str.strip().str.lower()
 
@@ -32,7 +30,6 @@ def load_weekly_sales_data(file_path):
     return data
 
 def load_asins_to_forecast(file_path):
-    """Load ASINs to forecast from a text or Excel file."""
     if file_path.endswith('.txt'):
         with open(file_path, 'r') as file:
             asins = [line.strip() for line in file if line.strip()]
@@ -44,7 +41,6 @@ def load_asins_to_forecast(file_path):
     return asins
 
 def load_amazon_forecasts_from_folder(folder_path, asin):
-    """Load Amazon forecast data from multiple Excel files in a folder."""
     forecast_data = {}
     for file_name in os.listdir(folder_path):
         if file_name.endswith('.xlsx'):
@@ -81,7 +77,6 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
     return forecast_data
 
 def add_lag_features(ts_data, lag_weeks=1):
-    """Add lag-based regressor features."""
     ts_data = ts_data.copy()
     ts_data = ts_data.sort_values('ds')
     ts_data[f'lag_{lag_weeks}_week'] = ts_data['y'].shift(lag_weeks)
@@ -89,7 +84,6 @@ def add_lag_features(ts_data, lag_weeks=1):
     return ts_data
 
 def prepare_time_series_with_lags(data, asin, lag_weeks=1):
-    """Prepare time series data for Prophet with lag features."""
     ts_data = data[data['asin'] == asin].rename(columns={'date': 'ds', 'y': 'y'})
     ts_data = ts_data.sort_values('ds')
     ts_data['y'] = ts_data['y'].interpolate().bfill().clip(lower=0)
@@ -97,7 +91,6 @@ def prepare_time_series_with_lags(data, asin, lag_weeks=1):
     return ts_data
 
 def get_shifted_holidays():
-    """Create a DataFrame of holidays shifted two weeks earlier."""
     holidays_list = [
         ('Prime Day', '2023-06-27'),
         ('Prime Day', '2023-06-28'),
@@ -115,13 +108,11 @@ def get_shifted_holidays():
     return holidays
 
 def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=20):
-    """Forecast demand using Prophet with custom parameters."""
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
     combined_df = pd.concat([ts_data, future], ignore_index=True)
 
-    # Add Amazon forecast data as regressors
     for forecast_type, values in forecast_data.items():
         values_to_use = values[:horizon] if len(values) > horizon else values
         extended_values = np.concatenate(
@@ -168,7 +159,6 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
         return pd.DataFrame(columns=['ds', 'Prophet Forecast']), None
 
 def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
-    """Optimize Prophet parameters to minimize RMSE against Amazon forecasts."""
     best_rmse = float('inf')
     best_params = None
     best_rmse_values = None
@@ -210,7 +200,6 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
     return best_params, best_rmse_values
 
 def calculate_rmse(forecast, forecast_data, horizon):
-    """Calculate RMSE between Prophet forecast and Amazon forecasts."""
     rmse_values = {}
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
@@ -219,9 +208,7 @@ def calculate_rmse(forecast, forecast_data, horizon):
     return rmse_values
 
 def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
-    """Format output for comparison using Prophet and Amazon forecasts."""
     comparison = prophet_forecast.copy()
-
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
         forecast_df = pd.DataFrame({
@@ -234,7 +221,6 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
     return comparison
 
 def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
-    """Adjust forecast weights dynamically for yhat and yhat_upper."""
     if 'yhat' not in forecast or 'yhat_upper' not in forecast:
         raise KeyError("'yhat' or 'yhat_upper' not found in forecast DataFrame.")
 
@@ -244,7 +230,6 @@ def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     return forecast
 
 def find_best_forecast_weights(forecast, comparison, weights):
-    """Find best weight combo for yhat and yhat_upper by comparing to Amazon forecasts."""
     best_rmse = float('inf')
     best_weights = None
     rmse_results = {}
@@ -287,7 +272,6 @@ def calculate_summary_statistics(ts_data, forecast_df, horizon):
 
 def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title):
     fig, ax = plt.subplots(figsize=(16, 10))
-
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
     ax.plot(comparison['ds'], comparison['Prophet Forecast'], label='Prophet Forecast', marker='o', linestyle='--', color='blue')
 
@@ -332,6 +316,20 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Forecast Comparison"
+
+    if 'yhat' in comparison.columns:
+        comparison.drop(columns=['yhat'], inplace=True)
+    if 'yhat_upper' in comparison.columns:
+        comparison.drop(columns=['yhat_upper'], inplace=True)
+
+    for i in range(len(comparison)):
+        ds_date = comparison.loc[i, 'ds']
+        start_date = ds_date
+        end_date = ds_date + pd.Timedelta(days=6)
+        week_label = f"Week {i} ({start_date.strftime('%B %d')}-{end_date.day})"
+        comparison.loc[i, 'Week'] = week_label
+
+    comparison.drop(columns=['ds'], inplace=True)
 
     for r in dataframe_to_rows(comparison, index=False, header=True):
         ws1.append(r)
@@ -382,6 +380,21 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
     wb = Workbook()
     for asin, forecast_df in consolidated_data.items():
         ws = wb.create_sheet(title=str(asin)[:31])
+
+        if 'yhat' in forecast_df.columns:
+            forecast_df.drop(columns=['yhat'], inplace=True)
+        if 'yhat_upper' in forecast_df.columns:
+            forecast_df.drop(columns=['yhat_upper'], inplace=True)
+
+        if 'ds' in forecast_df.columns:
+            for i in range(len(forecast_df)):
+                ds_date = forecast_df.loc[i, 'ds']
+                start_date = ds_date
+                end_date = ds_date + pd.Timedelta(days=6)
+                week_label = f"Week {i} ({start_date.strftime('%B %d')}-{end_date.day})"
+                forecast_df.loc[i, 'Week'] = week_label
+            forecast_df.drop(columns=['ds'], inplace=True)
+
         for r in dataframe_to_rows(forecast_df, index=False, header=True):
             ws.append(r)
 
@@ -395,16 +408,12 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
     print(f"All forecasts saved to {output_path}")
 
 def cross_validate_prophet_model(ts_data, initial='365 days', period='180 days', horizon='180 days'):
-    """
-    Perform cross-validation on Prophet model to evaluate historical performance.
-    """
     model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
         seasonality_mode='multiplicative'
     )
     model.fit(ts_data[['ds', 'y']])
-
     df_cv = cross_validation(model, initial=initial, period=period, horizon=horizon)
     df_performance = performance_metrics(df_cv)
     print("Prophet Model Cross-Validation Results:")
@@ -412,19 +421,15 @@ def cross_validate_prophet_model(ts_data, initial='365 days', period='180 days',
     return df_cv, df_performance
 
 def analyze_amazon_buying_habits(comparison, holidays):
-    """
-    Analyze Amazon's buying habits by comparing their forecasts to Prophet's forecasts.
-    """
     amazon_cols = [col for col in comparison.columns if col.startswith('Amazon ')]
     if not amazon_cols:
         print("No Amazon forecasts found for analysis.")
         return
 
     prophet_forecast = comparison['Prophet Forecast'].values
-    ds_dates = comparison['ds'].values
-
-    holiday_dates = holidays['ds'].values
-    comparison['is_holiday_week'] = comparison['ds'].isin(holiday_dates)
+    ds_dates = comparison.get('ds', pd.Series(index=comparison.index)) 
+    holiday_dates = holidays['ds'].values if holidays is not None else []
+    comparison['is_holiday_week'] = comparison.get('ds', pd.Series(index=comparison.index)).isin(holiday_dates) if 'ds' in comparison.columns else False
 
     for col in amazon_cols:
         amazon_forecast = comparison[col].values
@@ -492,14 +497,14 @@ def main():
 
     consolidated_forecasts = {}
     param_grid = {
-        'changepoint_prior_scale': [0.1, 0.2, 0.3, 0.4, 0.5],
-        'seasonality_prior_scale': [1,2,3,4,5],
-        'holidays_prior_scale': [10,15,20]
+        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
+        'holidays_prior_scale': [5, 10, 15]
     }
 
     holidays = get_shifted_holidays()
 
-    # Optionally perform global CV on one ASIN if available
+    # Optional: Cross-validate on one ASIN to see model performance
     if len(asin_list) > 0:
         test_asin = asin_list[0]
         test_ts_data = prepare_time_series_with_lags(valid_data, test_asin, lag_weeks=1)
@@ -537,7 +542,7 @@ def main():
             print(f"Forecasting failed for ASIN {asin}, skipping.")
             continue
 
-        weights = [(0.6, 0.4),(0.7, 0.3),(0.8, 0.2),(0.9, 0.1)] 
+        weights = [(0.5, 0.5), (0.55, 0.45), (0.6, 0.4), (0.65, 0.35), (0.7, 0.3), (0.75, 0.25), (0.8, 0.2), (0.85, 0.15), (0.9, 0.1)]
         comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
         best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights)
         print(f"Best weights for ASIN {asin}: {best_weights}")
@@ -569,7 +574,5 @@ def main():
 
         consolidated_forecasts[asin] = comparison
 
-    save_forecast_to_excel(output_file, consolidated_forecasts, missing_asin_data)
+``--
 
-if __name__ == '__main__':
-    main()
