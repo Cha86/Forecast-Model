@@ -152,6 +152,7 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     try:
         model.fit(train_df)
         forecast = model.predict(future_df)
+        # We return yhat, yhat_upper here for internal use, but will drop them later
         forecast['Prophet Forecast'] = forecast['yhat']
         return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']], model
     except Exception as e:
@@ -427,7 +428,7 @@ def analyze_amazon_buying_habits(comparison, holidays):
         return
 
     prophet_forecast = comparison['Prophet Forecast'].values
-    ds_dates = comparison.get('ds', pd.Series(index=comparison.index)) 
+    ds_dates = comparison.get('ds', pd.Series(index=comparison.index))  # ds might already be dropped, handle gracefully
     holiday_dates = holidays['ds'].values if holidays is not None else []
     comparison['is_holiday_week'] = comparison.get('ds', pd.Series(index=comparison.index)).isin(holiday_dates) if 'ds' in comparison.columns else False
 
@@ -457,6 +458,7 @@ def analyze_amazon_buying_habits(comparison, holidays):
             holiday_diff = amazon_forecast[holiday_mask] - prophet_forecast[holiday_mask]
             if len(holiday_diff) > 0:
                 print("  During holiday weeks:")
+
                 print(f"    Avg Ratio (Amazon/Prophet): {np.mean(holiday_ratio):.2f}")
                 print(f"    Avg Diff (Amazon-Prophet): {np.mean(holiday_diff):.2f}")
 
@@ -497,9 +499,9 @@ def main():
 
     consolidated_forecasts = {}
     param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-        'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
-        'holidays_prior_scale': [5, 10, 15]
+    'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+    'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
+    'holidays_prior_scale': [5, 10, 20]
     }
 
     holidays = get_shifted_holidays()
@@ -542,7 +544,7 @@ def main():
             print(f"Forecasting failed for ASIN {asin}, skipping.")
             continue
 
-        weights = [(0.5, 0.5), (0.55, 0.45), (0.6, 0.4), (0.65, 0.35), (0.7, 0.3), (0.75, 0.25), (0.8, 0.2), (0.85, 0.15), (0.9, 0.1)]
+        weights = [(0.5, 0.5),(0.6, 0.4),(0.7, 0.3),(0.8, 0.2),(0.9, 0.1)]
         comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
         best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights)
         print(f"Best weights for ASIN {asin}: {best_weights}")
@@ -574,5 +576,7 @@ def main():
 
         consolidated_forecasts[asin] = comparison
 
-``--
+    save_forecast_to_excel(output_file, consolidated_forecasts, missing_asin_data)
 
+if __name__ == '__main__':
+    main()
