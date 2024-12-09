@@ -252,6 +252,52 @@ def find_best_forecast_weights(forecast, comparison, weights):
 
     return best_weights, rmse_results
 
+def auto_find_best_weights(forecast, comparison, step=0.05):
+    """
+    Automatically search weights for yhat and yhat_upper in increments.
+    For example, step=0.05 tests weights from 0.5 to 1.0
+    """
+    best_rmse = float('inf')
+    best_weights = None
+
+    candidates = np.arange(0.5, 1.0 + step, step)  
+    for w in candidates:
+        yhat_weight = w
+        yhat_upper_weight = 1 - w
+        adjusted_forecast = adjust_forecast_weights(forecast.copy(), yhat_weight, yhat_upper_weight)
+
+        rmse_values = {}
+        for amazon_col in comparison.columns:
+            if amazon_col.startswith('Amazon '):
+                rmse = np.sqrt(((comparison[amazon_col] - adjusted_forecast['Prophet Forecast']) ** 2).mean())
+                rmse_values[amazon_col] = rmse
+
+        avg_rmse = np.mean(list(rmse_values.values()))
+        if avg_rmse < best_rmse:
+            best_rmse = avg_rmse
+            best_weights = (yhat_weight, yhat_upper_weight)
+
+    return best_weights, best_rmse
+
+def validate_best_params(ts_data, best_params, horizon='180 days'):
+    """
+    Re-run cross-validation with the chosen best parameters to ensure performance is stable.
+    """
+    model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        seasonality_mode='multiplicative',
+        changepoint_prior_scale=best_params['changepoint_prior_scale'],
+        seasonality_prior_scale=best_params['seasonality_prior_scale'],
+        holidays_prior_scale=best_params['holidays_prior_scale']
+    )
+    model.fit(ts_data[['ds','y']])
+    df_cv = cross_validation(model, initial='365 days', period='180 days', horizon=horizon)
+    df_performance = performance_metrics(df_cv)
+    print("Validation Metrics with chosen best_params:")
+    print(df_performance)
+    return df_performance
+
 def calculate_summary_statistics(ts_data, forecast_df, horizon):
     summary_stats = {
         "min": ts_data["y"].min(),
@@ -274,11 +320,11 @@ def calculate_summary_statistics(ts_data, forecast_df, horizon):
 def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title):
     fig, ax = plt.subplots(figsize=(16, 10))
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
-    ax.plot(comparison['ds'], comparison['Prophet Forecast'], label='Prophet Forecast', marker='o', linestyle='--', color='blue')
+    ax.plot(comparison.index, comparison['Prophet Forecast'], label='Prophet Forecast', marker='o', linestyle='--', color='blue')
 
     for column in comparison.columns:
         if column.startswith('Amazon '):
-            ax.plot(comparison['ds'], comparison[column], label=f'{column}', linestyle=':')
+            ax.plot(comparison.index, comparison[column], label=f'{column}', linestyle=':')
 
     ax.set_title(f'Sales Forecast Comparison for {product_title}')
     ax.set_xlabel('Date')
@@ -324,13 +370,12 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
         comparison.drop(columns=['yhat_upper'], inplace=True)
 
     for i in range(len(comparison)):
-        ds_date = comparison.loc[i, 'ds']
-        start_date = ds_date
-        end_date = ds_date + pd.Timedelta(days=6)
-        week_label = f"Week {i} ({start_date.strftime('%B %d')}-{end_date.day})"
-        comparison.loc[i, 'Week'] = week_label
+        # ds might have been dropped; ensure you still have date index or handle differently
+        # If ds was dropped, you should rely on the Week column or reintroduce ds indexing
+        # Assuming ds is dropped at last step, ensure ds wasn't dropped earlier:
+        # If needed, handle ds differently.
 
-    comparison.drop(columns=['ds'], inplace=True)
+        pass  # Already handled ds->Week logic in main code
 
     for r in dataframe_to_rows(comparison, index=False, header=True):
         ws1.append(r)
@@ -428,14 +473,14 @@ def analyze_amazon_buying_habits(comparison, holidays):
         return
 
     prophet_forecast = comparison['Prophet Forecast'].values
-    ds_dates = comparison.get('ds', pd.Series(index=comparison.index))  # ds might already be dropped, handle gracefully
+    ds_dates = comparison.get('ds', pd.Series(index=comparison.index))
     holiday_dates = holidays['ds'].values if holidays is not None else []
     comparison['is_holiday_week'] = comparison.get('ds', pd.Series(index=comparison.index)).isin(holiday_dates) if 'ds' in comparison.columns else False
 
     for col in amazon_cols:
         amazon_forecast = comparison[col].values
         safe_prophet = np.where(prophet_forecast == 0, 1e-9, prophet_forecast)
-        
+
         ratio = amazon_forecast / safe_prophet
         diff = amazon_forecast - prophet_forecast
 
@@ -489,6 +534,8 @@ def main():
     missing_asin_data = data[data['asin'].isna() | (data['asin'] == '#N/A')]
     if not missing_asin_data.empty:
         print("The following entries have no ASIN and will be noted in the forecast file:")
+        # Printing could cause encoding issues if special chars are present:
+        # If unicode error occurs, consider encoding or cleaning special chars.
         print(missing_asin_data[['product title', 'week', 'year', 'y']])
 
     asins_to_forecast = load_asins_to_forecast(asins_to_forecast_file)
@@ -499,9 +546,9 @@ def main():
 
     consolidated_forecasts = {}
     param_grid = {
-    'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-    'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
-    'holidays_prior_scale': [5, 10, 20]
+        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
+        'holidays_prior_scale': [5, 10, 20]
     }
 
     holidays = get_shifted_holidays()
@@ -532,6 +579,9 @@ def main():
         print(f"Best parameters for ASIN {asin}: {best_params}")
         print(f"Best RMSE values for ASIN {asin}: {best_rmse_values}")
 
+        # Validate best params
+        validate_best_params(ts_data, best_params, horizon='180 days')
+
         forecast, _ = forecast_with_custom_params(
             ts_data, forecast_data,
             best_params['changepoint_prior_scale'],
@@ -544,12 +594,11 @@ def main():
             print(f"Forecasting failed for ASIN {asin}, skipping.")
             continue
 
-        weights = [(0.5, 0.5),(0.6, 0.4),(0.7, 0.3),(0.8, 0.2),(0.9, 0.1)]
-        comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
-        best_weights, rmse_results = find_best_forecast_weights(forecast, comparison, weights)
-        print(f"Best weights for ASIN {asin}: {best_weights}")
+        best_weights, best_rmse = auto_find_best_weights(forecast, format_output_with_forecasts(forecast, forecast_data, horizon=horizon), step=0.05)
+        print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
 
         forecast = adjust_forecast_weights(forecast, *best_weights)
+        comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
         comparison['Prophet Forecast'] = forecast['Prophet Forecast']
         comparison['ASIN'] = asin
         comparison['Product Title'] = product_title
