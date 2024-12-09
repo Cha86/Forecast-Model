@@ -279,9 +279,32 @@ def auto_find_best_weights(forecast, comparison, step=0.05):
 
     return best_weights, best_rmse
 
-def validate_best_params(ts_data, best_params, horizon='180 days'):
+def try_cross_validation_with_fallback(model, ts_data, horizons, initial='365 days', period='180 days'):
     """
-    Re-run cross-validation with the chosen best parameters to ensure performance is stable.
+    Attempt cross-validation with a list of horizons, from larger to smaller.
+    If all fail, return None and print a message.
+    horizons: list of horizon strings, e.g. ['180 days', '90 days', '60 days']
+    """
+    for horizon in horizons:
+        try:
+            df_cv = cross_validation(model, initial=initial, period=period, horizon=horizon)
+            df_performance = performance_metrics(df_cv)
+            print(f"Cross-validation successful with horizon={horizon}")
+            return df_cv, df_performance
+        except ValueError as e:
+            if "Less data than horizon" in str(e):
+                print(f"Not enough data for horizon={horizon}, trying smaller horizon.")
+            else:
+                # If it's another type of ValueError, re-raise or handle differently
+                print(f"Error with horizon={horizon}: {e}")
+    # If we reach here, no horizon worked
+    print("The ASIN has too little data for cross-validation with any tested horizons.")
+    return None, None
+
+
+def validate_best_params(ts_data, best_params, initial='365 days', period='180 days'):
+    """
+    Attempt to validate the best parameters with multiple horizons.
     """
     model = Prophet(
         yearly_seasonality=True,
@@ -292,11 +315,16 @@ def validate_best_params(ts_data, best_params, horizon='180 days'):
         holidays_prior_scale=best_params['holidays_prior_scale']
     )
     model.fit(ts_data[['ds','y']])
-    df_cv = cross_validation(model, initial='365 days', period='180 days', horizon=horizon)
-    df_performance = performance_metrics(df_cv)
-    print("Validation Metrics with chosen best_params:")
-    print(df_performance)
-    return df_performance
+    
+    candidate_horizons = ['180 days', '90 days', '60 days', '30 days']
+    df_cv, df_performance = try_cross_validation_with_fallback(model, ts_data, candidate_horizons, initial=initial, period=period)
+    
+    if df_cv is not None and df_performance is not None:
+        print("Validation Metrics with chosen best_params:")
+        print(df_performance)
+    else:
+        print("No valid cross-validation results due to insufficient data.")
+
 
 def calculate_summary_statistics(ts_data, forecast_df, horizon):
     summary_stats = {
@@ -370,12 +398,10 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
         comparison.drop(columns=['yhat_upper'], inplace=True)
 
     for i in range(len(comparison)):
-        # ds might have been dropped; ensure you still have date index or handle differently
-        # If ds was dropped, you should rely on the Week column or reintroduce ds indexing
-        # Assuming ds is dropped at last step, ensure ds wasn't dropped earlier:
-        # If needed, handle ds differently.
-
-        pass  # Already handled ds->Week logic in main code
+        week_label = f"Week {i}"
+        comparison.loc[i, 'Week'] = week_label
+        
+    comparison.drop(columns=['ds'], inplace=True)
 
     for r in dataframe_to_rows(comparison, index=False, header=True):
         ws1.append(r)
@@ -534,8 +560,6 @@ def main():
     missing_asin_data = data[data['asin'].isna() | (data['asin'] == '#N/A')]
     if not missing_asin_data.empty:
         print("The following entries have no ASIN and will be noted in the forecast file:")
-        # Printing could cause encoding issues if special chars are present:
-        # If unicode error occurs, consider encoding or cleaning special chars.
         print(missing_asin_data[['product title', 'week', 'year', 'y']])
 
     asins_to_forecast = load_asins_to_forecast(asins_to_forecast_file)
@@ -579,8 +603,7 @@ def main():
         print(f"Best parameters for ASIN {asin}: {best_params}")
         print(f"Best RMSE values for ASIN {asin}: {best_rmse_values}")
 
-        # Validate best params
-        validate_best_params(ts_data, best_params, horizon='180 days')
+        validate_best_params(ts_data, best_params)
 
         forecast, _ = forecast_with_custom_params(
             ts_data, forecast_data,
