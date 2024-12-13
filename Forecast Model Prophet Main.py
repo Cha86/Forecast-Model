@@ -7,8 +7,81 @@ import warnings
 import os
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
+from statsmodels.tsa.arima.model import ARIMA
+import joblib
+from sklearn.metrics import mean_absolute_error, median_absolute_error, mean_absolute_percentage_error, mean_squared_error
+from math import sqrt
 
-warnings.filterwarnings("ignore")  
+warnings.filterwarnings("ignore")
+
+##############################
+# Added Functions for Caching
+##############################
+
+def save_model(model, model_type, asin):
+    """Save the fitted model for later use."""
+    model_cache_folder = "model_cache"
+    os.makedirs(model_cache_folder, exist_ok=True)
+    model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
+    joblib.dump(model, model_path)
+
+def load_model(model_type, asin):
+    """Load the previously saved model if it exists."""
+    model_cache_folder = "model_cache"
+    model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
+    if os.path.exists(model_path):
+        return joblib.load(model_path)
+    return None
+
+##############################
+# Functions for Data Handling
+##############################
+
+def handle_missing_data(data):
+    data['y'] = data['y'].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+    return data
+
+def handle_outliers(data):
+    Q1 = data['y'].quantile(0.25)
+    Q3 = data['y'].quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    data['y'] = data['y'].clip(lower=lower_bound, upper=upper_bound)
+    return data
+
+def preprocess_data(data):
+    data = handle_missing_data(data)
+    data = handle_outliers(data)
+    return data
+
+# ARIMA functions
+def fit_arima_model(data):
+    try:
+        model = ARIMA(data['y'], order=(1, 1, 1))  # Default configuration; can be tuned
+        model_fit = model.fit()
+        return model_fit
+    except Exception as e:
+        print(f"Error fitting ARIMA model: {e}")
+        return None
+
+def arima_forecast(model_fit, steps, last_date):
+    try:
+        forecast = model_fit.forecast(steps=steps)
+        future_dates = pd.date_range(start=last_date, periods=steps + 1, freq='W')[1:]
+        return pd.DataFrame({'ds': future_dates, 'Prophet Forecast': forecast})
+    except Exception as e:
+        print(f"Error during ARIMA forecasting: {e}")
+        return pd.DataFrame(columns=['ds', 'Prophet Forecast'])
+
+def choose_forecast_model(ts_data, threshold=20):
+    if len(ts_data) <= threshold:
+        print("Dataset size is small. Using ARIMA for forecasting.")
+        arima_model = fit_arima_model(ts_data)
+        return arima_model, "ARIMA"
+    else:
+        print("Dataset size is sufficient. Using Prophet for forecasting.")
+        return None, "Prophet"
 
 def generate_date_from_week(row):
     week_str = row['week']
@@ -86,7 +159,7 @@ def add_lag_features(ts_data, lag_weeks=1):
 def prepare_time_series_with_lags(data, asin, lag_weeks=1):
     ts_data = data[data['asin'] == asin].rename(columns={'date': 'ds', 'y': 'y'})
     ts_data = ts_data.sort_values('ds')
-    ts_data['y'] = ts_data['y'].interpolate().bfill().clip(lower=0)
+    ts_data = preprocess_data(ts_data)
     ts_data = add_lag_features(ts_data, lag_weeks)
     return ts_data
 
@@ -107,7 +180,7 @@ def get_shifted_holidays():
     holidays['ds'] = pd.to_datetime(holidays['ds'])
     return holidays
 
-def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=20):
+def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=16):
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
 
@@ -158,7 +231,12 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
         print(f"Error during forecasting: {e}")
         return pd.DataFrame(columns=['ds', 'Prophet Forecast']), None
 
-def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
+PARAM_COUNTER = 0
+POOR_PARAM_FOUND = False
+EARLY_STOP_THRESHOLD = 10_000
+
+def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
+    global PARAM_COUNTER, POOR_PARAM_FOUND
     best_rmse = float('inf')
     best_params = None
     best_rmse_values = None
@@ -166,6 +244,9 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
     for changepoint_prior_scale in param_grid['changepoint_prior_scale']:
         for seasonality_prior_scale in param_grid['seasonality_prior_scale']:
             for holidays_prior_scale in param_grid['holidays_prior_scale']:
+                PARAM_COUNTER += 1
+                print(f"Testing Params #{PARAM_COUNTER}: changepoint={changepoint_prior_scale}, "
+                      f"seasonality={seasonality_prior_scale}, holidays={holidays_prior_scale}")
                 try:
                     forecast, _ = forecast_with_custom_params(
                         ts_data, forecast_data,
@@ -179,6 +260,12 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=20):
 
                     rmse_values = calculate_rmse(forecast, forecast_data, horizon)
                     avg_rmse = np.mean(list(rmse_values.values()))
+
+                    if avg_rmse > EARLY_STOP_THRESHOLD:
+                        # Early stopping condition
+                        print("Early stopping triggered due to poor parameter performance.")
+                        POOR_PARAM_FOUND = True
+                        return best_params, best_rmse_values
 
                     if avg_rmse < best_rmse:
                         best_rmse = avg_rmse
@@ -207,7 +294,7 @@ def calculate_rmse(forecast, forecast_data, horizon):
         rmse_values[forecast_type] = rmse
     return rmse_values
 
-def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
+def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
     comparison = prophet_forecast.copy()
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
@@ -218,6 +305,16 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=20):
         comparison = comparison.merge(forecast_df, on='ds', how='left')
 
     comparison.fillna(0, inplace=True)
+
+    # Add difference and percentage difference for each Amazon column
+    for col in comparison.columns:
+        if col.startswith('Amazon '):
+            diff_col = f"Diff_{col.split('Amazon ')[1]}"
+            pct_col = f"Pct_{col.split('Amazon ')[1]}"
+            comparison[diff_col] = comparison['Prophet Forecast'] - comparison[col]
+            comparison[pct_col] = np.where(comparison[col] != 0,
+                                           (comparison[diff_col] / comparison[col]) * 100, 0)
+
     return comparison
 
 def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
@@ -306,8 +403,10 @@ def validate_best_params(ts_data, best_params, initial='365 days', period='180 d
     if df_cv is not None and df_performance is not None:
         print("Validation Metrics with chosen best_params:")
         print(df_performance)
+        return True
     else:
         print("No valid cross-validation results due to insufficient data.")
+        return False
 
 def calculate_summary_statistics(ts_data, forecast_df, horizon):
     summary_stats = {
@@ -319,16 +418,18 @@ def calculate_summary_statistics(ts_data, forecast_df, horizon):
         "total_sales": ts_data["y"].sum(),
         "data_range": (ts_data["ds"].min(), ts_data["ds"].max())
     }
-    total_forecast_16 = forecast_df['Prophet Forecast'][:16].sum()
-    total_forecast_8 = forecast_df['Prophet Forecast'][:8].sum()
-    total_forecast_4 = forecast_df['Prophet Forecast'][:4].sum()
+
+    total_forecast_16 = forecast_df['Prophet Forecast'][:16].sum() if len(forecast_df) >= 16 else forecast_df['Prophet Forecast'].sum()
+    total_forecast_8 = forecast_df['Prophet Forecast'][:8].sum() if len(forecast_df) >= 8 else forecast_df['Prophet Forecast'].sum()
+    total_forecast_4 = forecast_df['Prophet Forecast'][:4].sum() if len(forecast_df) >= 4 else forecast_df['Prophet Forecast'].sum()
+
     max_forecast = forecast_df['Prophet Forecast'].max()
     min_forecast = forecast_df['Prophet Forecast'].min()
-    max_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmax(), 'ds']
-    min_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmin(), 'ds']
+    max_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmax(), 'ds'] if 'ds' in forecast_df.columns else None
+    min_week = forecast_df.loc[forecast_df['Prophet Forecast'].idxmin(), 'ds'] if 'ds' in forecast_df.columns else None
     return summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week
 
-def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title):
+def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title, folder_name):
     fig, ax = plt.subplots(figsize=(16, 10))
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
     ax.plot(comparison['ds'], comparison['Prophet Forecast'], label='Prophet Forecast', marker='o', linestyle='--', color='blue')
@@ -356,30 +457,29 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
         f"Total Forecast (16 Weeks): {total_forecast_16:.0f}\n"
         f"Total Forecast (8 Weeks): {total_forecast_8:.0f}\n"
         f"Total Forecast (4 Weeks): {total_forecast_4:.0f}\n"
-        f"Max Forecast: {max_forecast:.0f} (Week of {max_week.strftime('%Y-%m-%d')})\n"
-        f"Min Forecast: {min_forecast:.0f} (Week of {min_week.strftime('%Y-%m-%d')})"
+        f"Max Forecast: {max_forecast:.0f} (Week of {max_week.strftime('%Y-%m-%d') if max_week else 'N/A'})\n"
+        f"Min Forecast: {min_forecast:.0f} (Week of {min_week.strftime('%Y-%m-%d') if min_week else 'N/A'})"
     )
 
     plt.gcf().text(0.78, 0.5, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8), va='center')
     plt.subplots_adjust(right=0.75)
 
-    graph_folder = 'forecast_graphs'
-    os.makedirs(graph_folder, exist_ok=True)
-    graph_file_path = os.path.join(graph_folder, f"{product_title.replace('/', '_')}_{asin}.png")
+    os.makedirs(folder_name, exist_ok=True)
+    graph_file_path = os.path.join(folder_name, f"{product_title.replace('/', '_')}_{asin}.png")
     plt.savefig(graph_file_path)
     plt.close()
     print(f"Graph saved to {graph_file_path}")
 
-def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, output_file_path):
+def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, output_file_path, metrics=None):
     comparison_for_excel = comparison.copy()
     if 'yhat' in comparison_for_excel.columns:
         comparison_for_excel.drop(columns=['yhat'], inplace=True)
     if 'yhat_upper' in comparison_for_excel.columns:
         comparison_for_excel.drop(columns=['yhat_upper'], inplace=True)
-
-    for i in range(len(comparison_for_excel)):
-        comparison_for_excel.loc[i, 'Week'] = f"Week {i}"
     if 'ds' in comparison_for_excel.columns:
+        # Change week labeling to W01, W02, etc.
+        for i in range(len(comparison_for_excel)):
+            comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
         comparison_for_excel.drop(columns=['ds'], inplace=True)
 
     wb = Workbook()
@@ -419,11 +519,18 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
             f"{total_forecast_8:.0f}",
             f"{total_forecast_4:.0f}",
             f"{max_forecast:.0f}",
-            f"{max_week.strftime('%Y-%m-%d')}",
+            f"{max_week.strftime('%Y-%m-%d') if max_week else 'N/A'}",
             f"{min_forecast:.0f}",
-            f"{min_week.strftime('%Y-%m-%d')}"
+            f"{min_week.strftime('%Y-%m-%d') if min_week else 'N/A'}"
         ]
     }
+
+    # Add additional metrics if available
+    if metrics is not None:
+        for k, v in metrics.items():
+            summary_data["Metric"].append(k)
+            summary_data["Value"].append(str(v))
+
     summary_df = pd.DataFrame(summary_data)
     for r in dataframe_to_rows(summary_df, index=False, header=True):
         ws2.append(r)
@@ -442,7 +549,7 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
 
         if 'ds' in df_for_excel.columns:
             for i in range(len(df_for_excel)):
-                df_for_excel.loc[i, 'Week'] = f"Week {i}"
+                df_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
             df_for_excel.drop(columns=['ds'], inplace=True)
 
         ws = wb.create_sheet(title=str(asin)[:31])
@@ -531,7 +638,7 @@ def main():
     forecasts_folder = 'forecasts_folder'
     asins_to_forecast_file = 'ASINs to Forecast.xlsx'
     output_file = 'consolidated_forecast.xlsx'
-    horizon = 20
+    horizon = 16
 
     data = load_weekly_sales_data(sales_file)
     valid_data = data[data['asin'].notna() & (data['asin'] != '#N/A')]
@@ -548,22 +655,28 @@ def main():
 
     consolidated_forecasts = {}
     param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-        'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
-        'holidays_prior_scale': [5, 10, 20]
+        'changepoint_prior_scale': [0.05, 0.1, 0.2],
+        'seasonality_prior_scale': [1, 2],
+        'holidays_prior_scale': [5, 10]
     }
 
     holidays = get_shifted_holidays()
 
-    # Optional cross-validation on one test ASIN
     if len(asin_list) > 0:
         test_asin = asin_list[0]
         test_ts_data = prepare_time_series_with_lags(valid_data, test_asin, lag_weeks=1)
         if not test_ts_data.empty and len(test_ts_data.dropna()) >= 2:
-            print(f"Performing cross-validation on ASIN {test_asin} Prophet model (no Amazon regressors)...")
-            cross_validate_prophet_model(test_ts_data, initial='365 days', period='180 days', horizon='180 days')
+            print(f"Performing cross-validation on ASIN {test_asin} Prophet model...")
+            cross_validate_prophet_model(test_ts_data, initial='365 days', period='180 days', horizon='90 days')
         else:
             print(f"Not enough data for {test_asin} to perform cross-validation test.")
+
+    insufficient_data_folder = "Insufficient data"
+    sufficient_data_folder = "Sufficient data"
+    os.makedirs(insufficient_data_folder, exist_ok=True)
+    os.makedirs(sufficient_data_folder, exist_ok=True)
+
+    global PARAM_COUNTER
 
     for asin in asin_list:
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
@@ -575,69 +688,217 @@ def main():
             continue
 
         ts_data = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
-        
-        # Check if we have at least 2 data points
+
         non_nan_count = len(ts_data.dropna(subset=['y']))
         if non_nan_count < 2:
             print(f"Not enough data for ASIN {asin} (only {non_nan_count} data points), skipping.")
+            no_data_output = os.path.join(insufficient_data_folder, f"{asin}_no_data.txt")
+            with open(no_data_output, 'w') as f:
+                f.write("Insufficient data for training/forecasting.\n")
             continue
 
-        best_params, best_rmse_values = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
-        print(f"Best parameters for ASIN {asin}: {best_params}")
-        print(f"Best RMSE values for ASIN {asin}: {best_rmse_values}")
+        model, model_type = choose_forecast_model(ts_data, threshold=20)
 
-        # Validate best params only if we have enough data for cross-validation
-        if len(ts_data.dropna()) >= 2:
-            validate_best_params(ts_data, best_params)
+        if model_type == "ARIMA":
+            cached_model = load_model("ARIMA", asin)
+            if cached_model is not None:
+                print(f"Using cached ARIMA model for ASIN {asin}.")
+                model = cached_model
+            else:
+                if model is not None:
+                    save_model(model, "ARIMA", asin)
+
+            if model is not None:
+                last_date = ts_data['ds'].iloc[-1]
+                forecast = arima_forecast(model, steps=horizon, last_date=last_date)
+                if forecast.empty:
+                    print(f"Forecasting failed for ASIN {asin}, skipping.")
+                    no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
+                    with open(no_data_output, 'w') as f:
+                        f.write("Failed to forecast due to insufficient data.\n")
+                    continue
+                comparison = forecast.copy()
+                comparison['ASIN'] = asin
+                comparison['Product Title'] = product_title
+
+                # Merge historical actuals for metrics
+                comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
+                comparison_historical = comparison.dropna(subset=['y'])
+
+                metrics = None
+                if not comparison_historical.empty:
+                    # Compute metrics
+                    MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                    MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                    MSE = mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                    RMSE = sqrt(MSE)
+                    MAPE = mean_absolute_percentage_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+
+                    print('Mean Absolute Error (MAE): ' + str(np.round(MAE, 2)))
+                    print('Median Absolute Error (MedAE): ' + str(np.round(MEDAE, 2)))
+                    print('Mean Squared Error (MSE): ' + str(np.round(MSE, 2)))
+                    print('Root Mean Squared Error (RMSE): ' + str(np.round(RMSE, 2)))
+                    print('Mean Absolute Percentage Error (MAPE): ' + str(np.round(MAPE, 2)) + ' %')
+
+                    metrics = {
+                        "Mean Absolute Error (MAE)": np.round(MAE, 2),
+                        "Median Absolute Error (MedAE)": np.round(MEDAE, 2),
+                        "Mean Squared Error (MSE)": np.round(MSE, 2),
+                        "Root Mean Squared Error (RMSE)": np.round(RMSE, 2),
+                        "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
+                    }
+
+                summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, comparison, horizon=horizon)
+                visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title, sufficient_data_folder)
+
+                output_file_name = f'forecast_summary_{asin}.xlsx'
+                output_file_path = os.path.join(sufficient_data_folder, output_file_name)
+                save_summary_to_excel(
+                    comparison,
+                    summary_stats,
+                    total_forecast_16,
+                    total_forecast_8,
+                    total_forecast_4,
+                    max_forecast,
+                    min_forecast,
+                    max_week,
+                    min_week,
+                    output_file_path,
+                    metrics=metrics
+                )
+                consolidated_forecasts[asin] = comparison
+            else:
+                print(f"ARIMA model fitting failed for {asin}, skipping.")
+                no_data_output = os.path.join(insufficient_data_folder, f"{asin}_arima_fit_failed.txt")
+                with open(no_data_output, 'w') as f:
+                    f.write("Insufficient data for ARIMA.\n")
+
         else:
-            print(f"Not enough data to validate best parameters for {asin}.")
+            cached_prophet_model = load_model("Prophet", asin)
+            if cached_prophet_model is not None:
+                print(f"Using cached Prophet model for ASIN {asin}.")
 
-        forecast, _ = forecast_with_custom_params(
-            ts_data, forecast_data,
-            best_params['changepoint_prior_scale'],
-            best_params['seasonality_prior_scale'],
-            best_params['holidays_prior_scale'],
-            horizon=horizon
-        )
+                # We must add the regressors that the model expects
+                # The model was trained with Amazon_* columns and prime_day.
+                # Let's replicate them with zeros
+                last_train_date = ts_data['ds'].max()
+                future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7), periods=horizon, freq='W')
+                future = pd.DataFrame({'ds': future_dates})
 
-        if forecast.empty:
-            print(f"Forecasting failed for ASIN {asin}, skipping.")
-            continue
+                # Add regressors
+                # Based on forecast_data keys, we have Amazon_{forecast_type}
+                for forecast_type in forecast_data.keys():
+                    future[f"Amazon_{forecast_type}"] = 0
+                # Add prime_day
+                future['prime_day'] = 0
 
-        comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
-        best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05)
-        print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
+                forecast = cached_prophet_model.predict(future)
+                forecast['Prophet Forecast'] = forecast['yhat']
+            else:
+                best_params, best_rmse_values = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
+                print(f"Best parameters for ASIN {asin}: {best_params}")
+                print(f"Best RMSE values for ASIN {asin}: {best_rmse_values}")
 
-        forecast = adjust_forecast_weights(forecast, *best_weights)
-        comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
-        comparison['Prophet Forecast'] = forecast['Prophet Forecast']
-        comparison['ASIN'] = asin
-        comparison['Product Title'] = product_title
+                validation_success = False
+                if len(ts_data.dropna()) >= 2:
+                    validation_success = validate_best_params(ts_data, best_params)
 
-        analyze_amazon_buying_habits(comparison, holidays)
+                forecast, trained_prophet_model = forecast_with_custom_params(
+                    ts_data, forecast_data,
+                    best_params['changepoint_prior_scale'],
+                    best_params['seasonality_prior_scale'],
+                    best_params['holidays_prior_scale'],
+                    horizon=horizon
+                )
 
-        summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, comparison, horizon=horizon)
-        visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title)
+                if trained_prophet_model is not None:
+                    save_model(trained_prophet_model, "Prophet", asin)
 
-        output_file_name = f'forecast_summary_{asin}.xlsx'
-        output_file_path = os.path.abspath(output_file_name)
-        save_summary_to_excel(
-            comparison,
-            summary_stats,
-            total_forecast_16,
-            total_forecast_8,
-            total_forecast_4,
-            max_forecast,
-            min_forecast,
-            max_week,
-            min_week,
-            output_file_path
-        )
+                if forecast.empty:
+                    print(f"Forecasting failed for ASIN {asin}, skipping.")
+                    no_data_output = os.path.join(insufficient_data_folder, f"{asin}_prophet_forecast_failed.txt")
+                    with open(no_data_output, 'w') as f:
+                        f.write("Insufficient data for Prophet forecasting.\n")
+                    continue
 
-        consolidated_forecasts[asin] = comparison
+                if not validation_success:
+                    insufficient_file = os.path.join(insufficient_data_folder, f"{asin}_insufficient_data.txt")
+                    with open(insufficient_file, 'w') as f:
+                        f.write("Insufficient data for cross-validation.\n")
 
-    save_forecast_to_excel(output_file, consolidated_forecasts, missing_asin_data)
+            if 'forecast' not in locals() or forecast.empty:
+                print(f"Forecasting failed for ASIN {asin}, skipping.")
+                no_data_output = os.path.join(insufficient_data_folder, f"{asin}_final_forecast_failed.txt")
+                with open(no_data_output, 'w') as f:
+                    f.write("Final forecasting failed.\n")
+                continue
+
+            comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
+            best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05)
+            print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
+
+            forecast = adjust_forecast_weights(forecast, *best_weights)
+            comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
+            comparison['Prophet Forecast'] = forecast['Prophet Forecast']
+            comparison['ASIN'] = asin
+            comparison['Product Title'] = product_title
+
+            analyze_amazon_buying_habits(comparison, holidays)
+
+            # Merge historical actuals for metrics
+            comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
+            comparison_historical = comparison.dropna(subset=['y'])
+
+            metrics = None
+            if not comparison_historical.empty:
+                # Compute metrics
+                MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                MSE = mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                RMSE = sqrt(MSE)
+                MAPE = mean_absolute_percentage_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+
+                print('Mean Absolute Error (MAE): ' + str(np.round(MAE, 2)))
+                print('Median Absolute Error (MedAE): ' + str(np.round(MEDAE, 2)))
+                print('Mean Squared Error (MSE): ' + str(np.round(MSE, 2)))
+                print('Root Mean Squared Error (RMSE): ' + str(np.round(RMSE, 2)))
+                print('Mean Absolute Percentage Error (MAPE): ' + str(np.round(MAPE, 2)) + ' %')
+
+                metrics = {
+                    "Mean Absolute Error (MAE)": np.round(MAE, 2),
+                    "Median Absolute Error (MedAE)": np.round(MEDAE, 2),
+                    "Mean Squared Error (MSE)": np.round(MSE, 2),
+                    "Root Mean Squared Error (RMSE)": np.round(RMSE, 2),
+                    "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
+                }
+
+            summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, comparison, horizon=horizon)
+            visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title, sufficient_data_folder)
+
+            output_file_name = f'forecast_summary_{asin}.xlsx'
+            output_file_path = os.path.join(sufficient_data_folder, output_file_name)
+            save_summary_to_excel(
+                comparison,
+                summary_stats,
+                total_forecast_16,
+                total_forecast_8,
+                total_forecast_4,
+                max_forecast,
+                min_forecast,
+                max_week,
+                min_week,
+                output_file_path,
+                metrics=metrics
+            )
+
+            consolidated_forecasts[asin] = comparison
+
+    final_output_path = os.path.join(sufficient_data_folder, output_file)
+    save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
+
+    print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
+    if POOR_PARAM_FOUND:
+        print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
 
 if __name__ == '__main__':
     main()
-
