@@ -471,16 +471,28 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
     print(f"Graph saved to {graph_file_path}")
 
 def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, output_file_path, metrics=None):
+    # Desired columns order
+    desired_columns = [
+        'Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean Forecast',
+        'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
+        'Product Title', 'is_holiday_week'
+    ]
+
     comparison_for_excel = comparison.copy()
-    if 'yhat' in comparison_for_excel.columns:
-        comparison_for_excel.drop(columns=['yhat'], inplace=True)
-    if 'yhat_upper' in comparison_for_excel.columns:
-        comparison_for_excel.drop(columns=['yhat_upper'], inplace=True)
+    # Remove columns we don't need and reorder
+    # First ensure 'Week' column formatting
     if 'ds' in comparison_for_excel.columns:
-        # Change week labeling to W01, W02, etc.
         for i in range(len(comparison_for_excel)):
             comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
-        comparison_for_excel.drop(columns=['ds'], inplace=True)
+        comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
+    
+    # Make sure all desired columns exist. If not, create them as blank or zero.
+    for col in desired_columns:
+        if col not in comparison_for_excel.columns:
+            comparison_for_excel[col] = np.nan
+    
+    # Select only desired columns in order
+    comparison_for_excel = comparison_for_excel[desired_columns]
 
     wb = Workbook()
     ws1 = wb.active
@@ -539,18 +551,30 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
     print(f"Comparison and summary saved to '{output_file_path}'")
 
 def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
+    # Desired columns order
+    desired_columns = [
+        'Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean Forecast',
+        'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
+        'Product Title', 'is_holiday_week'
+    ]
+
     wb = Workbook()
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
-        if 'yhat' in df_for_excel.columns:
-            df_for_excel.drop(columns=['yhat'], inplace=True)
-        if 'yhat_upper' in df_for_excel.columns:
-            df_for_excel.drop(columns=['yhat_upper'], inplace=True)
 
+        # Format week column
         if 'ds' in df_for_excel.columns:
             for i in range(len(df_for_excel)):
                 df_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
-            df_for_excel.drop(columns=['ds'], inplace=True)
+            df_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
+
+        # Ensure all columns exist
+        for col in desired_columns:
+            if col not in df_for_excel.columns:
+                df_for_excel[col] = np.nan
+
+        # Select and reorder columns
+        df_for_excel = df_for_excel[desired_columns]
 
         ws = wb.create_sheet(title=str(asin)[:31])
         for r in dataframe_to_rows(df_for_excel, index=False, header=True):
@@ -561,7 +585,10 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
         for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(r)
 
-    del wb['Sheet']
+    # Remove default sheet if exists
+    if 'Sheet' in wb.sheetnames:
+        del wb['Sheet']
+
     wb.save(output_path)
     print(f"All forecasts saved to {output_path}")
 
@@ -655,9 +682,9 @@ def main():
 
     consolidated_forecasts = {}
     param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1, 0.2],
-        'seasonality_prior_scale': [1, 2],
-        'holidays_prior_scale': [5, 10]
+        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
+        'holidays_prior_scale': [5, 10,15, 20]
     }
 
     holidays = get_shifted_holidays()
