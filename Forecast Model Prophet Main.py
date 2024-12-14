@@ -7,10 +7,11 @@ import warnings
 import os
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
-from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 import joblib
 from sklearn.metrics import mean_absolute_error, median_absolute_error, mean_absolute_percentage_error, mean_squared_error
 from math import sqrt
+from pykalman import KalmanFilter
 
 warnings.filterwarnings("ignore")
 
@@ -34,11 +35,41 @@ def load_model(model_type, asin):
     return None
 
 ##############################
-# Functions for Data Handling
+# Kalman filter-based Missing Data Handling
 ##############################
 
+def kalman_smooth(series):
+    values = series.values.astype(float)
+    initial_state_mean = np.nanmean(values)
+    if np.isnan(initial_state_mean):
+        initial_state_mean = 0.0
+
+    kf = KalmanFilter(
+        initial_state_mean=initial_state_mean,
+        n_dim_obs=1,
+        n_dim_state=1,
+        initial_state_covariance=1,
+        transition_matrices=[1],
+        observation_matrices=[1],
+        transition_covariance=0.1,
+        observation_covariance=1.0
+    )
+
+    masked_values = np.ma.array(values, mask=np.isnan(values))
+    kf = kf.em(masked_values, n_iter=5)
+    smoothed_state_means, _ = kf.smooth(masked_values)
+
+    # smoothed_state_means is Nx1, convert to 1D
+    smoothed_state_means_1d = smoothed_state_means[:, 0]
+
+    filled_values = values.copy()
+    nan_idx = np.isnan(values)
+    filled_values[nan_idx] = smoothed_state_means_1d[nan_idx]
+
+    return pd.Series(filled_values, index=series.index)
+
 def handle_missing_data(data):
-    data['y'] = data['y'].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+    data['y'] = kalman_smooth(data['y'])
     return data
 
 def handle_outliers(data):
@@ -55,30 +86,35 @@ def preprocess_data(data):
     data = handle_outliers(data)
     return data
 
-# ARIMA functions
-def fit_arima_model(data):
+##############################
+# SARIMA functions (replacing ARIMA)
+##############################
+
+def fit_sarima_model(data):
     try:
-        model = ARIMA(data['y'], order=(1, 1, 1))  # Default configuration; can be tuned
-        model_fit = model.fit()
+        # Basic SARIMA(1,1,1) with no seasonality.
+        model = SARIMAX(data['y'], order=(1,1,1), seasonal_order=(0,0,0,0),
+                        enforce_stationarity=False, enforce_invertibility=False)
+        model_fit = model.fit(disp=False)
         return model_fit
     except Exception as e:
-        print(f"Error fitting ARIMA model: {e}")
+        print(f"Error fitting SARIMA model: {e}")
         return None
 
-def arima_forecast(model_fit, steps, last_date):
+def sarima_forecast(model_fit, steps, last_date):
     try:
-        forecast = model_fit.forecast(steps=steps)
+        forecast_values = model_fit.forecast(steps=steps)
         future_dates = pd.date_range(start=last_date, periods=steps + 1, freq='W')[1:]
-        return pd.DataFrame({'ds': future_dates, 'Prophet Forecast': forecast})
+        return pd.DataFrame({'ds': future_dates, 'Prophet Forecast': forecast_values})
     except Exception as e:
-        print(f"Error during ARIMA forecasting: {e}")
+        print(f"Error during SARIMA forecasting: {e}")
         return pd.DataFrame(columns=['ds', 'Prophet Forecast'])
 
-def choose_forecast_model(ts_data, threshold=20):
+def choose_forecast_model(ts_data, threshold=50):
     if len(ts_data) <= threshold:
-        print("Dataset size is small. Using ARIMA for forecasting.")
-        arima_model = fit_arima_model(ts_data)
-        return arima_model, "ARIMA"
+        print("Dataset size is small. Using SARIMA for forecasting.")
+        sarima_model = fit_sarima_model(ts_data)
+        return sarima_model, "SARIMA"
     else:
         print("Dataset size is sufficient. Using Prophet for forecasting.")
         return None, "Prophet"
@@ -306,7 +342,6 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
 
     comparison.fillna(0, inplace=True)
 
-    # Add difference and percentage difference for each Amazon column
     for col in comparison.columns:
         if col.startswith('Amazon '):
             diff_col = f"Diff_{col.split('Amazon ')[1]}"
@@ -464,6 +499,7 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
     plt.gcf().text(0.78, 0.5, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8), va='center')
     plt.subplots_adjust(right=0.75)
 
+    # Ensure forecast graphs go to forecast_graphs folder
     os.makedirs(folder_name, exist_ok=True)
     graph_file_path = os.path.join(folder_name, f"{product_title.replace('/', '_')}_{asin}.png")
     plt.savefig(graph_file_path)
@@ -471,7 +507,6 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
     print(f"Graph saved to {graph_file_path}")
 
 def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, output_file_path, metrics=None):
-    # Desired columns order
     desired_columns = [
         'Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean Forecast',
         'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
@@ -479,19 +514,15 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
     ]
 
     comparison_for_excel = comparison.copy()
-    # Remove columns we don't need and reorder
-    # First ensure 'Week' column formatting
     if 'ds' in comparison_for_excel.columns:
         for i in range(len(comparison_for_excel)):
             comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
         comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
     
-    # Make sure all desired columns exist. If not, create them as blank or zero.
     for col in desired_columns:
         if col not in comparison_for_excel.columns:
             comparison_for_excel[col] = np.nan
     
-    # Select only desired columns in order
     comparison_for_excel = comparison_for_excel[desired_columns]
 
     wb = Workbook()
@@ -537,7 +568,6 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
         ]
     }
 
-    # Add additional metrics if available
     if metrics is not None:
         for k, v in metrics.items():
             summary_data["Metric"].append(k)
@@ -551,7 +581,6 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
     print(f"Comparison and summary saved to '{output_file_path}'")
 
 def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
-    # Desired columns order
     desired_columns = [
         'Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean Forecast',
         'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
@@ -562,18 +591,15 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
 
-        # Format week column
         if 'ds' in df_for_excel.columns:
             for i in range(len(df_for_excel)):
                 df_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
             df_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
 
-        # Ensure all columns exist
         for col in desired_columns:
             if col not in df_for_excel.columns:
                 df_for_excel[col] = np.nan
 
-        # Select and reorder columns
         df_for_excel = df_for_excel[desired_columns]
 
         ws = wb.create_sheet(title=str(asin)[:31])
@@ -585,7 +611,6 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
         for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(r)
 
-    # Remove default sheet if exists
     if 'Sheet' in wb.sheetnames:
         del wb['Sheet']
 
@@ -684,7 +709,7 @@ def main():
     param_grid = {
         'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
         'seasonality_prior_scale': [1, 2, 3, 4, 5, 10],
-        'holidays_prior_scale': [5, 10,15, 20]
+        'holidays_prior_scale': [5, 10, 15, 20]
     }
 
     holidays = get_shifted_holidays()
@@ -724,20 +749,20 @@ def main():
                 f.write("Insufficient data for training/forecasting.\n")
             continue
 
-        model, model_type = choose_forecast_model(ts_data, threshold=20)
+        model, model_type = choose_forecast_model(ts_data, threshold=50)
 
-        if model_type == "ARIMA":
-            cached_model = load_model("ARIMA", asin)
+        if model_type == "SARIMA":
+            cached_model = load_model("SARIMA", asin)
             if cached_model is not None:
-                print(f"Using cached ARIMA model for ASIN {asin}.")
+                print(f"Using cached SARIMA model for ASIN {asin}.")
                 model = cached_model
             else:
                 if model is not None:
-                    save_model(model, "ARIMA", asin)
+                    save_model(model, "SARIMA", asin)
 
             if model is not None:
                 last_date = ts_data['ds'].iloc[-1]
-                forecast = arima_forecast(model, steps=horizon, last_date=last_date)
+                forecast = sarima_forecast(model, steps=horizon, last_date=last_date)
                 if forecast.empty:
                     print(f"Forecasting failed for ASIN {asin}, skipping.")
                     no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
@@ -748,13 +773,11 @@ def main():
                 comparison['ASIN'] = asin
                 comparison['Product Title'] = product_title
 
-                # Merge historical actuals for metrics
                 comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
                 comparison_historical = comparison.dropna(subset=['y'])
 
                 metrics = None
                 if not comparison_historical.empty:
-                    # Compute metrics
                     MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
                     MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
                     MSE = mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
@@ -795,28 +818,23 @@ def main():
                 )
                 consolidated_forecasts[asin] = comparison
             else:
-                print(f"ARIMA model fitting failed for {asin}, skipping.")
-                no_data_output = os.path.join(insufficient_data_folder, f"{asin}_arima_fit_failed.txt")
+                print(f"SARIMA model fitting failed for {asin}, skipping.")
+                no_data_output = os.path.join(insufficient_data_folder, f"{asin}_sarima_fit_failed.txt")
                 with open(no_data_output, 'w') as f:
-                    f.write("Insufficient data for ARIMA.\n")
+                    f.write("Insufficient data for SARIMA.\n")
 
         else:
+            # Prophet logic for large datasets remains unchanged.
             cached_prophet_model = load_model("Prophet", asin)
             if cached_prophet_model is not None:
                 print(f"Using cached Prophet model for ASIN {asin}.")
-
-                # We must add the regressors that the model expects
-                # The model was trained with Amazon_* columns and prime_day.
-                # Let's replicate them with zeros
                 last_train_date = ts_data['ds'].max()
                 future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7), periods=horizon, freq='W')
                 future = pd.DataFrame({'ds': future_dates})
 
-                # Add regressors
-                # Based on forecast_data keys, we have Amazon_{forecast_type}
+                # Add regressors with zeros
                 for forecast_type in forecast_data.keys():
                     future[f"Amazon_{forecast_type}"] = 0
-                # Add prime_day
                 future['prime_day'] = 0
 
                 forecast = cached_prophet_model.predict(future)
@@ -872,13 +890,11 @@ def main():
 
             analyze_amazon_buying_habits(comparison, holidays)
 
-            # Merge historical actuals for metrics
             comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
             comparison_historical = comparison.dropna(subset=['y'])
 
             metrics = None
             if not comparison_historical.empty:
-                # Compute metrics
                 MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
                 MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
                 MSE = mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
@@ -920,7 +936,8 @@ def main():
 
             consolidated_forecasts[asin] = comparison
 
-    final_output_path = os.path.join(sufficient_data_folder, output_file)
+    # Save the consolidated forecast in the same directory as the script, no folder.
+    final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
