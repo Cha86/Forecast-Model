@@ -59,12 +59,13 @@ def kalman_smooth(series):
     kf = kf.em(masked_values, n_iter=5)
     smoothed_state_means, _ = kf.smooth(masked_values)
 
-    # smoothed_state_means is Nx1, convert to 1D
     smoothed_state_means_1d = smoothed_state_means[:, 0]
-
     filled_values = values.copy()
     nan_idx = np.isnan(values)
     filled_values[nan_idx] = smoothed_state_means_1d[nan_idx]
+
+    # Round to integer since we want no decimals
+    filled_values = np.round(filled_values).astype(int)
 
     return pd.Series(filled_values, index=series.index)
 
@@ -78,7 +79,9 @@ def handle_outliers(data):
     IQR = Q3 - Q1
     lower_bound = Q1 - 1.5 * IQR
     upper_bound = Q3 + 1.5 * IQR
-    data['y'] = data['y'].clip(lower=lower_bound, upper=upper_bound)
+    # After clipping, round and convert to int
+    clipped = data['y'].clip(lower=lower_bound, upper=upper_bound).round().astype(int)
+    data['y'] = clipped
     return data
 
 def preprocess_data(data):
@@ -87,33 +90,80 @@ def preprocess_data(data):
     return data
 
 ##############################
-# SARIMA functions (replacing ARIMA)
+# SARIMA functions
 ##############################
 
-def fit_sarima_model(data):
-    try:
-        # Basic SARIMA(1,1,1) with no seasonality.
-        model = SARIMAX(data['y'], order=(1,1,1), seasonal_order=(0,0,0,0),
-                        enforce_stationarity=False, enforce_invertibility=False)
-        model_fit = model.fit(disp=False)
-        return model_fit
-    except Exception as e:
-        print(f"Error fitting SARIMA model: {e}")
+def create_holiday_regressors(ts_data, holidays):
+    holiday_names = holidays['holiday'].unique()
+    exog = pd.DataFrame(index=ts_data.index)
+    exog['ds'] = ts_data['ds']
+
+    for h in holiday_names:
+        holiday_dates = holidays[holidays['holiday'] == h]['ds']
+        exog[h] = exog['ds'].isin(holiday_dates).astype(int)
+
+    exog.drop(columns=['ds'], inplace=True)
+    return exog
+
+def fit_sarima_model(data, holidays, seasonal_period=7):
+    p_values = [0, 1, 2]
+    d_values = [0, 1]
+    q_values = [0, 1, 2]
+    P_values = [0, 1]
+    D_values = [0, 1]
+    Q_values = [0, 1]
+    m_values = [seasonal_period]
+
+    exog = create_holiday_regressors(data, holidays)
+    best_aic = float('inf')
+    best_model = None
+
+    for p in p_values:
+        for d in d_values:
+            for q in q_values:
+                for P in P_values:
+                    for D in D_values:
+                        for Q in Q_values:
+                            for m in m_values:
+                                try:
+                                    model = SARIMAX(
+                                        data['y'],
+                                        order=(p, d, q),
+                                        seasonal_order=(P, D, Q, m),
+                                        exog=exog if not exog.empty else None,
+                                        enforce_stationarity=False,
+                                        enforce_invertibility=False
+                                    )
+                                    model_fit = model.fit(disp=False)
+                                    aic = model_fit.aic
+                                    if aic < best_aic:
+                                        best_aic = aic
+                                        best_model = model_fit
+                                except:
+                                    continue
+
+    if best_model is None:
+        print("No suitable SARIMA model found.")
         return None
+    else:
+        print(f"Best SARIMA model AIC={best_aic}")
+        return best_model
 
 def sarima_forecast(model_fit, steps, last_date):
     try:
         forecast_values = model_fit.forecast(steps=steps)
+        # Round forecast to int
+        forecast_values = forecast_values.round().astype(int)
         future_dates = pd.date_range(start=last_date, periods=steps + 1, freq='W')[1:]
         return pd.DataFrame({'ds': future_dates, 'Prophet Forecast': forecast_values})
     except Exception as e:
         print(f"Error during SARIMA forecasting: {e}")
         return pd.DataFrame(columns=['ds', 'Prophet Forecast'])
 
-def choose_forecast_model(ts_data, threshold=50):
+def choose_forecast_model(ts_data, threshold=50, holidays=None):
     if len(ts_data) <= threshold:
         print("Dataset size is small. Using SARIMA for forecasting.")
-        sarima_model = fit_sarima_model(ts_data)
+        sarima_model = fit_sarima_model(ts_data, holidays, seasonal_period=7)
         return sarima_model, "SARIMA"
     else:
         print("Dataset size is sufficient. Using Prophet for forecasting.")
@@ -135,7 +185,9 @@ def load_weekly_sales_data(file_path):
         raise ValueError(f"Missing required columns: {missing_required}")
 
     data['date'] = data.apply(generate_date_from_week, axis=1)
+    # Convert units_sold to int (no decimals)
     data = data.rename(columns={'units_sold': 'y'})
+    data['y'] = data['y'].astype(int)
     return data
 
 def load_asins_to_forecast(file_path):
@@ -196,8 +248,7 @@ def prepare_time_series_with_lags(data, asin, lag_weeks=1):
     ts_data = data[data['asin'] == asin].rename(columns={'date': 'ds', 'y': 'y'})
     ts_data = ts_data.sort_values('ds')
     ts_data = preprocess_data(ts_data)
-    ts_data = add_lag_features(ts_data, lag_weeks)
-    return ts_data
+    return add_lag_features(ts_data, lag_weeks)
 
 def get_shifted_holidays():
     holidays_list = [
@@ -228,7 +279,8 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
             [
                 np.full(len(ts_data), np.nan),
                 values_to_use,
-                np.full(max(horizon - len(values_to_use), 0), values_to_use[-1] if len(values_to_use) > 0 else 0)
+                np.full(max(horizon - len(values_to_use), 0),
+                        values_to_use[-1] if len(values_to_use) > 0 else 0)
             ]
         )
         extended_values = extended_values[:len(combined_df)]
@@ -261,7 +313,8 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     try:
         model.fit(train_df)
         forecast = model.predict(future_df)
-        forecast['Prophet Forecast'] = forecast['yhat']
+        # Round the Prophet Forecast to int
+        forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
         return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']], model
     except Exception as e:
         print(f"Error during forecasting: {e}")
@@ -298,7 +351,6 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
                     avg_rmse = np.mean(list(rmse_values.values()))
 
                     if avg_rmse > EARLY_STOP_THRESHOLD:
-                        # Early stopping condition
                         print("Early stopping triggered due to poor parameter performance.")
                         POOR_PARAM_FOUND = True
                         return best_params, best_rmse_values
@@ -326,6 +378,7 @@ def calculate_rmse(forecast, forecast_data, horizon):
     rmse_values = {}
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
+        # Prophet Forecast is already int
         rmse = np.sqrt(((forecast['Prophet Forecast'] - values) ** 2).mean())
         rmse_values[forecast_type] = rmse
     return rmse_values
@@ -334,6 +387,8 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
     comparison = prophet_forecast.copy()
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
+        # Values should already be int, ensure int here
+        values = np.array(values, dtype=int)
         forecast_df = pd.DataFrame({
             'ds': prophet_forecast['ds'],
             f'Amazon {forecast_type}': values
@@ -346,9 +401,19 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
         if col.startswith('Amazon '):
             diff_col = f"Diff_{col.split('Amazon ')[1]}"
             pct_col = f"Pct_{col.split('Amazon ')[1]}"
-            comparison[diff_col] = comparison['Prophet Forecast'] - comparison[col]
-            comparison[pct_col] = np.where(comparison[col] != 0,
-                                           (comparison[diff_col] / comparison[col]) * 100, 0)
+            comparison[diff_col] = (comparison['Prophet Forecast'] - comparison[col]).astype(int)
+            comparison[pct_col] = np.where(
+                comparison[col] != 0,
+                (comparison[diff_col] / comparison[col]) * 100,
+                0
+            )
+
+    # Ensure all forecasts and calculations are int where appropriate
+    comparison['Prophet Forecast'] = comparison['Prophet Forecast'].astype(int)
+    for col in comparison.columns:
+        if col.startswith("Amazon ") or col.startswith("Diff_"):
+            comparison[col] = comparison[col].astype(int, errors='ignore')
+    # Pct_ columns may remain float since they are percentages
 
     return comparison
 
@@ -356,9 +421,11 @@ def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     if 'yhat' not in forecast or 'yhat_upper' not in forecast:
         raise KeyError("'yhat' or 'yhat_upper' not found in forecast DataFrame.")
 
-    forecast['Prophet Forecast'] = (
+    adj_forecast = (
         yhat_weight * forecast['yhat'] + yhat_upper_weight * forecast['yhat_upper']
-    ).clip(lower=0).round().astype(int)
+    ).clip(lower=0)
+    adj_forecast = adj_forecast.round().astype(int)
+    forecast['Prophet Forecast'] = adj_forecast
     return forecast
 
 def find_best_forecast_weights(forecast, comparison, weights):
@@ -499,7 +566,6 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total
     plt.gcf().text(0.78, 0.5, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8), va='center')
     plt.subplots_adjust(right=0.75)
 
-    # Ensure forecast graphs go to forecast_graphs folder
     os.makedirs(folder_name, exist_ok=True)
     graph_file_path = os.path.join(folder_name, f"{product_title.replace('/', '_')}_{asin}.png")
     plt.savefig(graph_file_path)
@@ -749,7 +815,7 @@ def main():
                 f.write("Insufficient data for training/forecasting.\n")
             continue
 
-        model, model_type = choose_forecast_model(ts_data, threshold=50)
+        model, model_type = choose_forecast_model(ts_data, threshold=50, holidays=holidays)
 
         if model_type == "SARIMA":
             cached_model = load_model("SARIMA", asin)
@@ -824,7 +890,6 @@ def main():
                     f.write("Insufficient data for SARIMA.\n")
 
         else:
-            # Prophet logic for large datasets remains unchanged.
             cached_prophet_model = load_model("Prophet", asin)
             if cached_prophet_model is not None:
                 print(f"Using cached Prophet model for ASIN {asin}.")
@@ -832,13 +897,12 @@ def main():
                 future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7), periods=horizon, freq='W')
                 future = pd.DataFrame({'ds': future_dates})
 
-                # Add regressors with zeros
                 for forecast_type in forecast_data.keys():
                     future[f"Amazon_{forecast_type}"] = 0
                 future['prime_day'] = 0
 
                 forecast = cached_prophet_model.predict(future)
-                forecast['Prophet Forecast'] = forecast['yhat']
+                forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
             else:
                 best_params, best_rmse_values = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
                 print(f"Best parameters for ASIN {asin}: {best_params}")
@@ -936,7 +1000,6 @@ def main():
 
             consolidated_forecasts[asin] = comparison
 
-    # Save the consolidated forecast in the same directory as the script, no folder.
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
 
