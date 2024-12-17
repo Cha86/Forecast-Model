@@ -97,7 +97,6 @@ def kalman_smooth(series):
     nan_idx = np.isnan(values)
     filled_values[nan_idx] = smoothed_state_means_1d[nan_idx]
 
-    # Round to integer since we want no decimals
     filled_values = np.round(filled_values).astype(int)
 
     return pd.Series(filled_values, index=series.index)
@@ -112,7 +111,6 @@ def handle_outliers(data):
     IQR = Q3 - Q1
     lower_bound = Q1 - 1.5 * IQR
     upper_bound = Q3 + 1.5 * IQR
-    # After clipping, round and convert to int
     clipped = data['y'].clip(lower=lower_bound, upper=upper_bound).round().astype(int)
     data['y'] = clipped
     return data
@@ -209,10 +207,10 @@ def generate_future_exog(holidays, steps, last_date):
 def choose_forecast_model(ts_data, threshold=50, holidays=None):
     if len(ts_data) <= threshold:
         print("Dataset size is small. Using SARIMA for forecasting.")
-        exog = create_holiday_regressors(ts_data, holidays)  # Generate exogenous regressors
+        exog = create_holiday_regressors(ts_data, holidays)  
         sarima_model = fit_sarima_model(ts_data, holidays, seasonal_period=7)
         if sarima_model is not None:
-            save_model(sarima_model, "SARIMA", ts_data['asin'].iloc[0], exog)  # Save model with exog
+            save_model(sarima_model, "SARIMA", ts_data['asin'].iloc[0], exog)  
         return sarima_model, "SARIMA"
     else:
         print("Dataset size is sufficient. Using Prophet for forecasting.")
@@ -234,7 +232,6 @@ def load_weekly_sales_data(file_path):
         raise ValueError(f"Missing required columns: {missing_required}")
 
     data['date'] = data.apply(generate_date_from_week, axis=1)
-    # Convert units_sold to int (no decimals)
     data = data.rename(columns={'units_sold': 'y'})
     data['y'] = data['y'].astype(int)
     return data
@@ -362,7 +359,6 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     try:
         model.fit(train_df)
         forecast = model.predict(future_df)
-        # Round the Prophet Forecast to int
         forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
         return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']], model
     except Exception as e:
@@ -427,7 +423,6 @@ def calculate_rmse(forecast, forecast_data, horizon):
     rmse_values = {}
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
-        # Prophet Forecast is already int
         rmse = np.sqrt(((forecast['Prophet Forecast'] - values) ** 2).mean())
         rmse_values[forecast_type] = rmse
     return rmse_values
@@ -436,7 +431,6 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
     comparison = prophet_forecast.copy()
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
-        # Values should already be int, ensure int here
         values = np.array(values, dtype=int)
         forecast_df = pd.DataFrame({
             'ds': prophet_forecast['ds'],
@@ -457,12 +451,10 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
                 0
             )
 
-    # Ensure all forecasts and calculations are int where appropriate
     comparison['Prophet Forecast'] = comparison['Prophet Forecast'].astype(int)
     for col in comparison.columns:
         if col.startswith("Amazon ") or col.startswith("Diff_"):
             comparison[col] = comparison[col].astype(int, errors='ignore')
-    # Pct_ columns may remain float since they are percentages
 
     return comparison
 
