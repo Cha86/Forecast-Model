@@ -19,20 +19,53 @@ warnings.filterwarnings("ignore")
 # Added Functions for Caching
 ##############################
 
-def save_model(model, model_type, asin):
-    """Save the fitted model for later use."""
+def save_model(model, model_type, asin, ts_data):
+    """Save the fitted model for later use, along with last training date."""
     model_cache_folder = "model_cache"
     os.makedirs(model_cache_folder, exist_ok=True)
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
+    
+    # Attach metadata: last training date
+    model.last_train_date = ts_data['ds'].max()
+    
     joblib.dump(model, model_path)
 
 def load_model(model_type, asin):
-    """Load the previously saved model if it exists."""
+    """Load the previously saved model and exogenous variables if they exist."""
     model_cache_folder = "model_cache"
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
+    exog_path = os.path.join(model_cache_folder, f"{asin}_{model_type}_exog.pkl")
+
     if os.path.exists(model_path):
-        return joblib.load(model_path)
-    return None
+        model = joblib.load(model_path)
+        if os.path.exists(exog_path): 
+            exog = joblib.load(exog_path)
+            return model, exog
+        return model, None  
+    return None, None
+
+def is_model_up_to_date(cached_model_path, ts_data):
+    """
+    Check if the cached model is up-to-date with the latest data.
+    Compare the last training date of the model with the latest date in ts_data.
+    """
+    if not os.path.exists(cached_model_path):
+        return False  # Cache doesn't exist, retrain is needed
+    
+    model = joblib.load(cached_model_path)
+    
+    # Assuming last training date is stored in the model metadata
+    if hasattr(model, 'last_train_date'):
+        last_train_date = model.last_train_date
+        latest_data_date = ts_data['ds'].max()
+        
+        if last_train_date >= latest_data_date:
+            return True  # Model is up-to-date
+        else:
+            return False  # New data is present, retrain needed
+    return False  # If no metadata is available, assume retrain is needed
+
+
 
 ##############################
 # Kalman filter-based Missing Data Handling
@@ -149,10 +182,14 @@ def fit_sarima_model(data, holidays, seasonal_period=7):
         print(f"Best SARIMA model AIC={best_aic}")
         return best_model
 
-def sarima_forecast(model_fit, steps, last_date):
+def sarima_forecast(model_fit, steps, last_date, exog=None):
     try:
-        forecast_values = model_fit.forecast(steps=steps)
-        # Round forecast to int
+        if exog is not None:
+            exog_future = exog.iloc[-steps:].copy()
+        else:
+            exog_future = None
+
+        forecast_values = model_fit.forecast(steps=steps, exog=exog_future)
         forecast_values = forecast_values.round().astype(int)
         future_dates = pd.date_range(start=last_date, periods=steps + 1, freq='W')[1:]
         return pd.DataFrame({'ds': future_dates, 'Prophet Forecast': forecast_values})
@@ -160,10 +197,22 @@ def sarima_forecast(model_fit, steps, last_date):
         print(f"Error during SARIMA forecasting: {e}")
         return pd.DataFrame(columns=['ds', 'Prophet Forecast'])
 
+def generate_future_exog(holidays, steps, last_date):
+    future_dates = pd.date_range(start=last_date, periods=steps + 1, freq='W')[1:]
+    exog_future = pd.DataFrame(index=future_dates)
+
+    for h in holidays['holiday'].unique():
+        exog_future[h] = exog_future.index.isin(holidays[holidays['holiday'] == h]['ds'])
+    
+    return exog_future.astype(int)
+
 def choose_forecast_model(ts_data, threshold=50, holidays=None):
     if len(ts_data) <= threshold:
         print("Dataset size is small. Using SARIMA for forecasting.")
+        exog = create_holiday_regressors(ts_data, holidays)  # Generate exogenous regressors
         sarima_model = fit_sarima_model(ts_data, holidays, seasonal_period=7)
+        if sarima_model is not None:
+            save_model(sarima_model, "SARIMA", ts_data['asin'].iloc[0], exog)  # Save model with exog
         return sarima_model, "SARIMA"
     else:
         print("Dataset size is sufficient. Using Prophet for forecasting.")
@@ -818,17 +867,20 @@ def main():
         model, model_type = choose_forecast_model(ts_data, threshold=50, holidays=holidays)
 
         if model_type == "SARIMA":
-            cached_model = load_model("SARIMA", asin)
-            if cached_model is not None:
+            # SARIMA logic remains as is...
+            model, exog = load_model("SARIMA", asin)
+            if model is not None:
                 print(f"Using cached SARIMA model for ASIN {asin}.")
-                model = cached_model
             else:
-                if model is not None:
-                    save_model(model, "SARIMA", asin)
+                exog = create_holiday_regressors(ts_data, holidays) 
+                model = fit_sarima_model(ts_data, holidays, seasonal_period=7)
+            if model is not None:
+                save_model(model, "SARIMA", asin, ts_data)
 
             if model is not None:
                 last_date = ts_data['ds'].iloc[-1]
-                forecast = sarima_forecast(model, steps=horizon, last_date=last_date)
+                exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date)
+                forecast = sarima_forecast(model, steps=horizon, last_date=last_date, exog=exog_future)
                 if forecast.empty:
                     print(f"Forecasting failed for ASIN {asin}, skipping.")
                     no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
@@ -890,28 +942,48 @@ def main():
                     f.write("Insufficient data for SARIMA.\n")
 
         else:
-            cached_prophet_model = load_model("Prophet", asin)
-            if cached_prophet_model is not None:
-                print(f"Using cached Prophet model for ASIN {asin}.")
-                last_train_date = ts_data['ds'].max()
-                future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7), periods=horizon, freq='W')
-                future = pd.DataFrame({'ds': future_dates})
+            # PROPHT MODEL LOGIC WITH CACHING AND UP-TO-DATE CHECK
+            cached_model_path = os.path.join("model_cache", f"{asin}_Prophet.pkl")
 
-                for forecast_type in forecast_data.keys():
-                    future[f"Amazon_{forecast_type}"] = 0
-                future['prime_day'] = 0
+            # Check if cached model exists and is up-to-date
+            if os.path.exists(cached_model_path):
+                # Validate if the cached model is up-to-date
+                if is_model_up_to_date(cached_model_path, ts_data):
+                    print(f"Using up-to-date cached Prophet model for ASIN {asin}.")
+                    cached_prophet_model = joblib.load(cached_model_path)
+                    
+                    # Predict future values using the cached model
+                    last_train_date = ts_data['ds'].max()
+                    future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7), periods=horizon, freq='W')
+                    future = pd.DataFrame({'ds': future_dates})
 
-                forecast = cached_prophet_model.predict(future)
-                forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
+                    # Add regressors if any forecast data exists
+                    for forecast_type in forecast_data.keys():
+                        future[f"Amazon_{forecast_type}"] = 0
+                    future['prime_day'] = 0
+
+                    forecast = cached_prophet_model.predict(future)
+                    forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
+                else:
+                    print(f"Cached Prophet model for ASIN {asin} is outdated. Retraining with updated data...")
+                    # Retrain Prophet model with updated data
+                    best_params, _ = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
+                    forecast, trained_prophet_model = forecast_with_custom_params(
+                        ts_data, forecast_data,
+                        best_params['changepoint_prior_scale'],
+                        best_params['seasonality_prior_scale'],
+                        best_params['holidays_prior_scale'],
+                        horizon=horizon
+                    )
+
+                    if trained_prophet_model is not None:
+                        save_model(trained_prophet_model, "Prophet", asin, ts_data)
+                    else:
+                        print("Failed to retrain the Prophet model.")
             else:
-                best_params, best_rmse_values = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
-                print(f"Best parameters for ASIN {asin}: {best_params}")
-                print(f"Best RMSE values for ASIN {asin}: {best_rmse_values}")
-
-                validation_success = False
-                if len(ts_data.dropna()) >= 2:
-                    validation_success = validate_best_params(ts_data, best_params)
-
+                print(f"No cached Prophet model found for ASIN {asin}. Training a new model...")
+                # Train Prophet model from scratch
+                best_params, _ = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
                 forecast, trained_prophet_model = forecast_with_custom_params(
                     ts_data, forecast_data,
                     best_params['changepoint_prior_scale'],
@@ -921,19 +993,9 @@ def main():
                 )
 
                 if trained_prophet_model is not None:
-                    save_model(trained_prophet_model, "Prophet", asin)
-
-                if forecast.empty:
-                    print(f"Forecasting failed for ASIN {asin}, skipping.")
-                    no_data_output = os.path.join(insufficient_data_folder, f"{asin}_prophet_forecast_failed.txt")
-                    with open(no_data_output, 'w') as f:
-                        f.write("Insufficient data for Prophet forecasting.\n")
-                    continue
-
-                if not validation_success:
-                    insufficient_file = os.path.join(insufficient_data_folder, f"{asin}_insufficient_data.txt")
-                    with open(insufficient_file, 'w') as f:
-                        f.write("Insufficient data for cross-validation.\n")
+                    save_model(trained_prophet_model, "Prophet", asin, ts_data)
+                else:
+                    print("Failed to train the Prophet model.")
 
             if 'forecast' not in locals() or forecast.empty:
                 print(f"Forecasting failed for ASIN {asin}, skipping.")
@@ -1007,5 +1069,8 @@ def main():
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
 
+
 if __name__ == '__main__':
     main()
+
+
