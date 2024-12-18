@@ -27,10 +27,8 @@ def save_model(model, model_type, asin, ts_data):
     model_cache_folder = "model_cache"
     os.makedirs(model_cache_folder, exist_ok=True)
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
-    
     # Attach metadata: last training date
     model.last_train_date = ts_data['ds'].max()
-    
     joblib.dump(model, model_path)
 
 def load_model(model_type, asin):
@@ -59,11 +57,7 @@ def is_model_up_to_date(cached_model_path, ts_data):
     if hasattr(model, 'last_train_date'):
         last_train_date = model.last_train_date
         latest_data_date = ts_data['ds'].max()
-        
-        if last_train_date >= latest_data_date:
-            return True
-        else:
-            return False
+        return last_train_date >= latest_data_date
     return False
 
 ##############################
@@ -97,7 +91,6 @@ def kalman_smooth(series):
     filled_values[nan_idx] = smoothed_state_means_1d[nan_idx]
 
     filled_values = np.round(filled_values).astype(int)
-
     return pd.Series(filled_values, index=series.index)
 
 def handle_missing_data(data):
@@ -124,7 +117,7 @@ def preprocess_data(data):
 ##############################
 
 def differencing(timeseries, m):
-    # Skipped actual usage for brevity, code included from snippet
+    # Provided as-is from snippet
     info = []
     tcopy = timeseries.copy()
 
@@ -181,43 +174,73 @@ def create_holiday_regressors(ts_data, holidays):
 
 def fit_sarima_model(data, holidays, seasonal_period=52):
     exog = create_holiday_regressors(data, holidays)
-    stepwise_model = auto_arima(data['y'], exogenous=exog if not exog.empty else None,
-                                seasonal=True, m=seasonal_period,
-                                trace=False, error_action='ignore', suppress_warnings=True,
-                                max_p=5, max_q=5, max_P=2, max_Q=2, max_D=2, max_D_in=2)
-    if stepwise_model is None:
-        print("No suitable SARIMA model found via auto_arima.")
+    sample_size = len(data)
+
+    # Adjust seasonal_period dynamically if dataset is too small
+    if sample_size < 52:
+        if sample_size >= 12:
+            seasonal_period = 12
+        elif sample_size >= 4:
+            seasonal_period = 4
+        else:
+            seasonal_period = 1
+        print(f"Dataset too small for m=52. Adjusting seasonal_period to m={seasonal_period} based on data size.")
+
+    try:
+        stepwise_model = auto_arima(
+            data['y'], 
+            exogenous=exog if not exog.empty else None,
+            seasonal=True, 
+            m=seasonal_period,
+            trace=False, 
+            error_action='ignore', 
+            suppress_warnings=True,
+            max_p=5, max_q=5, max_P=2, max_Q=2, max_D=2, max_D_in=2
+        )
+        if stepwise_model is None:
+            print("No suitable SARIMA model found via auto_arima.")
+            return None
+
+        order = stepwise_model.order
+        seasonal_order = stepwise_model.seasonal_order
+        print(f"Best SARIMA model found by auto_arima: order={order}, seasonal_order={seasonal_order}")
+
+        sarima = SARIMAX(
+            data['y'], 
+            order=order, 
+            seasonal_order=seasonal_order, 
+            exog=exog if not exog.empty else None,
+            enforce_stationarity=False, 
+            enforce_invertibility=False
+        )
+        sarima_fit = sarima.fit(disp=False)
+        return sarima_fit
+
+    except ValueError as e:
+        print(f"Error fitting SARIMA model: {e}")
         return None
-    
-    order = stepwise_model.order
-    seasonal_order = stepwise_model.seasonal_order
-    print(f"Best SARIMA model found by auto_arima: order={order}, seasonal_order={seasonal_order}")
-    sarima = SARIMAX(data['y'], order=order, seasonal_order=seasonal_order, exog=exog if not exog.empty else None,
-                     enforce_stationarity=False, enforce_invertibility=False)
-    sarima_fit = sarima.fit(disp=False)
-    return sarima_fit
 
 def sarima_forecast(model_fit, steps, last_date, exog=None):
-    if exog is not None:
-        exog_future = exog.iloc[-steps:].copy()
-    else:
-        exog_future = None
-
-    forecast_values = model_fit.forecast(steps=steps, exog=exog_future)
+    # Just forecast out-of-sample steps
+    forecast_values = model_fit.forecast(steps=steps, exog=exog)
     forecast_values = forecast_values.round().astype(int)
-    future_dates = pd.date_range(start=last_date, periods=steps + 1, freq='W')[1:]
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
     return pd.DataFrame({'ds': future_dates, 'Prophet Forecast': forecast_values})
 
 def generate_future_exog(holidays, steps, last_date):
-    # This function is used for SARIMA to create future exogenous regressors based on holidays
-    # Prophet does not need a similar function because it handles regressors internally.
-    future_dates = pd.date_range(start=last_date, periods=steps + 1, freq='W')[1:]
+    """
+    Generate future exogenous regressors for exactly 'steps' weeks after last_date.
+    """
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
     exog_future = pd.DataFrame(index=future_dates)
 
-    for h in holidays['holiday'].unique():
+    # For each holiday column used in training, ensure we create the same columns here
+    holiday_names = holidays['holiday'].unique()
+    for h in holiday_names:
         exog_future[h] = exog_future.index.isin(holidays[holidays['holiday'] == h]['ds'])
-    
-    return exog_future.astype(int)
+
+    exog_future = exog_future.astype(int)
+    return exog_future
 
 def choose_forecast_model(ts_data, threshold=50, holidays=None):
     if len(ts_data) <= threshold:
@@ -236,6 +259,11 @@ def generate_date_from_week(row):
     week_number = int(week_str[1:])
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
+def clean_weekly_sales_data(data):
+    # If needed, implement any cleaning logic to remove duplicates, etc.
+    # For now, just return the data as is.
+    return data
+
 def load_weekly_sales_data(file_path):
     data = pd.read_excel(file_path)
     data.columns = data.columns.str.strip().str.lower()
@@ -248,6 +276,8 @@ def load_weekly_sales_data(file_path):
     data['date'] = data.apply(generate_date_from_week, axis=1)
     data = data.rename(columns={'units_sold': 'y'})
     data['y'] = data['y'].astype(int)
+
+    data = clean_weekly_sales_data(data)
     return data
 
 def load_asins_to_forecast(file_path):
@@ -354,12 +384,10 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
         lambda x: 0.2 if x in holidays[holidays['holiday'] == 'Prime Day']['ds'].values else 0
     )
 
-    # Implement a training set for prophet
-    # 80% train, 20% test just to evaluate prophet
     n = len(ts_data)
     split = int(n*0.8)
     train_df = combined_df.iloc[:split].dropna(subset=['y']).copy()
-    test_df = combined_df.iloc[split:].copy()  # We'll forecast this period to compare
+    test_df = combined_df.iloc[split:].copy()
 
     model = Prophet(
         yearly_seasonality=True,
@@ -376,10 +404,8 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
 
     model.fit(train_df[['ds','y'] + regressor_cols + ['prime_day']])
     
-    # Forecast test period to evaluate prophet
     test_future = test_df.drop(columns='y').copy()
     test_forecast = model.predict(test_future)
-    # Evaluate prophet on test set if test set has 'y'
     test_actual = combined_df.iloc[split:].dropna(subset=['y'])
     if not test_actual.empty:
         test_eval = test_forecast[test_forecast['ds'].isin(test_actual['ds'])]
@@ -388,7 +414,6 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
         rmse_val = sqrt(mean_squared_error(test_actual['y'], test_eval['Prophet Forecast']))
         print(f"Prophet Test MAPE: {mape:.4f}, RMSE: {rmse_val:.4f}")
 
-    # Now forecast the actual future horizon
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
     forecast = model.predict(future_df)
     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
@@ -799,7 +824,7 @@ def analyze_amazon_buying_habits(comparison, holidays):
 
         holiday_mask = comparison['is_holiday_week']
         if holiday_mask.any():
-            holiday_ratio = (amazon_forecast[holiday_mask] / safe_prophet[holiday_mask])
+            holiday_ratio = amazon_forecast[holiday_mask] / safe_prophet[holiday_mask]
             holiday_diff = amazon_forecast[holiday_mask] - prophet_forecast[holiday_mask]
             if len(holiday_diff) > 0:
                 print("  During holiday weeks:")
@@ -892,14 +917,15 @@ def main():
             split = int(n*0.8)
             train_sarima = ts_data.iloc[:split]
             test_sarima = ts_data.iloc[split:]
+            
             exog_train = create_holiday_regressors(train_sarima, holidays)
             exog_test = create_holiday_regressors(test_sarima, holidays)
 
             if model is not None:
-                last_date = train_sarima['ds'].iloc[-1]
+                # Use forecast(...) for out-of-sample prediction
                 steps = len(test_sarima)
                 exog_future_test = exog_test if not exog_test.empty else None
-                preds = model.predict(start=test_sarima.index[0], end=test_sarima.index[-1], exog=exog_future_test)
+                preds = model.forecast(steps=steps, exog=exog_future_test)
                 preds = preds.round().astype(int)
 
                 sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
@@ -909,13 +935,18 @@ def main():
             if model is not None:
                 last_date_full = ts_data['ds'].iloc[-1]
                 exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
-                forecast = sarima_forecast(model, steps=horizon, last_date=last_date_full, exog=exog_future)
+                final_preds = model.forecast(steps=horizon, exog=exog_future)
+                final_preds = final_preds.round().astype(int)
+                future_dates = pd.date_range(start=last_date_full + pd.Timedelta(weeks=1), periods=horizon, freq='W')
+                forecast = pd.DataFrame({'ds': future_dates, 'Prophet Forecast': final_preds})
+
                 if forecast.empty:
                     print(f"Forecasting failed for ASIN {asin}, skipping.")
                     no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
                     with open(no_data_output, 'w') as f:
                         f.write("Failed to forecast due to insufficient data.\n")
                     continue
+
                 comparison = forecast.copy()
                 comparison['ASIN'] = asin
                 comparison['Product Title'] = product_title
@@ -1074,7 +1105,6 @@ def main():
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
-
 
 if __name__ == '__main__':
     main()
