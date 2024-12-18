@@ -94,7 +94,11 @@ def kalman_smooth(series):
     return pd.Series(filled_values, index=series.index)
 
 def handle_missing_data(data):
-    data['y'] = kalman_smooth(data['y'])
+    if len(data['y']) < 2:
+        print("Not enough data points for Kalman smoothing. Using fallback method for missing data.")
+        data['y'] = data['y'].fillna(method='bfill').fillna(method='ffill').astype(int)
+    else:
+        data['y'] = kalman_smooth(data['y'])
     return data
 
 def handle_outliers(data):
