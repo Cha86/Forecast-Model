@@ -895,6 +895,7 @@ def main():
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
 
+        # Load Amazon forecast data
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
             print(f"No forecast data found for ASIN {asin}, skipping.")
@@ -914,78 +915,109 @@ def main():
 
         if model_type == "SARIMA":
             n = len(ts_data)
-            split = int(n*0.8)
+            split = int(n * 0.8)
             train_sarima = ts_data.iloc[:split]
             test_sarima = ts_data.iloc[split:]
-            
+
             exog_train = create_holiday_regressors(train_sarima, holidays)
             exog_test = create_holiday_regressors(test_sarima, holidays)
 
-            if model is not None:
-                # Use forecast(...) for out-of-sample prediction
-                steps = len(test_sarima)
-                exog_future_test = exog_test if not exog_test.empty else None
-                preds = model.forecast(steps=steps, exog=exog_future_test)
-                preds = preds.round().astype(int)
-
-                sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
-                sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], preds))
-                print(f"SARIMA Test MAPE: {sarima_mape:.4f}, RMSE: {sarima_rmse:.4f}")
-
-            if model is not None:
-                last_date_full = ts_data['ds'].iloc[-1]
-                exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
-                final_preds = model.forecast(steps=horizon, exog=exog_future)
-                final_preds = final_preds.round().astype(int)
-                future_dates = pd.date_range(start=last_date_full + pd.Timedelta(weeks=1), periods=horizon, freq='W')
-                forecast = pd.DataFrame({'ds': future_dates, 'Prophet Forecast': final_preds})
-
-                if forecast.empty:
-                    print(f"Forecasting failed for ASIN {asin}, skipping.")
-                    no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
-                    with open(no_data_output, 'w') as f:
-                        f.write("Failed to forecast due to insufficient data.\n")
-                    continue
-
-                comparison = forecast.copy()
-                comparison['ASIN'] = asin
-                comparison['Product Title'] = product_title
-
-                comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
-                comparison_historical = comparison.dropna(subset=['y'])
-
-                metrics = {
-                    "Mean Absolute Error (MAE)": np.round(mean_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast']), 2),
-                    "Median Absolute Error (MedAE)": np.round(median_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast']), 2),
-                    "Mean Squared Error (MSE)": np.round(mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast']), 2),
-                    "Root Mean Squared Error (RMSE)": np.round(sqrt(mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])), 2),
-                    "Mean Absolute Percentage Error (MAPE)": str(np.round(mean_absolute_percentage_error(comparison_historical['y'], comparison_historical['Prophet Forecast']), 2)) + " %"
-                }
-
-                summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, comparison, horizon=horizon)
-                visualize_forecast_with_comparison(ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title, sufficient_data_folder)
-
-                output_file_name = f'forecast_summary_{asin}.xlsx'
-                output_file_path = os.path.join(sufficient_data_folder, output_file_name)
-                save_summary_to_excel(
-                    comparison,
-                    summary_stats,
-                    total_forecast_16,
-                    total_forecast_8,
-                    total_forecast_4,
-                    max_forecast,
-                    min_forecast,
-                    max_week,
-                    min_week,
-                    output_file_path,
-                    metrics=metrics
+            # Integrate Amazon forecast data into exogenous variables
+            for forecast_type, values in forecast_data.items():
+                # Add Amazon forecast data to exog_train
+                exog_train[f"Amazon_{forecast_type}"] = np.concatenate(
+                    (values[:len(train_sarima)], np.zeros(len(exog_train) - len(train_sarima)))
                 )
-                consolidated_forecasts[asin] = comparison
+                # Add Amazon forecast data to exog_test
+                exog_test[f"Amazon_{forecast_type}"] = np.concatenate(
+                    (values[len(train_sarima):], np.zeros(len(exog_test) - len(test_sarima)))
+                )
+
+            if model is not None:
+                try:
+                    steps = len(test_sarima)
+                    exog_future_test = exog_test if not exog_test.empty else None
+                    preds = model.forecast(steps=steps, exog=exog_future_test)
+                    preds = preds.round().astype(int)
+
+                    sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
+                    sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], preds))
+                    print(f"SARIMA Test MAPE: {sarima_mape:.4f}, RMSE: {sarima_rmse:.4f}")
+
+                    last_date_full = ts_data['ds'].iloc[-1]
+                    exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
+
+                    # Add Amazon forecast data to exog_future
+                    for forecast_type, values in forecast_data.items():
+                        future_values = values[-horizon:] if len(values) >= horizon else values
+                        exog_future[f"Amazon_{forecast_type}"] = np.pad(
+                            future_values, (0, max(0, len(exog_future) - len(future_values))), 'constant'
+                        )
+
+                    final_preds = model.forecast(steps=horizon, exog=exog_future)
+                    final_preds = final_preds.round().astype(int)
+                    future_dates = pd.date_range(start=last_date_full + pd.Timedelta(weeks=1), periods=horizon, freq='W')
+                    forecast = pd.DataFrame({'ds': future_dates, 'Prophet Forecast': final_preds})
+
+                    if forecast.empty:
+                        print(f"Forecasting failed for ASIN {asin}, skipping.")
+                        no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
+                        with open(no_data_output, 'w') as f:
+                            f.write("Failed to forecast due to insufficient data.\n")
+                        continue
+
+                    comparison = forecast.copy()
+                    comparison['ASIN'] = asin
+                    comparison['Product Title'] = product_title
+
+                    comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
+                    comparison_historical = comparison.dropna(subset=['y'])
+
+                    if comparison_historical.empty:
+                        print("No overlapping historical data to calculate metrics. Skipping metrics.")
+                        metrics = {}
+                    else:
+                        MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                        MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                        MSE = mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+                        RMSE = sqrt(MSE)
+                        MAPE = mean_absolute_percentage_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
+
+                        print('Mean Absolute Error (MAE): ' + str(np.round(MAE, 2)))
+                        print('Median Absolute Error (MedAE): ' + str(np.round(MEDAE, 2)))
+                        print('Mean Squared Error (MSE): ' + str(np.round(MSE, 2)))
+                        print('Root Mean Squared Error (RMSE): ' + str(np.round(RMSE, 2)))
+                        print('Mean Absolute Percentage Error (MAPE): ' + str(np.round(MAPE, 2)) + ' %')
+
+                        metrics = {
+                            "Mean Absolute Error (MAE)": np.round(MAE, 2),
+                            "Median Absolute Error (MedAE)": np.round(MEDAE, 2),
+                            "Mean Squared Error (MSE)": np.round(MSE, 2),
+                            "Root Mean Squared Error (RMSE)": np.round(RMSE, 2),
+                            "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
+                        }
+
+                    summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
+                        ts_data, comparison, horizon=horizon)
+                    visualize_forecast_with_comparison(
+                        ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8,
+                        total_forecast_4, max_forecast, min_forecast, max_week, min_week, asin, product_title, sufficient_data_folder
+                    )
+
+                    output_file_name = f'forecast_summary_{asin}.xlsx'
+                    output_file_path = os.path.join(sufficient_data_folder, output_file_name)
+                    save_summary_to_excel(
+                        comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4,
+                        max_forecast, min_forecast, max_week, min_week, output_file_path, metrics=metrics
+                    )
+                    consolidated_forecasts[asin] = comparison
+
+                except ValueError as e:
+                    print(f"Error during SARIMA prediction for ASIN {asin}: {e}")
+                    continue
             else:
                 print(f"SARIMA model fitting failed for {asin}, skipping.")
-                no_data_output = os.path.join(insufficient_data_folder, f"{asin}_sarima_fit_failed.txt")
-                with open(no_data_output, 'w') as f:
-                    f.write("Insufficient data for SARIMA.\n")
+                continue
 
         else:
             cached_model_path = os.path.join("model_cache", f"{asin}_Prophet.pkl")
@@ -1056,8 +1088,10 @@ def main():
             comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
             comparison_historical = comparison.dropna(subset=['y'])
 
-            metrics = None
-            if not comparison_historical.empty:
+            if comparison_historical.empty:
+                print("No overlapping historical data to calculate metrics. Skipping metrics.")
+                metrics = {}
+            else:
                 MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
                 MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
                 MSE = mean_squared_error(comparison_historical['y'], comparison_historical['Prophet Forecast'])
