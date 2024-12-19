@@ -929,13 +929,26 @@ def main():
             # Integrate Amazon forecast data into exogenous variables
             for forecast_type, values in forecast_data.items():
                 # Add Amazon forecast data to exog_train
+                train_length = len(train_sarima)
+                if len(values) >= train_length:
+                    adjusted_train_values = values[:train_length]
+                else:
+                    adjusted_train_values = np.pad(values, (0, train_length - len(values)), constant_values=0)
+
                 exog_train[f"Amazon_{forecast_type}"] = np.concatenate(
                     (values[:len(train_sarima)], np.zeros(len(exog_train) - len(train_sarima)))
                 )
                 # Add Amazon forecast data to exog_test
-                exog_test[f"Amazon_{forecast_type}"] = np.concatenate(
-                    (values[len(train_sarima):], np.zeros(len(exog_test) - len(test_sarima)))
-                )
+                test_length = len(test_sarima)
+                if len(values) >= train_length + test_length:
+                    adjusted_test_values = values[train_length:train_length + test_length]
+                elif len(values) > train_length:
+                    adjusted_test_values = values[train_length:]
+                    adjusted_test_values = np.pad(adjusted_test_values, (0, test_length - len(adjusted_test_values)), constant_values=0)
+                else:
+                    adjusted_test_values = np.zeros(test_length)
+
+                exog_test[f"Amazon_{forecast_type}"] = adjusted_test_values
 
             if model is not None:
                 try:
