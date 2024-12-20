@@ -18,6 +18,11 @@ import time
 warnings.filterwarnings("ignore")
 
 ##############################
+# Configuration
+##############################
+SARIMA_WEIGHT = 0.6  # Weight for SARIMA forecast in final combination for SARIMA model
+
+##############################
 # Added Functions for Caching
 ##############################
 
@@ -35,10 +40,10 @@ def load_model(model_type, asin):
 
     if os.path.exists(model_path):
         model = joblib.load(model_path)
-        if os.path.exists(exog_path): 
+        if os.path.exists(exog_path):
             exog = joblib.load(exog_path)
             return model, exog
-        return model, None  
+        return model, None
     return None, None
 
 def is_model_up_to_date(cached_model_path, ts_data):
@@ -60,6 +65,7 @@ def kalman_smooth(series):
     initial_state_mean = np.nanmean(values)
     if np.isnan(initial_state_mean):
         initial_state_mean = 0.0
+
     kf = KalmanFilter(
         initial_state_mean=initial_state_mean,
         n_dim_obs=1,
@@ -70,13 +76,16 @@ def kalman_smooth(series):
         transition_covariance=0.1,
         observation_covariance=1.0
     )
+
     masked_values = np.ma.array(values, mask=np.isnan(values))
     kf = kf.em(masked_values, n_iter=5)
     smoothed_state_means, _ = kf.smooth(masked_values)
+
     smoothed_state_means_1d = smoothed_state_means[:, 0]
     filled_values = values.copy()
     nan_idx = np.isnan(values)
     filled_values[nan_idx] = smoothed_state_means_1d[nan_idx]
+
     filled_values = np.round(filled_values).astype(int)
     return pd.Series(filled_values, index=series.index)
 
@@ -156,7 +165,7 @@ def create_holiday_regressors(ts_data, holidays):
     return exog
 
 ##############################
-# Custom SARIMA fitting (no Amazon data for SARIMA)
+# Custom SARIMA fitting
 ##############################
 
 def calculate_forecast_metrics(actual, predicted):
@@ -258,7 +267,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52):
         return best_model
 
 def sarima_forecast(model_fit, steps, last_date, exog=None):
-    # Select only required columns up to k_exog
     k_exog = model_fit.model.k_exog
     if exog is not None and k_exog > 0:
         exog = exog.iloc[:, :k_exog]
@@ -391,10 +399,8 @@ def get_shifted_holidays():
 def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=16):
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
-
     combined_df = pd.concat([ts_data, future], ignore_index=True)
 
-    # For Prophet ONLY: we keep Amazon forecast data
     for forecast_type, values in forecast_data.items():
         values_to_use = values[:horizon] if len(values) > horizon else values
         extended_values = np.concatenate(
@@ -421,6 +427,7 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     train_df = combined_df.iloc[:split].dropna(subset=['y']).copy()
     test_df = combined_df.iloc[split:].copy()
 
+    # Use linear growth and clip negative forecasts
     model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
@@ -428,7 +435,8 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
         holidays=holidays,
         changepoint_prior_scale=changepoint_prior_scale,
         seasonality_prior_scale=seasonality_prior_scale,
-        holidays_prior_scale=holidays_prior_scale
+        holidays_prior_scale=holidays_prior_scale,
+        growth='linear'
     )
 
     for regressor in regressor_cols + ['prime_day']:
@@ -449,6 +457,8 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
     forecast = model.predict(future_df)
     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
+    # Clip negative values
+    forecast['Prophet Forecast'] = forecast['Prophet Forecast'].clip(lower=0)
     return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']], model
 
 PARAM_COUNTER = 0
@@ -803,6 +813,7 @@ def analyze_amazon_buying_habits(comparison, holidays):
     if not amazon_cols:
         print("No Amazon forecasts found for analysis.")
         return
+
     prophet_forecast = comparison['Prophet Forecast'].values
     ds_dates = comparison.get('ds', pd.Series(index=comparison.index))
     holiday_dates = holidays['ds'].values if holidays is not None else []
@@ -841,6 +852,7 @@ def analyze_amazon_buying_habits(comparison, holidays):
             'Mid-term (Weeks 5-12)': (weeks >=5) & (weeks <=12),
             'Long-term (Weeks 13+)': (weeks > 12)
         }
+
         for segment_name, mask in segments.items():
             if mask.any():
                 seg_ratio = ratio[mask]
@@ -914,7 +926,6 @@ def main():
         model, model_type = choose_forecast_model(ts_data, threshold=50, holidays=holidays)
 
         if model_type == "SARIMA":
-            # For SARIMA, no Amazon forecast data is added.
             n = len(ts_data)
             split = int(n * 0.8)
             train_sarima = ts_data.iloc[:split]
@@ -926,10 +937,9 @@ def main():
             if model is not None:
                 try:
                     steps = len(test_sarima)
-                    # After model is fit, select only k_exog columns dynamically in forecast
-                    preds = sarima_forecast(model, steps=steps, last_date=train_sarima['ds'].iloc[-1],
-                                            exog=exog_test)
-                    preds = preds['Prophet Forecast'].values
+                    preds_df = sarima_forecast(model, steps=steps, last_date=train_sarima['ds'].iloc[-1],
+                                               exog=exog_test)
+                    preds = preds_df['Prophet Forecast'].values
 
                     sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
                     sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], preds))
@@ -937,7 +947,6 @@ def main():
 
                     last_date_full = ts_data['ds'].iloc[-1]
                     exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
-
                     final_forecast_df = sarima_forecast(model, steps=horizon, last_date=last_date_full, exog=exog_future)
                     if final_forecast_df.empty:
                         print(f"Forecasting failed for ASIN {asin}, skipping.")
@@ -976,6 +985,28 @@ def main():
                             "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
                         }
 
+                    # Combine SARIMA forecast with Amazon data
+                    amazon_cols = [col for col in forecast_data.keys()]
+                    if amazon_cols:
+                        for ftype, values in forecast_data.items():
+                            horizon_values = values[:horizon] if len(values) >= horizon else values
+                            if len(horizon_values) < horizon and len(horizon_values) > 0:
+                                horizon_values = np.pad(horizon_values, (0, horizon - len(horizon_values)),
+                                                        'constant', constant_values=horizon_values[-1])
+                            elif len(horizon_values) == 0:
+                                horizon_values = np.zeros(horizon)
+                            comparison[f'Amazon {ftype}'] = horizon_values
+
+                        # Compute mean Amazon forecast
+                        a_cols = [c for c in comparison.columns if c.startswith('Amazon ')]
+                        if a_cols:
+                            comparison['Amazon Mean'] = comparison[a_cols].mean(axis=1)
+                            # Weighted combination
+                            comparison['Prophet Forecast'] = (SARIMA_WEIGHT * comparison['Prophet Forecast'] +
+                                                              (1 - SARIMA_WEIGHT) * comparison['Amazon Mean'])
+                            # Ensure no negative forecasts
+                            comparison['Prophet Forecast'] = comparison['Prophet Forecast'].clip(lower=0)
+
                     summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
                         ts_data, comparison, horizon=horizon)
                     visualize_forecast_with_comparison(
@@ -999,7 +1030,7 @@ def main():
                 continue
 
         else:
-            # Prophet model logic remains the same, with Amazon data included
+            # Prophet model logic unchanged
             cached_model_path = os.path.join("model_cache", f"{asin}_Prophet.pkl")
             if os.path.exists(cached_model_path):
                 if is_model_up_to_date(cached_model_path, ts_data):
@@ -1013,6 +1044,7 @@ def main():
                     future['prime_day'] = 0
                     forecast = cached_prophet_model.predict(future)
                     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
+                    forecast['Prophet Forecast'] = forecast['Prophet Forecast'].clip(lower=0)
                 else:
                     print(f"Cached Prophet model for ASIN {asin} is outdated. Retraining with updated data...")
                     best_params, _ = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
@@ -1023,6 +1055,7 @@ def main():
                         best_params['holidays_prior_scale'],
                         horizon=horizon
                     )
+
                     if trained_prophet_model is not None:
                         save_model(trained_prophet_model, "Prophet", asin, ts_data)
                     else:
