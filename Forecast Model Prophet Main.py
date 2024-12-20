@@ -458,7 +458,8 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     forecast = model.predict(future_df)
     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
     # Clip negative values
-    forecast['Prophet Forecast'] = forecast['Prophet Forecast'].clip(lower=0)
+    forecast['Prophet Forecast'] = forecast['Prophet Forecast'].clip(lower=0).round().astype(int)
+
     return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']], model
 
 PARAM_COUNTER = 0
@@ -1044,7 +1045,7 @@ def main():
                     future['prime_day'] = 0
                     forecast = cached_prophet_model.predict(future)
                     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
-                    forecast['Prophet Forecast'] = forecast['Prophet Forecast'].clip(lower=0)
+                    forecast['Prophet Forecast'] = forecast['Prophet Forecast'].clip(lower=0).round().astype(int)
                 else:
                     print(f"Cached Prophet model for ASIN {asin} is outdated. Retraining with updated data...")
                     best_params, _ = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
