@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "default": "forecast-database"
+  },
+  "targets": {},
+  "etags": {}
+}

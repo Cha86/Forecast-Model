@@ -14,7 +14,6 @@ from math import sqrt
 from pykalman import KalmanFilter
 from statsmodels.tsa.stattools import adfuller
 import time
-from pmdarima import auto_arima
 
 warnings.filterwarnings("ignore")
 
@@ -27,7 +26,6 @@ def save_model(model, model_type, asin, ts_data):
     model_cache_folder = "model_cache"
     os.makedirs(model_cache_folder, exist_ok=True)
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
-    # Attach metadata: last training date
     model.last_train_date = ts_data['ds'].max()
     joblib.dump(model, model_path)
 
@@ -39,10 +37,10 @@ def load_model(model_type, asin):
 
     if os.path.exists(model_path):
         model = joblib.load(model_path)
-        if os.path.exists(exog_path): 
+        if os.path.exists(exog_path):
             exog = joblib.load(exog_path)
             return model, exog
-        return model, None  
+        return model, None
     return None, None
 
 def is_model_up_to_date(cached_model_path, ts_data):
@@ -52,7 +50,7 @@ def is_model_up_to_date(cached_model_path, ts_data):
     """
     if not os.path.exists(cached_model_path):
         return False
-    
+
     model = joblib.load(cached_model_path)
     if hasattr(model, 'last_train_date'):
         last_train_date = model.last_train_date
@@ -121,7 +119,6 @@ def preprocess_data(data):
 ##############################
 
 def differencing(timeseries, m):
-    # Provided as-is from snippet
     info = []
     tcopy = timeseries.copy()
 
@@ -142,7 +139,7 @@ def differencing(timeseries, m):
             d_series = info[j+3].diff(periods=period).dropna()
             d_series.name = f"d{j}_D2_m{period}"
             info.append(d_series)
-        
+
     df_info = pd.concat(info, axis=1)
     return df_info
 
@@ -157,7 +154,7 @@ def adf_summary(diff_series):
         g, h, i = e.values()
         results = [a, b, c, d, g, h, i]
         summary.append(results)
-    
+
     columns = ["Test Statistic", "p-value", "#Lags Used", "No. of Obs. Used",
                "Critical Value (1%)", "Critical Value (5%)", "Critical Value (10%)"]
     index = diff_series.columns
@@ -176,69 +173,123 @@ def create_holiday_regressors(ts_data, holidays):
     exog.drop(columns=['ds'], inplace=True)
     return exog
 
+##############################
+# Custom SARIMA fitting with parameter grid search
+##############################
+
+def calculate_forecast_metrics(actual, predicted):
+    """Calculate RMSE and MAPE metrics."""
+    rmse = np.sqrt(mean_squared_error(actual, predicted))
+    mape = mean_absolute_percentage_error(actual, predicted)*100
+    return rmse, mape
+
 def fit_sarima_model(data, holidays, seasonal_period=52):
     exog = create_holiday_regressors(data, holidays)
     sample_size = len(data)
 
-    # Adjust seasonal_period dynamically if dataset is too small
+    # Adjust seasonal_period based on data size
     if sample_size < 52:
         if sample_size >= 12:
             seasonal_period = 12
+            print(f"Dataset too small for m=52. Adjusting seasonal_period to m={seasonal_period} based on data size.")
         elif sample_size >= 4:
-            seasonal_period = 4
+            seasonal_period = None
+            print("Dataset too small for robust seasonal modeling. Using non-seasonal SARIMA.")
         else:
             seasonal_period = 1
-        print(f"Dataset too small for m=52. Adjusting seasonal_period to m={seasonal_period} based on data size.")
+            print(f"Dataset too small. Adjusting seasonal_period to m={seasonal_period}.")
 
-    try:
-        stepwise_model = auto_arima(
-            data['y'], 
-            exogenous=exog if not exog.empty else None,
-            seasonal=True, 
-            m=seasonal_period,
-            trace=False, 
-            error_action='ignore', 
-            suppress_warnings=True,
-            max_p=5, max_q=5, max_P=2, max_Q=2, max_D=2, max_D_in=2
-        )
-        if stepwise_model is None:
-            print("No suitable SARIMA model found via auto_arima.")
-            return None
+    p_values = [0, 1, 2]
+    d_values = [0, 1]
+    q_values = [0, 1, 2]
+    P_values = [0, 1]
+    D_values = [0, 1]
+    Q_values = [0, 1]
 
-        order = stepwise_model.order
-        seasonal_order = stepwise_model.seasonal_order
-        print(f"Best SARIMA model found by auto_arima: order={order}, seasonal_order={seasonal_order}")
+    if seasonal_period is None:
+        # Non-seasonal model
+        m_values = [1]
+        seasonal = False
+    else:
+        m_values = [seasonal_period]
+        seasonal = True
 
-        sarima = SARIMAX(
-            data['y'], 
-            order=order, 
-            seasonal_order=seasonal_order, 
-            exog=exog if not exog.empty else None,
-            enforce_stationarity=False, 
-            enforce_invertibility=False
-        )
-        sarima_fit = sarima.fit(disp=False)
-        return sarima_fit
+    best_rmse = float('inf')
+    best_model = None
+    best_metrics = None
 
-    except ValueError as e:
-        print(f"Error fitting SARIMA model: {e}")
+    for p in p_values:
+        for d in d_values:
+            for q in q_values:
+                if seasonal:
+                    for P in P_values:
+                        for D in D_values:
+                            for Q in Q_values:
+                                for m in m_values:
+                                    try:
+                                        model = SARIMAX(
+                                            data['y'],
+                                            order=(p, d, q),
+                                            seasonal_order=(P, D, Q, m),
+                                            exog=exog if not exog.empty else None,
+                                            enforce_stationarity=False,
+                                            enforce_invertibility=False
+                                        )
+                                        model_fit = model.fit(disp=False)
+                                        forecast = model_fit.fittedvalues
+                                        actual = data['y']
+                                        rmse, mape = calculate_forecast_metrics(actual, forecast)
+                                        if rmse < best_rmse:
+                                            best_rmse = rmse
+                                            best_model = model_fit
+                                            best_metrics = {'RMSE': rmse, 'MAPE': mape,
+                                                            'p': p, 'd': d, 'q': q,
+                                                            'P': P, 'D': D, 'Q': Q, 'm': m}
+                                    except:
+                                        continue
+                else:
+                    # Non-seasonal (no seasonal_order)
+                    try:
+                        model = SARIMAX(
+                            data['y'],
+                            order=(p, d, q),
+                            seasonal_order=(0, 0, 0, 1),
+                            exog=exog if not exog.empty else None,
+                            enforce_stationarity=False,
+                            enforce_invertibility=False
+                        )
+                        model_fit = model.fit(disp=False)
+                        forecast = model_fit.fittedvalues
+                        actual = data['y']
+                        rmse, mape = calculate_forecast_metrics(actual, forecast)
+                        if rmse < best_rmse:
+                            best_rmse = rmse
+                            best_model = model_fit
+                            best_metrics = {'RMSE': rmse, 'MAPE': mape,
+                                            'p': p, 'd': d, 'q': q,
+                                            'P': 0, 'D': 0, 'Q': 0, 'm': 1}
+                    except:
+                        continue
+
+    if best_model is None:
+        print("No suitable SARIMA model found.")
         return None
+    else:
+        print(f"Best SARIMA Model: (p,d,q)=({best_metrics['p']},{best_metrics['d']},{best_metrics['q']}), "
+              f"(P,D,Q,m)=({best_metrics['P']},{best_metrics['D']},{best_metrics['Q']},{best_metrics['m']}), "
+              f"RMSE={best_metrics['RMSE']:.2f}, MAPE={best_metrics['MAPE']:.2f}%")
+        return best_model
 
 def sarima_forecast(model_fit, steps, last_date, exog=None):
-    # Just forecast out-of-sample steps
     forecast_values = model_fit.forecast(steps=steps, exog=exog)
     forecast_values = forecast_values.round().astype(int)
     future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
     return pd.DataFrame({'ds': future_dates, 'Prophet Forecast': forecast_values})
 
 def generate_future_exog(holidays, steps, last_date):
-    """
-    Generate future exogenous regressors for exactly 'steps' weeks after last_date.
-    """
     future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
     exog_future = pd.DataFrame(index=future_dates)
 
-    # For each holiday column used in training, ensure we create the same columns here
     holiday_names = holidays['holiday'].unique()
     for h in holiday_names:
         exog_future[h] = exog_future.index.isin(holidays[holidays['holiday'] == h]['ds'])
@@ -264,8 +315,6 @@ def generate_date_from_week(row):
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
 def clean_weekly_sales_data(data):
-    # If needed, implement any cleaning logic to remove duplicates, etc.
-    # For now, just return the data as is.
     return data
 
 def load_weekly_sales_data(file_path):
@@ -407,7 +456,7 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
         model.add_regressor(regressor, mode='multiplicative')
 
     model.fit(train_df[['ds','y'] + regressor_cols + ['prime_day']])
-    
+
     test_future = test_df.drop(columns='y').copy()
     test_forecast = model.predict(test_future)
     test_actual = combined_df.iloc[split:].dropna(subset=['y'])
@@ -683,11 +732,11 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
         for i in range(len(comparison_for_excel)):
             comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
         comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
-    
+
     for col in desired_columns:
         if col not in comparison_for_excel.columns:
             comparison_for_excel[col] = np.nan
-    
+
     comparison_for_excel = comparison_for_excel[desired_columns]
 
     wb = Workbook()
@@ -899,7 +948,6 @@ def main():
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
 
-        # Load Amazon forecast data
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
             print(f"No forecast data found for ASIN {asin}, skipping.")
@@ -926,9 +974,7 @@ def main():
             exog_train = create_holiday_regressors(train_sarima, holidays)
             exog_test = create_holiday_regressors(test_sarima, holidays)
 
-            # Integrate Amazon forecast data into exogenous variables
             for forecast_type, values in forecast_data.items():
-                # Add Amazon forecast data to exog_train
                 train_length = len(train_sarima)
                 if len(values) >= train_length:
                     adjusted_train_values = values[:train_length]
@@ -938,7 +984,6 @@ def main():
                 exog_train[f"Amazon_{forecast_type}"] = np.concatenate(
                     (values[:len(train_sarima)], np.zeros(len(exog_train) - len(train_sarima)))
                 )
-                # Add Amazon forecast data to exog_test
                 test_length = len(test_sarima)
                 if len(values) >= train_length + test_length:
                     adjusted_test_values = values[train_length:train_length + test_length]
@@ -953,6 +998,8 @@ def main():
             if model is not None:
                 try:
                     steps = len(test_sarima)
+                    exog_columns = exog_train.columns
+                    exog_test = exog_test.reindex(columns=exog_columns, fill_value=0)
                     exog_future_test = exog_test if not exog_test.empty else None
                     preds = model.forecast(steps=steps, exog=exog_future_test)
                     preds = preds.round().astype(int)
@@ -964,12 +1011,12 @@ def main():
                     last_date_full = ts_data['ds'].iloc[-1]
                     exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
 
-                    # Add Amazon forecast data to exog_future
                     for forecast_type, values in forecast_data.items():
                         future_values = values[-horizon:] if len(values) >= horizon else values
                         exog_future[f"Amazon_{forecast_type}"] = np.pad(
                             future_values, (0, max(0, len(exog_future) - len(future_values))), 'constant'
                         )
+                    exog_future = exog_future.reindex(columns=exog_columns, fill_value=0)
 
                     final_preds = model.forecast(steps=horizon, exog=exog_future)
                     final_preds = final_preds.round().astype(int)
@@ -986,7 +1033,6 @@ def main():
                     comparison = forecast.copy()
                     comparison['ASIN'] = asin
                     comparison['Product Title'] = product_title
-
                     comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
                     comparison_historical = comparison.dropna(subset=['y'])
 
@@ -1038,7 +1084,6 @@ def main():
 
         else:
             cached_model_path = os.path.join("model_cache", f"{asin}_Prophet.pkl")
-
             if os.path.exists(cached_model_path):
                 if is_model_up_to_date(cached_model_path, ts_data):
                     print(f"Using up-to-date cached Prophet model for ASIN {asin}.")
