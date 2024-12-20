@@ -22,7 +22,6 @@ warnings.filterwarnings("ignore")
 ##############################
 
 def save_model(model, model_type, asin, ts_data):
-    """Save the fitted model for later use, along with last training date."""
     model_cache_folder = "model_cache"
     os.makedirs(model_cache_folder, exist_ok=True)
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
@@ -30,27 +29,21 @@ def save_model(model, model_type, asin, ts_data):
     joblib.dump(model, model_path)
 
 def load_model(model_type, asin):
-    """Load the previously saved model and exogenous variables if they exist."""
     model_cache_folder = "model_cache"
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
     exog_path = os.path.join(model_cache_folder, f"{asin}_{model_type}_exog.pkl")
 
     if os.path.exists(model_path):
         model = joblib.load(model_path)
-        if os.path.exists(exog_path):
+        if os.path.exists(exog_path): 
             exog = joblib.load(exog_path)
             return model, exog
-        return model, None
+        return model, None  
     return None, None
 
 def is_model_up_to_date(cached_model_path, ts_data):
-    """
-    Check if the cached model is up-to-date with the latest data.
-    Compare the last training date of the model with the latest date in ts_data.
-    """
     if not os.path.exists(cached_model_path):
         return False
-
     model = joblib.load(cached_model_path)
     if hasattr(model, 'last_train_date'):
         last_train_date = model.last_train_date
@@ -67,7 +60,6 @@ def kalman_smooth(series):
     initial_state_mean = np.nanmean(values)
     if np.isnan(initial_state_mean):
         initial_state_mean = 0.0
-
     kf = KalmanFilter(
         initial_state_mean=initial_state_mean,
         n_dim_obs=1,
@@ -78,16 +70,13 @@ def kalman_smooth(series):
         transition_covariance=0.1,
         observation_covariance=1.0
     )
-
     masked_values = np.ma.array(values, mask=np.isnan(values))
     kf = kf.em(masked_values, n_iter=5)
     smoothed_state_means, _ = kf.smooth(masked_values)
-
     smoothed_state_means_1d = smoothed_state_means[:, 0]
     filled_values = values.copy()
     nan_idx = np.isnan(values)
     filled_values[nan_idx] = smoothed_state_means_1d[nan_idx]
-
     filled_values = np.round(filled_values).astype(int)
     return pd.Series(filled_values, index=series.index)
 
@@ -121,25 +110,21 @@ def preprocess_data(data):
 def differencing(timeseries, m):
     info = []
     tcopy = timeseries.copy()
-
     original = tcopy.copy()
     for i in range(3):
         original.name = f"d{i}_D0_m0"
         info.append(original)
         original = original.diff().dropna()
-
     for period in m:
         for j in range(3):
             d_series = info[j].diff(periods=period).dropna()
             d_series.name = f"d{j}_D1_m{period}"
             info.append(d_series)
-
     for period in m:
         for j in range(3):
             d_series = info[j+3].diff(periods=period).dropna()
             d_series.name = f"d{j}_D2_m{period}"
             info.append(d_series)
-
     df_info = pd.concat(info, axis=1)
     return df_info
 
@@ -154,7 +139,6 @@ def adf_summary(diff_series):
         g, h, i = e.values()
         results = [a, b, c, d, g, h, i]
         summary.append(results)
-
     columns = ["Test Statistic", "p-value", "#Lags Used", "No. of Obs. Used",
                "Critical Value (1%)", "Critical Value (5%)", "Critical Value (10%)"]
     index = diff_series.columns
@@ -165,20 +149,17 @@ def create_holiday_regressors(ts_data, holidays):
     holiday_names = holidays['holiday'].unique()
     exog = pd.DataFrame(index=ts_data.index)
     exog['ds'] = ts_data['ds']
-
     for h in holiday_names:
         holiday_dates = holidays[holidays['holiday'] == h]['ds']
         exog[h] = exog['ds'].isin(holiday_dates).astype(int)
-
     exog.drop(columns=['ds'], inplace=True)
     return exog
 
 ##############################
-# Custom SARIMA fitting with parameter grid search
+# Custom SARIMA fitting (no Amazon data for SARIMA)
 ##############################
 
 def calculate_forecast_metrics(actual, predicted):
-    """Calculate RMSE and MAPE metrics."""
     rmse = np.sqrt(mean_squared_error(actual, predicted))
     mape = mean_absolute_percentage_error(actual, predicted)*100
     return rmse, mape
@@ -186,8 +167,6 @@ def calculate_forecast_metrics(actual, predicted):
 def fit_sarima_model(data, holidays, seasonal_period=52):
     exog = create_holiday_regressors(data, holidays)
     sample_size = len(data)
-
-    # Adjust seasonal_period based on data size
     if sample_size < 52:
         if sample_size >= 12:
             seasonal_period = 12
@@ -207,7 +186,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52):
     Q_values = [0, 1]
 
     if seasonal_period is None:
-        # Non-seasonal model
         m_values = [1]
         seasonal = False
     else:
@@ -248,7 +226,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52):
                                     except:
                                         continue
                 else:
-                    # Non-seasonal (no seasonal_order)
                     try:
                         model = SARIMAX(
                             data['y'],
@@ -281,6 +258,11 @@ def fit_sarima_model(data, holidays, seasonal_period=52):
         return best_model
 
 def sarima_forecast(model_fit, steps, last_date, exog=None):
+    # Select only required columns up to k_exog
+    k_exog = model_fit.model.k_exog
+    if exog is not None and k_exog > 0:
+        exog = exog.iloc[:, :k_exog]
+
     forecast_values = model_fit.forecast(steps=steps, exog=exog)
     forecast_values = forecast_values.round().astype(int)
     future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
@@ -289,11 +271,9 @@ def sarima_forecast(model_fit, steps, last_date, exog=None):
 def generate_future_exog(holidays, steps, last_date):
     future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
     exog_future = pd.DataFrame(index=future_dates)
-
     holiday_names = holidays['holiday'].unique()
     for h in holiday_names:
         exog_future[h] = exog_future.index.isin(holidays[holidays['holiday'] == h]['ds'])
-
     exog_future = exog_future.astype(int)
     return exog_future
 
@@ -329,7 +309,6 @@ def load_weekly_sales_data(file_path):
     data['date'] = data.apply(generate_date_from_week, axis=1)
     data = data.rename(columns={'units_sold': 'y'})
     data['y'] = data['y'].astype(int)
-
     data = clean_weekly_sales_data(data)
     return data
 
@@ -377,7 +356,6 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
                 .values
             )
             forecast_data[forecast_type] = forecast_values
-
     return forecast_data
 
 def add_lag_features(ts_data, lag_weeks=1):
@@ -416,6 +394,7 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
 
     combined_df = pd.concat([ts_data, future], ignore_index=True)
 
+    # For Prophet ONLY: we keep Amazon forecast data
     for forecast_type, values in forecast_data.items():
         values_to_use = values[:horizon] if len(values) > horizon else values
         extended_values = np.concatenate(
@@ -481,7 +460,6 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
     best_rmse = float('inf')
     best_params = None
     best_rmse_values = None
-
     for changepoint_prior_scale in param_grid['changepoint_prior_scale']:
         for seasonality_prior_scale in param_grid['seasonality_prior_scale']:
             for holidays_prior_scale in param_grid['holidays_prior_scale']:
@@ -498,15 +476,12 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
                     )
                     if forecast.empty or 'Prophet Forecast' not in forecast.columns:
                         raise ValueError("Forecast failed to generate 'Prophet Forecast'.")
-
                     rmse_values = calculate_rmse(forecast, forecast_data, horizon)
                     avg_rmse = np.mean(list(rmse_values.values()))
-
                     if avg_rmse > EARLY_STOP_THRESHOLD:
                         print("Early stopping triggered due to poor parameter performance.")
                         POOR_PARAM_FOUND = True
                         return best_params, best_rmse_values
-
                     if avg_rmse < best_rmse:
                         best_rmse = avg_rmse
                         best_params = {
@@ -518,12 +493,10 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
                 except Exception as e:
                     print(f"Error during optimization: {e}")
                     continue
-
     if best_params is None:
         print("Optimization failed. Using default parameters.")
         best_params = {'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 1, 'holidays_prior_scale': 10}
         best_rmse_values = {}
-
     return best_params, best_rmse_values
 
 def calculate_rmse(forecast, forecast_data, horizon):
@@ -544,9 +517,7 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
             f'Amazon {forecast_type}': values
         })
         comparison = comparison.merge(forecast_df, on='ds', how='left')
-
     comparison.fillna(0, inplace=True)
-
     for col in comparison.columns:
         if col.startswith('Amazon '):
             diff_col = f"Diff_{col.split('Amazon ')[1]}"
@@ -557,18 +528,15 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
                 (comparison[diff_col] / comparison[col]) * 100,
                 0
             )
-
     comparison['Prophet Forecast'] = comparison['Prophet Forecast'].astype(int)
     for col in comparison.columns:
         if col.startswith("Amazon ") or col.startswith("Diff_"):
             comparison[col] = comparison[col].astype(int, errors='ignore')
-
     return comparison
 
 def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     if 'yhat' not in forecast or 'yhat_upper' not in forecast:
         raise KeyError("'yhat' or 'yhat_upper' not found in forecast DataFrame.")
-
     adj_forecast = (
         yhat_weight * forecast['yhat'] + yhat_upper_weight * forecast['yhat_upper']
     ).clip(lower=0)
@@ -580,7 +548,6 @@ def find_best_forecast_weights(forecast, comparison, weights):
     best_rmse = float('inf')
     best_weights = None
     rmse_results = {}
-
     for yhat_weight, yhat_upper_weight in weights:
         adjusted_forecast = adjust_forecast_weights(forecast.copy(), yhat_weight, yhat_upper_weight)
         rmse_values = {}
@@ -588,37 +555,30 @@ def find_best_forecast_weights(forecast, comparison, weights):
             if amazon_col.startswith('Amazon '):
                 rmse = np.sqrt(((comparison[amazon_col] - adjusted_forecast['Prophet Forecast']) ** 2).mean())
                 rmse_values[amazon_col] = rmse
-
         avg_rmse = np.mean(list(rmse_values.values()))
         rmse_results[(yhat_weight, yhat_upper_weight)] = avg_rmse
-
         if avg_rmse < best_rmse:
             best_rmse = avg_rmse
             best_weights = (yhat_weight, yhat_upper_weight)
-
     return best_weights, rmse_results
 
 def auto_find_best_weights(forecast, comparison, step=0.05):
     best_rmse = float('inf')
     best_weights = None
-
     candidates = np.arange(0.5, 1.0 + step, step)
     for w in candidates:
         yhat_weight = w
         yhat_upper_weight = 1 - w
         adjusted_forecast = adjust_forecast_weights(forecast.copy(), yhat_weight, yhat_upper_weight)
-
         rmse_values = {}
         for amazon_col in comparison.columns:
             if amazon_col.startswith('Amazon '):
                 rmse = np.sqrt(((comparison[amazon_col] - adjusted_forecast['Prophet Forecast']) ** 2).mean())
                 rmse_values[amazon_col] = rmse
-
         avg_rmse = np.mean(list(rmse_values.values()))
         if avg_rmse < best_rmse:
             best_rmse = avg_rmse
             best_weights = (yhat_weight, yhat_upper_weight)
-
     return best_weights, best_rmse
 
 def try_cross_validation_with_fallback(model, ts_data, horizons, initial='365 days', period='180 days'):
@@ -646,10 +606,8 @@ def validate_best_params(ts_data, best_params, initial='365 days', period='180 d
         holidays_prior_scale=best_params['holidays_prior_scale']
     )
     model.fit(ts_data[['ds','y']])
-
     candidate_horizons = ['180 days', '90 days', '60 days', '30 days']
     df_cv, df_performance = try_cross_validation_with_fallback(model, ts_data, candidate_horizons, initial=initial, period=period)
-
     if df_cv is not None and df_performance is not None:
         print("Validation Metrics with chosen best_params:")
         print(df_performance)
@@ -742,7 +700,6 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Forecast Comparison"
-
     for r in dataframe_to_rows(comparison_for_excel, index=False, header=True):
         ws1.append(r)
 
@@ -781,7 +738,6 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
             f"{min_week.strftime('%Y-%m-%d') if min_week else 'N/A'}"
         ]
     }
-
     if metrics is not None:
         for k, v in metrics.items():
             summary_data["Metric"].append(k)
@@ -804,7 +760,6 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
     wb = Workbook()
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
-
         if 'ds' in df_for_excel.columns:
             for i in range(len(df_for_excel)):
                 df_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
@@ -815,7 +770,6 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
                 df_for_excel[col] = np.nan
 
         df_for_excel = df_for_excel[desired_columns]
-
         ws = wb.create_sheet(title=str(asin)[:31])
         for r in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(r)
@@ -849,7 +803,6 @@ def analyze_amazon_buying_habits(comparison, holidays):
     if not amazon_cols:
         print("No Amazon forecasts found for analysis.")
         return
-
     prophet_forecast = comparison['Prophet Forecast'].values
     ds_dates = comparison.get('ds', pd.Series(index=comparison.index))
     holiday_dates = holidays['ds'].values if holidays is not None else []
@@ -858,10 +811,8 @@ def analyze_amazon_buying_habits(comparison, holidays):
     for col in amazon_cols:
         amazon_forecast = comparison[col].values
         safe_prophet = np.where(prophet_forecast == 0, 1e-9, prophet_forecast)
-
         ratio = amazon_forecast / safe_prophet
         diff = amazon_forecast - prophet_forecast
-
         avg_ratio = np.mean(ratio)
         avg_diff = np.mean(diff)
         print(f"\nFor {col}:")
@@ -890,7 +841,6 @@ def analyze_amazon_buying_habits(comparison, holidays):
             'Mid-term (Weeks 5-12)': (weeks >=5) & (weeks <=12),
             'Long-term (Weeks 13+)': (weeks > 12)
         }
-
         for segment_name, mask in segments.items():
             if mask.any():
                 seg_ratio = ratio[mask]
@@ -947,14 +897,12 @@ def main():
     for asin in asin_list:
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
-
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
             print(f"No forecast data found for ASIN {asin}, skipping.")
             continue
 
         ts_data = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
-
         non_nan_count = len(ts_data.dropna(subset=['y']))
         if non_nan_count < 2:
             print(f"Not enough data for ASIN {asin} (only {non_nan_count} data points), skipping.")
@@ -966,6 +914,7 @@ def main():
         model, model_type = choose_forecast_model(ts_data, threshold=50, holidays=holidays)
 
         if model_type == "SARIMA":
+            # For SARIMA, no Amazon forecast data is added.
             n = len(ts_data)
             split = int(n * 0.8)
             train_sarima = ts_data.iloc[:split]
@@ -974,35 +923,13 @@ def main():
             exog_train = create_holiday_regressors(train_sarima, holidays)
             exog_test = create_holiday_regressors(test_sarima, holidays)
 
-            for forecast_type, values in forecast_data.items():
-                train_length = len(train_sarima)
-                if len(values) >= train_length:
-                    adjusted_train_values = values[:train_length]
-                else:
-                    adjusted_train_values = np.pad(values, (0, train_length - len(values)), constant_values=0)
-
-                exog_train[f"Amazon_{forecast_type}"] = np.concatenate(
-                    (values[:len(train_sarima)], np.zeros(len(exog_train) - len(train_sarima)))
-                )
-                test_length = len(test_sarima)
-                if len(values) >= train_length + test_length:
-                    adjusted_test_values = values[train_length:train_length + test_length]
-                elif len(values) > train_length:
-                    adjusted_test_values = values[train_length:]
-                    adjusted_test_values = np.pad(adjusted_test_values, (0, test_length - len(adjusted_test_values)), constant_values=0)
-                else:
-                    adjusted_test_values = np.zeros(test_length)
-
-                exog_test[f"Amazon_{forecast_type}"] = adjusted_test_values
-
             if model is not None:
                 try:
                     steps = len(test_sarima)
-                    exog_columns = exog_train.columns
-                    exog_test = exog_test.reindex(columns=exog_columns, fill_value=0)
-                    exog_future_test = exog_test if not exog_test.empty else None
-                    preds = model.forecast(steps=steps, exog=exog_future_test)
-                    preds = preds.round().astype(int)
+                    # After model is fit, select only k_exog columns dynamically in forecast
+                    preds = sarima_forecast(model, steps=steps, last_date=train_sarima['ds'].iloc[-1],
+                                            exog=exog_test)
+                    preds = preds['Prophet Forecast'].values
 
                     sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
                     sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], preds))
@@ -1011,26 +938,15 @@ def main():
                     last_date_full = ts_data['ds'].iloc[-1]
                     exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
 
-                    for forecast_type, values in forecast_data.items():
-                        future_values = values[-horizon:] if len(values) >= horizon else values
-                        exog_future[f"Amazon_{forecast_type}"] = np.pad(
-                            future_values, (0, max(0, len(exog_future) - len(future_values))), 'constant'
-                        )
-                    exog_future = exog_future.reindex(columns=exog_columns, fill_value=0)
-
-                    final_preds = model.forecast(steps=horizon, exog=exog_future)
-                    final_preds = final_preds.round().astype(int)
-                    future_dates = pd.date_range(start=last_date_full + pd.Timedelta(weeks=1), periods=horizon, freq='W')
-                    forecast = pd.DataFrame({'ds': future_dates, 'Prophet Forecast': final_preds})
-
-                    if forecast.empty:
+                    final_forecast_df = sarima_forecast(model, steps=horizon, last_date=last_date_full, exog=exog_future)
+                    if final_forecast_df.empty:
                         print(f"Forecasting failed for ASIN {asin}, skipping.")
                         no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
                         with open(no_data_output, 'w') as f:
                             f.write("Failed to forecast due to insufficient data.\n")
                         continue
 
-                    comparison = forecast.copy()
+                    comparison = final_forecast_df.copy()
                     comparison['ASIN'] = asin
                     comparison['Product Title'] = product_title
                     comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
@@ -1083,6 +999,7 @@ def main():
                 continue
 
         else:
+            # Prophet model logic remains the same, with Amazon data included
             cached_model_path = os.path.join("model_cache", f"{asin}_Prophet.pkl")
             if os.path.exists(cached_model_path):
                 if is_model_up_to_date(cached_model_path, ts_data):
@@ -1094,7 +1011,6 @@ def main():
                     for forecast_type in forecast_data.keys():
                         future[f"Amazon_{forecast_type}"] = 0
                     future['prime_day'] = 0
-
                     forecast = cached_prophet_model.predict(future)
                     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
                 else:
@@ -1107,7 +1023,6 @@ def main():
                         best_params['holidays_prior_scale'],
                         horizon=horizon
                     )
-
                     if trained_prophet_model is not None:
                         save_model(trained_prophet_model, "Prophet", asin, ts_data)
                     else:
@@ -1122,7 +1037,6 @@ def main():
                     best_params['holidays_prior_scale'],
                     horizon=horizon
                 )
-
                 if trained_prophet_model is not None:
                     save_model(trained_prophet_model, "Prophet", asin, ts_data)
                 else:
