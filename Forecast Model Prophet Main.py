@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore")
 ##############################
 SARIMA_WEIGHT = 0.6  # Weight for SARIMA forecast in final combination
 CAP_VALUE = 2000     # Example cap for Prophet if using logistic growth
-FALLBACK_TOLERANCE = 10  # Tolerance used in fallback mechanism
+PERCENT_TOLERANCE = 0.30  # 30% difference tolerance for fallback
 EARLY_STOP_THRESHOLD = 10_000
 
 ##############################
@@ -282,12 +282,15 @@ def fit_sarima_model(data, holidays, seasonal_period=52):
         return best_model
 
 def sarima_forecast(model_fit, steps, last_date, exog=None):
+    """
+    Return a DataFrame with columns ['ds', 'Forecast'].
+    We'll unify the column name as 'Forecast' for consistency.
+    """
     k_exog = model_fit.model.k_exog
     if exog is not None and k_exog > 0:
         exog = exog.iloc[:, :k_exog]
 
     forecast_values = model_fit.forecast(steps=steps, exog=exog)
-    # Clip negatives, round to int
     forecast_values = forecast_values.clip(lower=0).round().astype(int)
 
     future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
@@ -321,6 +324,7 @@ def generate_date_from_week(row):
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
 def clean_weekly_sales_data(data):
+    # Optionally remove duplicates or do other cleaning
     return data
 
 def load_weekly_sales_data(file_path):
@@ -423,11 +427,14 @@ def forecast_with_custom_params(ts_data, forecast_data,
                                 seasonality_prior_scale,
                                 holidays_prior_scale,
                                 horizon=16):
+    from prophet import Prophet
+
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7),
                                  periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
     combined_df = pd.concat([ts_data, future], ignore_index=True)
 
+    # Insert Amazon forecast data as regressors
     for forecast_type, values in forecast_data.items():
         values_to_use = values[:horizon] if len(values) > horizon else values
         extended_values = np.concatenate([
@@ -473,16 +480,16 @@ def forecast_with_custom_params(ts_data, forecast_data,
     test_actual = combined_df.iloc[split:].dropna(subset=['y'])
     if not test_actual.empty:
         test_eval = test_forecast[test_forecast['ds'].isin(test_actual['ds'])]
-        # rename to "Forecast" for consistency
         test_eval['Forecast'] = test_eval['yhat'].clip(lower=0).round().astype(int)
         mape_val = mean_absolute_percentage_error(test_actual['y'], test_eval['Forecast'])
         rmse_val = sqrt(mean_squared_error(test_actual['y'], test_eval['Forecast']))
         print(f"Prophet Test MAPE: {mape_val:.4f}, RMSE: {rmse_val:.4f}")
 
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y', errors='ignore').copy()
-    prophet_output = model.predict(future_df)
-    prophet_output['Forecast'] = prophet_output['yhat'].clip(lower=0).round().astype(int)
-    return prophet_output[['ds', 'Forecast', 'yhat', 'yhat_upper']], model
+    forecast = model.predict(future_df)
+    # We'll unify the column name 'Forecast' for Prophet as well
+    forecast['Forecast'] = forecast['yhat'].clip(lower=0).round().astype(int)
+    return forecast[['ds', 'Forecast', 'yhat', 'yhat_upper']], model
 
 ##############################
 # Parameter Optimization for Prophet
@@ -513,7 +520,7 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
                         horizon
                     )
                     if forecast.empty or 'Forecast' not in forecast.columns:
-                        raise ValueError("Forecast failed to generate 'Forecast' column.")
+                        raise ValueError("Forecast failed to generate 'Forecast' column for Prophet.")
 
                     rmse_values = calculate_rmse(forecast, forecast_data, horizon)
                     avg_rmse = np.mean(list(rmse_values.values()))
@@ -547,10 +554,9 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
 def calculate_rmse(forecast, forecast_data, horizon):
     rmse_values = {}
     for forecast_type, values in forecast_data.items():
-        values = values[:horizon]
-        # We assume 'Forecast' is the final column
-        rmse_val = np.sqrt(((forecast['Forecast'] - values) ** 2).mean())
-        rmse_values[forecast_type] = rmse_val
+        val_slice = values[:horizon]
+        err = (forecast['Forecast'] - val_slice[:len(forecast)])**2
+        rmse_values[forecast_type] = np.sqrt(err.mean())
     return rmse_values
 
 ##############################
@@ -559,53 +565,51 @@ def calculate_rmse(forecast, forecast_data, horizon):
 
 def format_output_with_forecasts(forecast_df, forecast_data, horizon=16):
     """
-    We'll unify the 'Forecast' column for both SARIMA and Prophet outputs.
-    This function expects the forecast_df to have a column named 'Forecast'.
+    We'll unify the final 'Forecast' column, merging any Amazon forecast columns.
+    Then we do a fallback if it's out of a 30% difference range compared to 'Amazon Mean'.
     """
     comparison = forecast_df.copy()
 
-    # Merge Amazon columns
+    # Merge in the Amazon columns
     for forecast_type, values in forecast_data.items():
-        values = values[:horizon]
-        values = np.array(values, dtype=int)
+        val_slice = values[:horizon]
+        val_slice = np.array(val_slice, dtype=int)
         temp_df = pd.DataFrame({
             'ds': comparison['ds'],
-            f'Amazon {forecast_type}': values
+            f'Amazon {forecast_type}': val_slice
         })
         comparison = comparison.merge(temp_df, on='ds', how='left')
 
     comparison.fillna(0, inplace=True)
 
-    # Example fallback logic using P70/P90
-    if 'Amazon P70' in comparison.columns and 'Amazon P90' in comparison.columns:
+    # If we do not see 'Forecast' in columns, check if 'SARIMA Forecast' or 'Forecast' from Prophet is present
+    # But we already unify 'Forecast' for Prophet, 'Forecast' for SARIMA, so we should have 'Forecast' by default.
+    if 'Forecast' not in comparison.columns:
+        raise KeyError("No 'Forecast' column found. Make sure SARIMA or Prophet returns 'Forecast'.")
+
+    # 30% difference tolerance check if 'Amazon Mean' is present
+    if 'Amazon Mean' in comparison.columns:
         for i in range(len(comparison)):
-            model_val = comparison.loc[i, 'Forecast']  # unified forecast
-            amz_p70 = comparison.loc[i, 'Amazon P70']
-            amz_p90 = comparison.loc[i, 'Amazon P90']
+            model_val = comparison.loc[i, 'Forecast']
+            amz_mean = comparison.loc[i, 'Amazon Mean']
+            if amz_mean == 0:
+                continue
+            abs_percent_diff = abs(model_val - amz_mean) / float(amz_mean)
+            if abs_percent_diff > PERCENT_TOLERANCE:
+                print(f"Row {i} => ModelVal={model_val} is outside 30% range of AmazonMean={amz_mean}. Fallback used.")
+                fallback_val = 0.5 * model_val + 0.5 * amz_mean
+                fallback_val = max(0, round(fallback_val))
+                comparison.loc[i, 'Forecast'] = fallback_val
 
-            asin = comparison.loc[i, 'ASIN'] if 'ASIN' in comparison.columns else 'Unknown ASIN'
-
-            if (model_val < amz_p70 - FALLBACK_TOLERANCE) or (model_val > amz_p90 + FALLBACK_TOLERANCE):
-                if 'Amazon Mean' in comparison.columns:
-                    fallback_val = 0.5 * model_val + 0.5 * comparison.loc[i, 'Amazon Mean']
-                    print(f"ASIN {asin}: Model forecast ({model_val}) is out of tolerance range "
-                      f"[{amz_p70 - FALLBACK_TOLERANCE}, {amz_p90 + FALLBACK_TOLERANCE}]. "
-                      f"Using Amazon Mean ({comparison.loc[i, 'Amazon Mean']}) as fallback.")
-                else:
-                    fallback_val = amz_p70
-                    print(f"ASIN {asin}: Model forecast ({model_val}) is out of tolerance range "
-                      f"[{amz_p70 - FALLBACK_TOLERANCE}, {amz_p90 + FALLBACK_TOLERANCE}]. "
-                      f"Using Amazon P70 ({amz_p70}) as fallback.")
-                comparison.loc[i, 'Forecast'] = max(0, round(fallback_val))
-                
-
+    # Clip negative
     comparison['Forecast'] = comparison['Forecast'].clip(lower=0).round().astype(int)
 
+    # Create "Diff_*" and "Pct_*" columns
     for col in comparison.columns:
         if col.startswith('Amazon '):
             diff_col = f"Diff_{col.split('Amazon ')[1]}"
             pct_col = f"Pct_{col.split('Amazon ')[1]}"
-            comparison[diff_col] = (comparison['Forecast'] - comparison[col]).astype(int)
+            comparison[diff_col] = comparison['Forecast'] - comparison[col]
             comparison[pct_col] = np.where(
                 comparison[col] != 0,
                 (comparison[diff_col] / comparison[col]) * 100,
@@ -620,46 +624,41 @@ def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     adj_forecast = (yhat_weight * forecast['yhat'] +
                     yhat_upper_weight * forecast['yhat_upper']).clip(lower=0)
     adj_forecast = adj_forecast.round().astype(int)
-    # unify to 'Forecast' column
     forecast['Forecast'] = adj_forecast
     return forecast
 
-def find_best_forecast_weights(forecast, comparison, weights):
-    best_rmse = float('inf')
-    best_weights = None
-    rmse_results = {}
-    for yhat_weight, yhat_upper_weight in weights:
-        temp = adjust_forecast_weights(forecast.copy(), yhat_weight, yhat_upper_weight)
-        rmse_values = {}
-        for amazon_col in comparison.columns:
-            if amazon_col.startswith('Amazon '):
-                rmse_val = np.sqrt(((comparison[amazon_col] - temp['Forecast']) ** 2).mean())
-                rmse_values[amazon_col] = rmse_val
-        avg_rmse = np.mean(list(rmse_values.values()))
-        rmse_results[(yhat_weight, yhat_upper_weight)] = avg_rmse
-        if avg_rmse < best_rmse:
-            best_rmse = avg_rmse
-            best_weights = (yhat_weight, yhat_upper_weight)
-    return best_weights, rmse_results
-
-def auto_find_best_weights(forecast, comparison, step=0.05):
+def auto_find_best_weights(forecast, comparison, horizon=16, step=0.05):
     best_rmse = float('inf')
     best_weights = None
     candidates = np.arange(0.5, 1.0 + step, step)
     for w in candidates:
         yhat_weight = w
         yhat_upper_weight = 1 - w
-        temp = adjust_forecast_weights(forecast.copy(), yhat_weight, yhat_upper_weight)
-        rmse_values = {}
-        for amazon_col in comparison.columns:
-            if amazon_col.startswith('Amazon '):
-                rmse_val = np.sqrt(((comparison[amazon_col] - temp['Forecast']) ** 2).mean())
-                rmse_values[amazon_col] = rmse_val
-        avg_rmse = np.mean(list(rmse_values.values()))
-        if avg_rmse < best_rmse:
-            best_rmse = avg_rmse
-            best_weights = (yhat_weight, yhat_upper_weight)
+        
+        temp = forecast.copy()
+        # Weighted forecast
+        temp['Forecast'] = (
+            yhat_weight * temp['yhat'] + yhat_upper_weight * temp['yhat_upper']
+        ).clip(lower=0).round().astype(int)
+        
+        # Now call format_output_with_forecasts with horizon=16 (or your actual horizon)
+        comp = format_output_with_forecasts(temp, comparison, horizon)
+        
+        # Then compute RMSE vs. Amazon columns, etc.
+        rmse_vals = {}
+        for col in comp.columns:
+            if col.startswith('Amazon '):
+                rmse = np.sqrt(((comp['Forecast'] - comp[col])**2).mean())
+                rmse_vals[col] = rmse
+
+        if rmse_vals:
+            avg_rmse = np.mean(list(rmse_vals.values()))
+            if avg_rmse < best_rmse:
+                best_rmse = avg_rmse
+                best_weights = (yhat_weight, yhat_upper_weight)
+
     return best_weights, best_rmse
+
 
 ##############################
 # Cross-Validation for Prophet
@@ -669,6 +668,7 @@ def cross_validate_prophet_model(ts_data,
                                  initial='365 days',
                                  period='180 days',
                                  horizon='180 days'):
+    from prophet import Prophet
     model = Prophet(
         growth='linear',
         yearly_seasonality=True,
@@ -698,6 +698,7 @@ def try_cross_validation_with_fallback(model, ts_data, horizons, initial='365 da
     return None, None
 
 def validate_best_params(ts_data, best_params, initial='365 days', period='180 days'):
+    from prophet import Prophet
     model = Prophet(
         growth='linear',
         yearly_seasonality=True,
@@ -724,6 +725,11 @@ def validate_best_params(ts_data, best_params, initial='365 days', period='180 d
 ##############################
 
 def calculate_summary_statistics(ts_data, forecast_df, horizon):
+    # We'll look for 'Forecast' in forecast_df
+    forecast_col = 'Forecast'
+    if forecast_col not in forecast_df.columns:
+        raise KeyError("'Forecast' column not found in forecast DataFrame. Ensure unification was done properly.")
+
     summary_stats = {
         "min": ts_data["y"].min(),
         "max": ts_data["y"].max(),
@@ -734,14 +740,14 @@ def calculate_summary_statistics(ts_data, forecast_df, horizon):
         "data_range": (ts_data["ds"].min(), ts_data["ds"].max())
     }
 
-    total_forecast_16 = forecast_df['Forecast'][:16].sum() if len(forecast_df) >= 16 else forecast_df['Forecast'].sum()
-    total_forecast_8 = forecast_df['Forecast'][:8].sum() if len(forecast_df) >= 8 else forecast_df['Forecast'].sum()
-    total_forecast_4 = forecast_df['Forecast'][:4].sum() if len(forecast_df) >= 4 else forecast_df['Forecast'].sum()
+    total_forecast_16 = forecast_df[forecast_col][:16].sum() if len(forecast_df) >= 16 else forecast_df[forecast_col].sum()
+    total_forecast_8 = forecast_df[forecast_col][:8].sum() if len(forecast_df) >= 8 else forecast_df[forecast_col].sum()
+    total_forecast_4 = forecast_df[forecast_col][:4].sum() if len(forecast_df) >= 4 else forecast_df[forecast_col].sum()
 
-    max_forecast = forecast_df['Forecast'].max()
-    min_forecast = forecast_df['Forecast'].min()
-    max_week = forecast_df.loc[forecast_df['Forecast'].idxmax(), 'ds'] if 'ds' in forecast_df.columns else None
-    min_week = forecast_df.loc[forecast_df['Forecast'].idxmin(), 'ds'] if 'ds' in forecast_df.columns else None
+    max_forecast = forecast_df[forecast_col].max()
+    min_forecast = forecast_df[forecast_col].min()
+    max_week = forecast_df.loc[forecast_df[forecast_col].idxmax(), 'ds'] if 'ds' in forecast_df.columns else None
+    min_week = forecast_df.loc[forecast_df[forecast_col].idxmin(), 'ds'] if 'ds' in forecast_df.columns else None
     return (summary_stats,
             total_forecast_16,
             total_forecast_8,
@@ -755,14 +761,25 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats,
                                        total_forecast_16, total_forecast_8, total_forecast_4,
                                        max_forecast, min_forecast, max_week, min_week,
                                        asin, product_title, folder_name):
+    # We need a 'Forecast' column in 'comparison'
+    if 'Forecast' not in comparison.columns:
+        # If needed, unify again, or raise error
+        raise KeyError("'Forecast' column is missing in the comparison DataFrame. Cannot plot.")
+
+    # Ensure we have 'ds'
+    if 'ds' not in comparison.columns:
+        # Attempt to unify with original ts_data
+        comparison = pd.concat([ts_data[['ds']], comparison], axis=1).drop_duplicates(subset=['ds'])
+        if 'ds' not in comparison.columns:
+            raise KeyError("'ds' column is missing in the comparison DataFrame even after merging.")
+
     fig, ax = plt.subplots(figsize=(16, 10))
     ax.plot(ts_data['ds'], ts_data['y'], label='Historical Sales', marker='o', color='black')
-    ax.plot(comparison['ds'], comparison['Forecast'],
-            label='Forecast', marker='o', linestyle='--', color='blue')
+    ax.plot(comparison['ds'], comparison['Forecast'], label='Forecast', marker='o', linestyle='--', color='blue')
 
     for column in comparison.columns:
         if column.startswith('Amazon '):
-            ax.plot(comparison['ds'], comparison[column], label=f'{column}', linestyle=':')
+            ax.plot(comparison['ds'], comparison[column], label=column, linestyle=':')
 
     ax.set_title(f'Sales Forecast Comparison for {product_title}')
     ax.set_xlabel('Date')
@@ -770,6 +787,7 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats,
     ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1))
     ax.grid()
 
+    # Summary Text
     summary_text = (
         f"Historical Summary:\n"
         f"Range: {summary_stats['data_range'][0].strftime('%Y-%m-%d')} to "
@@ -815,6 +833,9 @@ def save_summary_to_excel(comparison,
                           min_week,
                           output_file_path,
                           metrics=None):
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
     desired_columns = [
         'Week', 'ASIN', 'Forecast', 'Amazon Mean Forecast',
         'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
@@ -827,7 +848,6 @@ def save_summary_to_excel(comparison,
             comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
         comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
 
-    # Ensure essential columns
     for col in desired_columns:
         if col not in comparison_for_excel.columns:
             comparison_for_excel[col] = np.nan
@@ -835,7 +855,6 @@ def save_summary_to_excel(comparison,
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Forecast Comparison"
-    from openpyxl.utils.dataframe import dataframe_to_rows
     for r in dataframe_to_rows(comparison_for_excel, index=False, header=True):
         ws1.append(r)
 
@@ -888,6 +907,9 @@ def save_summary_to_excel(comparison,
     print(f"Comparison and summary saved to '{output_file_path}'")
 
 def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
     wb = Workbook()
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
@@ -907,13 +929,11 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
 
         df_for_excel = df_for_excel[desired_columns]
         ws = wb.create_sheet(title=str(asin)[:31])
-        from openpyxl.utils.dataframe import dataframe_to_rows
         for r in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(r)
 
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
-        from openpyxl.utils.dataframe import dataframe_to_rows
         for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(r)
 
@@ -922,6 +942,48 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
 
     wb.save(output_path)
     print(f"All forecasts saved to {output_path}")
+
+def save_4_16weeks_forecast(consolidated_forecasts, output_file_path):
+    """
+    Create a new Excel file that contains columns:
+        ASIN,
+        Total Forecast for first 4 weeks,
+        Total Forecast for first 8 weeks,
+        Total Forecast for first 16 weeks.
+    """
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
+    data_list = []
+    for asin, df in consolidated_forecasts.items():
+        # Decide which forecast column to use
+        if "Forecast" in df.columns:
+            forecast_col = "Forecast"
+        else:
+            raise KeyError(f"No 'Forecast' column found for ASIN {asin} in consolidated data.")
+
+        total_4 = df[forecast_col].iloc[:4].sum() if len(df) >= 4 else df[forecast_col].sum()
+        total_8 = df[forecast_col].iloc[:8].sum() if len(df) >= 8 else df[forecast_col].sum()
+        total_16 = df[forecast_col].iloc[:16].sum() if len(df) >= 16 else df[forecast_col].sum()
+
+        data_list.append({
+            'ASIN': asin,
+            '4 Weeks Forecast': total_4,
+            '8 Weeks Forecast': total_8,
+            '16 Weeks Forecast': total_16
+        })
+
+    result_df = pd.DataFrame(data_list)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "4-16 Weeks Forecast"
+
+    for row in dataframe_to_rows(result_df, index=False, header=True):
+        ws.append(row)
+
+    wb.save(output_file_path)
+    print(f"Saved 4/8/16-weeks forecast summary to '{output_file_path}'")
 
 ##############################
 # Analyze Amazon Buying Habits
@@ -933,18 +995,23 @@ def analyze_amazon_buying_habits(comparison, holidays):
         print("No Amazon forecasts found for analysis.")
         return
 
-    # We'll see if there's a "SARIMA Forecast" or "Prophet Forecast" or just "Forecast"
-    if 'SARIMA Forecast' in comparison.columns:
-        model_col = 'SARIMA Forecast'
-    elif 'Prophet Forecast' in comparison.columns:
-        model_col = 'Prophet Forecast'
-    else:
+    if 'Forecast' in comparison.columns:
         model_col = 'Forecast'
+    else:
+        raise KeyError("No 'Forecast' column to compare against Amazon forecasts in analyze_amazon_buying_habits.")
+
+    print("Columns in `comparison` df:", comparison.columns.tolist())
+    print("Unique columns in `comparison` df:", set(comparison.columns))
+    print("Shape of comparison[model_col]:", comparison[model_col].shape)
 
     model_forecast_vals = comparison[model_col].values
-    ds_dates = comparison.get('ds', pd.Series(index=comparison.index))
-    holiday_dates = holidays['ds'].values if holidays is not None else []
-    comparison['is_holiday_week'] = comparison.get('ds', pd.Series(index=comparison.index)).isin(holiday_dates) if 'ds' in comparison.columns else False
+
+    # If we want a holiday mask
+    if 'is_holiday_week' in comparison.columns:
+        holiday_mask = comparison['is_holiday_week']
+    else:
+        # or create one from the DS
+        holiday_mask = comparison['ds'].isin(holidays['ds'].values) if 'ds' in comparison.columns else np.array([False]*len(comparison))
 
     for col in amazon_cols:
         amazon_forecast = comparison[col].values
@@ -965,10 +1032,9 @@ def analyze_amazon_buying_habits(comparison, holidays):
         else:
             print("  Amazon forecasts similarly to our model on average.")
 
-        holiday_mask = comparison['is_holiday_week']
         if holiday_mask.any():
-            holiday_ratio = amazon_forecast[holiday_mask] / safe_model_forecast[holiday_mask]
-            holiday_diff = amazon_forecast[holiday_mask] - model_forecast_vals[holiday_mask]
+            holiday_ratio = ratio[holiday_mask]
+            holiday_diff = diff[holiday_mask]
             if len(holiday_diff) > 0:
                 print("  During holiday weeks:")
                 print(f"    Avg Ratio (Amazon/Model): {np.mean(holiday_ratio):.2f}")
@@ -1010,7 +1076,7 @@ def main():
     print(f"ASINs to forecast: {asins_to_forecast}")
 
     asin_list = valid_data['asin'].unique()
-    asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
+    asin_list = [a for a in asin_list if a in asins_to_forecast]
 
     consolidated_forecasts = {}
     param_grid = {
@@ -1058,6 +1124,7 @@ def main():
         model, model_type = choose_forecast_model(ts_data, threshold=50, holidays=holidays)
 
         if model_type == "SARIMA":
+            # SARIMA logic
             n = len(ts_data)
             split = int(n * 0.8)
             train_sarima = ts_data.iloc[:split]
@@ -1069,10 +1136,11 @@ def main():
             if model is not None:
                 try:
                     steps = len(test_sarima)
-                    preds_df = sarima_forecast(model, steps=steps,
-                                               last_date=train_sarima['ds'].iloc[-1],
-                                               exog=exog_test)
-                    # Our SARIMA forecast is in the column named 'Forecast'
+                    preds_df = sarima_forecast(
+                        model, steps=steps,
+                        last_date=train_sarima['ds'].iloc[-1],
+                        exog=exog_test
+                    )
                     preds = preds_df['Forecast'].values
 
                     sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
@@ -1081,9 +1149,9 @@ def main():
 
                     last_date_full = ts_data['ds'].iloc[-1]
                     exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
-                    final_forecast_df = sarima_forecast(model, steps=horizon,
-                                                        last_date=last_date_full,
-                                                        exog=exog_future)
+                    final_forecast_df = sarima_forecast(
+                        model, steps=horizon, last_date=last_date_full, exog=exog_future
+                    )
                     if final_forecast_df.empty:
                         print(f"Forecasting failed for ASIN {asin}, skipping.")
                         no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
@@ -1091,11 +1159,9 @@ def main():
                             f.write("Failed to forecast due to insufficient data.\n")
                         continue
 
-                    # Pass final_forecast_df to format_output_with_forecasts
+                    # final_forecast_df => columns: ds, Forecast
                     comparison = format_output_with_forecasts(final_forecast_df, forecast_data, horizon=horizon)
-                    # We keep it as "Forecast" for final usage (unified). 
-                    # If you want "SARIMA Forecast", rename after calling format_output_with_forecasts
-                    # e.g.: comparison.rename(columns={'Forecast': 'SARIMA Forecast'}, inplace=True)
+                    # Now we keep the column name as 'Forecast' (no rename)
 
                     comparison['ASIN'] = asin
                     comparison['Product Title'] = product_title
@@ -1127,24 +1193,12 @@ def main():
                             "Mean Absolute Percentage Error (MAPE)": str(np.round(mape_val, 2)) + " %"
                         }
 
-                    # Optionally combine with Amazon data if you want a weighted approach
-                    amazon_cols = [col for col in forecast_data.keys()]
-                    if amazon_cols:
-                        for ftype, values in forecast_data.items():
-                            horizon_values = values[:horizon] if len(values) >= horizon else values
-                            if len(horizon_values) < horizon and len(horizon_values) > 0:
-                                horizon_values = np.pad(horizon_values, (0, horizon - len(horizon_values)),
-                                                        'constant', constant_values=horizon_values[-1])
-                            elif len(horizon_values) == 0:
-                                horizon_values = np.zeros(horizon)
-                            comparison[f'Amazon {ftype}'] = horizon_values
-
-                        # Weighted combination with 'Amazon Mean' if you like
-                        if 'Amazon Mean' in comparison.columns:
-                            comparison['Forecast'] = (
-                                SARIMA_WEIGHT * comparison['Forecast']
-                                + (1 - SARIMA_WEIGHT) * comparison['Amazon Mean']
-                            ).clip(lower=0).round().astype(int)
+                    # optional blend with Amazon Mean
+                    if 'Amazon Mean' in comparison.columns:
+                        comparison['Forecast'] = (
+                            SARIMA_WEIGHT * comparison['Forecast']
+                            + (1 - SARIMA_WEIGHT) * comparison['Amazon Mean']
+                        ).clip(lower=0).round().astype(int)
 
                     (summary_stats,
                      total_forecast_16,
@@ -1194,14 +1248,17 @@ def main():
                     print(f"Using up-to-date cached Prophet model for ASIN {asin}.")
                     cached_prophet_model = joblib.load(cached_model_path)
                     last_train_date = ts_data['ds'].max()
-                    future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7),
-                                                 periods=horizon, freq='W')
+                    future_dates = pd.date_range(
+                        start=last_train_date + pd.Timedelta(days=7),
+                        periods=horizon,
+                        freq='W'
+                    )
                     future = pd.DataFrame({'ds': future_dates})
                     for forecast_type in forecast_data.keys():
                         future[f"Amazon_{forecast_type}"] = 0
                     future['prime_day'] = 0
                     prophet_output = cached_prophet_model.predict(future)
-                    # unify column as "Forecast"
+                    # unify the forecast column
                     prophet_output['Forecast'] = prophet_output['yhat'].clip(lower=0).round().astype(int)
                     forecast = prophet_output[['ds', 'Forecast', 'yhat', 'yhat_upper']]
                 else:
@@ -1221,7 +1278,9 @@ def main():
                         print("Failed to retrain the Prophet model.")
             else:
                 print(f"No cached Prophet model found for ASIN {asin}. Training a new model...")
-                best_params, _ = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
+                best_params, _ = optimize_prophet_params(
+                    ts_data, forecast_data, param_grid, horizon=horizon
+                )
                 forecast, trained_prophet_model = forecast_with_custom_params(
                     ts_data,
                     forecast_data,
@@ -1242,11 +1301,12 @@ def main():
                     f.write("Final forecasting failed.\n")
                 continue
 
-            # Format output
             comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
 
-            # Auto find best weights for yhat/yhat_upper
-            best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05)
+            # auto find best yhat/yhat_upper weights
+            best_weights, best_rmse = auto_find_best_weights(forecast, forecast_data)
+            # but to keep code simpler, let's replicate your approach
+            # (or do: best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05))
             print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
 
             forecast = adjust_forecast_weights(forecast, *best_weights)
@@ -1254,6 +1314,12 @@ def main():
 
             comparison['ASIN'] = asin
             comparison['Product Title'] = product_title
+
+            # Insert is_holiday_week if missing
+            if 'is_holiday_week' not in comparison.columns:
+                comparison['is_holiday_week'] = comparison['ds'].apply(
+                    lambda x: x in holidays['ds'].values
+                )
 
             analyze_amazon_buying_habits(comparison, holidays)
 
@@ -1264,11 +1330,23 @@ def main():
                 print("No overlapping historical data to calculate metrics. Skipping metrics.")
                 metrics = {}
             else:
-                mae_val = mean_absolute_error(comparison_historical['y'], comparison_historical['Forecast'])
-                medae_val = median_absolute_error(comparison_historical['y'], comparison_historical['Forecast'])
-                mse_val = mean_squared_error(comparison_historical['y'], comparison_historical['Forecast'])
+                mae_val = mean_absolute_error(
+                    comparison_historical['y'],
+                    comparison_historical['Forecast']
+                )
+                medae_val = median_absolute_error(
+                    comparison_historical['y'],
+                    comparison_historical['Forecast']
+                )
+                mse_val = mean_squared_error(
+                    comparison_historical['y'],
+                    comparison_historical['Forecast']
+                )
                 rmse_val = sqrt(mse_val)
-                mape_val = mean_absolute_percentage_error(comparison_historical['y'], comparison_historical['Forecast'])
+                mape_val = mean_absolute_percentage_error(
+                    comparison_historical['y'],
+                    comparison_historical['Forecast']
+                )
 
                 print('Mean Absolute Error (MAE): ' + str(np.round(mae_val, 2)))
                 print('Median Absolute Error (MedAE): ' + str(np.round(medae_val, 2)))
@@ -1283,6 +1361,24 @@ def main():
                     "Root Mean Squared Error (RMSE)": np.round(rmse_val, 2),
                     "Mean Absolute Percentage Error (MAPE)": str(np.round(mape_val, 2)) + " %"
                 }
+
+            # Create Week label
+            for i in range(len(comparison)):
+                comparison.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
+
+            desired_final_cols = [
+                'ds',
+                'Week',
+                'ASIN',
+                'Forecast',
+                'Amazon Mean Forecast',
+                'Amazon P70 Forecast',
+                'Amazon P80 Forecast',
+                'Amazon P90 Forecast',
+                'Product Title',
+                'is_holiday_week'
+            ]
+            comparison = comparison[[col for col in desired_final_cols if col in comparison.columns]]
 
             (summary_stats,
              total_forecast_16,
@@ -1321,9 +1417,13 @@ def main():
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
 
+    forecast_4_16_file = "4-16weeks forecast.xlsx"
+    save_4_16weeks_forecast(consolidated_forecasts, forecast_4_16_file)
+
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
+
 
 if __name__ == '__main__':
     main()
