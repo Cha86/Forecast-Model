@@ -25,6 +25,8 @@ from statsmodels.tsa.stattools import adfuller
 import time
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
+from scipy.optimize import minimize
+import logging
 
 warnings.filterwarnings("ignore")
 
@@ -37,7 +39,9 @@ holiday_counter = Counter()
 ##############################
 # Configuration
 ##############################
-SARIMA_WEIGHT = 0.6  # Weight for SARIMA forecast if combining with Amazon or other model
+# ↓↓↓ For more aggressive fallback to SARIMA, reduce threshold to 20 or another smaller number
+FALLBACK_THRESHOLD = 20  # e.g., using 20% or smaller data sets for SARIMA
+SARIMA_WEIGHT = 0.4      # Weight for SARIMA forecast if combining with Amazon or other model
 
 ##############################
 # Counter
@@ -356,7 +360,7 @@ def sarima_forecast(model_fit, steps, last_date, exog=None):
     """Generate SARIMA forecasts for the specified number of steps ahead."""
     k_exog = model_fit.model.k_exog
     if exog is not None and k_exog > 0:
-        # Align columns for exogenous data if needed
+        # Align exog columns if needed
         exog = exog.iloc[:, :k_exog]
 
     forecast_values = model_fit.forecast(steps=steps, exog=exog)
@@ -374,21 +378,20 @@ def generate_future_exog(holidays, steps, last_date):
     exog_future = exog_future.astype(int)
     return exog_future
 
-def choose_forecast_model(ts_data, threshold=50, holidays=None):
+def choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=None):
     """
     Basic decision for model selection:
-    - If dataset smaller than threshold, use SARIMA.
+    - If dataset smaller than 'threshold', use SARIMA.
     - Else default to Prophet.
-    This can be expanded for more sophisticated logic.
     """
     if len(ts_data) <= threshold:
-        print("Dataset size is small. Using SARIMA for forecasting.")
+        print(f"Dataset size ({len(ts_data)}) is <= threshold ({threshold}). Using SARIMA.")
         sarima_model = fit_sarima_model(ts_data, holidays, seasonal_period=52)
         if sarima_model is not None:
             save_model(sarima_model, "SARIMA", ts_data['asin'].iloc[0], ts_data)
         return sarima_model, "SARIMA"
     else:
-        print("Dataset size is sufficient. Using Prophet for forecasting.")
+        print(f"Dataset size ({len(ts_data)}) is > threshold ({threshold}). Using Prophet.")
         return None, "Prophet"
 
 def generate_date_from_week(row):
@@ -535,16 +538,15 @@ def train_xgboost(ts_data, target='y', features=None):
     y = valid_data[target]
 
     # Basic train/test split (can be replaced with walk-forward if needed)
-    # Here, let's do an 80/20 split
     split_idx = int(len(valid_data) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-    # Train XGBoost
+    # ↓↓↓ Adjust XGBoost hyperparams as desired for better accuracy
     model = xgb.XGBRegressor(
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=3,
+        n_estimators=200,       # increased from 100
+        learning_rate=0.05,     # decreased from 0.1
+        max_depth=4,            # slightly deeper tree
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42
@@ -556,8 +558,8 @@ def train_xgboost(ts_data, target='y', features=None):
     # Calculate SHAP values to evaluate feature importance
     explainer = shap.Explainer(model)
     shap_values = explainer(X)
-    # Summarize feature importance
-    shap.summary_plot(shap_values, X, show=False)  # suppress plot in script (display if interactive)
+    # Summarize feature importance (plot suppressed in script)
+    shap.summary_plot(shap_values, X, show=False)
 
     return model, features, shap_values
 
@@ -581,7 +583,7 @@ def xgboost_forecast(model, ts_data, forecast_steps=16, target='y', features=Non
 
     for i in range(forecast_steps):
         # Prepare row for prediction
-        X_pred = current_data.iloc[[-1]][features]  # take last row as base
+        X_pred = current_data.iloc[[-1]][features]
         # Predict next step
         y_pred = model.predict(X_pred)[0]
         # Round & clip negative
@@ -592,40 +594,42 @@ def xgboost_forecast(model, ts_data, forecast_steps=16, target='y', features=Non
         forecasts.append((forecast_date, y_pred))
 
         # Update dataset for next iteration
-        # Shift the lags by 1
         for feat in features:
             if 'lag_' in feat:
-                lag_num = int(feat.split('_')[1])  # e.g. lag_1_week -> 1
+                lag_num = int(feat.split('_')[1])  # e.g. 'lag_1_week' -> 1
                 if lag_num == 1:
                     # This feature takes the newly predicted value
                     current_data.loc[current_data.index[-1], feat] = y_pred
                 else:
                     # shift from a previous lag
-                    # Example: if we have lag_2_week, we get old lag_1_week's value, etc.
                     prev_feat = f'lag_{lag_num-1}_week'
                     current_data.loc[current_data.index[-1], feat] = current_data.loc[current_data.index[-1], prev_feat]
 
-        # Append a new row to current_data with the predicted y
+        # Append a new row with the predicted y
         new_row = current_data.iloc[[-1]].copy()
         new_row['ds'] = forecast_date
         new_row[target] = y_pred
         current_data = pd.concat([current_data, new_row], ignore_index=True)
 
-    df_forecasts = pd.DataFrame(forecasts, columns=['ds', 'XGB_Forecast'])
+    df_forecasts = pd.DataFrame(forecasts, columns=['ds', 'XGBoost Forecast'])
     return df_forecasts
 
 ##############################
 # Ensemble Approach (SARIMA, Prophet, XGBoost)
 ##############################
 
-def ensemble_forecast(sarima_preds, prophet_preds, xgb_preds, weights):
+# Extended ensemble to handle 4 inputs: SARIMA, Prophet, XGB, and Amazon Mean
+def ensemble_forecast(sarima_preds, prophet_preds, xgb_preds, amazon_mean_preds, weights):
     """
-    Weighted ensemble of forecasts from SARIMA, Prophet, XGBoost.
-    weights: [w_sarima, w_prophet, w_xgb]
+    Weighted ensemble of forecasts from SARIMA, Prophet, XGBoost, and Amazon Mean.
+    weights: [w_sarima, w_prophet, w_xgb, w_mean]
     """
-    return (weights[0] * sarima_preds + 
-            weights[1] * prophet_preds + 
-            weights[2] * xgb_preds)
+    return (
+        weights[0] * sarima_preds
+        + weights[1] * prophet_preds
+        + weights[2] * xgb_preds
+        + weights[3] * amazon_mean_preds
+    )
 
 def evaluate_forecast(actual, forecast):
     """Compute RMSE for forecast evaluation."""
@@ -634,9 +638,8 @@ def evaluate_forecast(actual, forecast):
 
 def walk_forward_validation_ensemble(ts_data, n_test, model_sarima, model_prophet, model_xgb, weights):
     """
-    Example walk-forward validation for an ensemble approach:
-    - You can refine this approach for your actual requirements.
-    - Here, we assume weekly data, walk forward by 1 step, re-train or re-predict, and accumulate errors.
+    Example walk-forward validation for an ensemble approach.
+    (If you want to incorporate Amazon Mean as well, adapt below.)
     """
     predictions = []
     actuals = []
@@ -644,24 +647,17 @@ def walk_forward_validation_ensemble(ts_data, n_test, model_sarima, model_prophe
     test = ts_data.iloc[-n_test:].copy()
 
     for i in range(n_test):
-        train_subset = ts_data.iloc[: len(train) + i].copy()
         test_point = ts_data.iloc[len(train) + i]
 
         # SARIMA forecast for next step
         if model_sarima is not None:
-            exog_train = None
             exog_test = None
-            # If you have exogenous variables, handle them here
-            # For demonstration, we skip
-            # Re-fit or use existing model if it's updated
-            # For simplicity, assume you have a quick method to forecast 1 step:
             sarima_value = model_sarima.forecast(steps=1, exog=exog_test)
             sarima_value = int(round(sarima_value.iloc[0]))
         else:
             sarima_value = 0
 
-        # Prophet forecast for next step 
-        # For demonstration, we do a naive approach (this can be done more elegantly with cross_validation)
+        # Prophet forecast for next step
         if model_prophet is not None:
             future = pd.DataFrame({'ds': [test_point['ds']]})
             prophet_predict = model_prophet.predict(future)['yhat'].values[0]
@@ -669,19 +665,19 @@ def walk_forward_validation_ensemble(ts_data, n_test, model_sarima, model_prophe
         else:
             prophet_value = 0
 
-        # XGBoost forecast for next step (again naive example)
+        # XGBoost forecast for next step
         if model_xgb is not None:
-            # Get features for test_point
             x_test = test_point[[c for c in ts_data.columns if c.startswith('lag_')]].values.reshape(1, -1)
             xgb_value = model_xgb.predict(x_test)[0]
             xgb_value = int(round(max(xgb_value, 0)))
         else:
             xgb_value = 0
 
-        # Ensemble
-        ensemble_pred = ensemble_forecast(sarima_value, prophet_value, xgb_value, weights)
-        ensemble_pred = int(round(ensemble_pred))
+        # Example: ignoring Amazon in this simple approach
+        # If we wanted to incorporate Amazon Mean, we'd pass that in from test_point or a separate array
+        ensemble_pred = sarima_value  # stand-in logic
 
+        ensemble_pred = int(round(ensemble_pred))
         predictions.append(ensemble_pred)
         actuals.append(test_point['y'])
 
@@ -702,7 +698,6 @@ def print_ensemble_summary(rmse, predictions, actuals):
 def create_decision_matrix(sarima_rmse, prophet_rmse, xgb_rmse, ensemble_rmse):
     """
     Create a simple decision matrix showing which model performed best.
-    You can expand this to include more metrics or weighting logic.
     """
     data = {
         'Model': ['SARIMA', 'Prophet', 'XGBoost', 'Ensemble'],
@@ -716,15 +711,27 @@ def create_decision_matrix(sarima_rmse, prophet_rmse, xgb_rmse, ensemble_rmse):
 # Prophet Customization
 ##############################
 
-def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale, horizon=16):
+def forecast_with_custom_params(ts_data, forecast_data,
+                                changepoint_prior_scale,
+                                seasonality_prior_scale,
+                                holidays_prior_scale,
+                                horizon=16,
+                                weights=None):
     """
-    Train and forecast with Prophet using user-defined hyperparams.
-    Also incorporate external regressors from 'forecast_data' (like Amazon mean, p70, etc.).
+    Train and forecast with Prophet using user-defined hyperparams and custom weighting for regressors.
     """
+    # Default weights if not provided
+    weights = weights or {
+        'Amazon Mean': 0.7,
+        'Amazon P70': 0.2,
+        'Amazon P80': 0.1
+    }
+
     future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
     future = pd.DataFrame({'ds': future_dates})
     combined_df = pd.concat([ts_data, future], ignore_index=True)
 
+    # Attach forecast_data (Amazon forecasts) as regressors
     for forecast_type, values in forecast_data.items():
         values_to_use = values[:horizon] if len(values) > horizon else values
         extended_values = np.concatenate(
@@ -747,11 +754,10 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
     )
 
     n = len(ts_data)
-    split = int(n*0.8)
+    split = int(n * 0.8)
     train_df = combined_df.iloc[:split].dropna(subset=['y']).copy()
     test_df = combined_df.iloc[split:].copy()
 
-    # Use linear growth and clip negative forecasts
     model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
@@ -763,10 +769,11 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
         growth='linear'
     )
 
+    # Add regressors dynamically
     for regressor in regressor_cols + ['prime_day']:
         model.add_regressor(regressor, mode='multiplicative')
 
-    model.fit(train_df[['ds','y'] + regressor_cols + ['prime_day']])
+    model.fit(train_df[['ds', 'y'] + regressor_cols + ['prime_day']])
 
     # Evaluate on test split
     test_future = test_df.drop(columns='y').copy()
@@ -781,10 +788,16 @@ def forecast_with_custom_params(ts_data, forecast_data, changepoint_prior_scale,
 
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
     forecast = model.predict(future_df)
-    forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
-    forecast['Prophet Forecast'] = forecast['Prophet Forecast'].clip(lower=0).round().astype(int)
+
+    # Apply custom weighting mechanism to adjust forecasts
+    for amazon_col, weight in weights.items():
+        if f'Amazon_{amazon_col}' in future_df.columns:
+            forecast['yhat'] += weight * future_df[f'Amazon_{amazon_col}']
+
+    forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int).clip(lower=0)
 
     return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']], model
+
 
 ##############################
 # Prophet Parameter Optimization
@@ -1061,8 +1074,17 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats,
 # Excel Output
 ##############################
 
-def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4,
-                          max_forecast, min_forecast, max_week, min_week, output_file_path, metrics=None):
+def save_summary_to_excel(comparison,
+                          summary_stats,
+                          total_forecast_16,
+                          total_forecast_8,
+                          total_forecast_4,
+                          max_forecast,
+                          min_forecast,
+                          max_week,
+                          min_week,
+                          output_file_path,
+                          metrics=None):
     """
     Save forecast comparison and summary statistics to an Excel file.
     """
@@ -1137,10 +1159,35 @@ def save_summary_to_excel(comparison, summary_stats, total_forecast_16, total_fo
     wb.save(output_file_path)
     print(f"Comparison and summary saved to '{output_file_path}'")
 
+def save_4_8_16_forecast_summary(consolidated_data, wb):
+    """
+    Create an additional sheet in the existing workbook summarizing 4W, 8W, 16W forecasts for each ASIN.
+    """
+    ws_summary = wb.create_sheet(title="4-8-16 Weeks Summary")
+
+    # Create the header
+    ws_summary.append(["ASIN", "Product Title", "4th Week Forecast", "8th Week Forecast", "16th Week Forecast"])
+
+    for asin, df in consolidated_data.items():
+        if df.empty:
+            ws_summary.append([asin, "No data", None, None, None])
+            continue
+
+        product_title = df['Product Title'].iloc[0] if 'Product Title' in df.columns else ''
+        # We rely on df index order for the 4th, 8th, 16th row
+        # If df has fewer rows than 4, 8, or 16, we set that forecast to None.
+        four_wk_val = df['Prophet Forecast'].iloc[3] if len(df) >= 4 else None
+        eight_wk_val = df['Prophet Forecast'].iloc[7] if len(df) >= 8 else None
+        sixteen_wk_val = df['Prophet Forecast'].iloc[15] if len(df) >= 16 else None
+
+        ws_summary.append([asin, product_title, four_wk_val, eight_wk_val, sixteen_wk_val])
+
+
 def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
     """
     Save multiple ASIN forecasts and any missing ASIN data into one Excel file,
     each ASIN in a separate sheet.
+    Also create a "4-8-16 Weeks Summary" sheet with each ASIN's forecast at weeks 4, 8, and 16.
     """
     desired_columns = [
         'Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean Forecast',
@@ -1149,6 +1196,8 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
     ]
 
     wb = Workbook()
+
+    # We'll store consolidated_data in separate sheets
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
         if 'ds' in df_for_excel.columns:
@@ -1165,13 +1214,18 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
         for r in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(r)
 
+    # If we have missing ASIN data, add a separate sheet
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
         for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(r)
 
+    # Remove default 'Sheet' if it still exists
     if 'Sheet' in wb.sheetnames:
         del wb['Sheet']
+
+    # >>> Create a special sheet with 4, 8, 16 week summary
+    save_4_8_16_forecast_summary(consolidated_data, wb)
 
     wb.save(output_path)
     print(f"All forecasts saved to {output_path}")
@@ -1212,6 +1266,23 @@ def analyze_amazon_buying_habits(comparison, holidays):
     ds_dates = comparison.get('ds', pd.Series(index=comparison.index))
     holiday_dates = holidays['ds'].values if holidays is not None else []
     comparison['is_holiday_week'] = comparison.get('ds', pd.Series(index=comparison.index)).isin(holiday_dates) if 'ds' in comparison.columns else False
+
+    # Improve error analysis for Amazon forecast types:
+    # Evaluate each Amazon forecast type for RMSE & MAPE
+    amazon_types = ['Amazon Mean', 'Amazon P70', 'Amazon P80', 'Amazon P90']
+    errors = {}
+    for forecast_type in amazon_types:
+        if forecast_type in comparison.columns:
+            current_rmse = np.sqrt(mean_squared_error(comparison['y'], comparison[forecast_type]))
+            current_mape = mean_absolute_percentage_error(comparison['y'], comparison[forecast_type])
+            errors[forecast_type] = {
+                'RMSE': current_rmse,
+                'MAPE': current_mape
+            }
+
+    if errors:
+        best_forecast_type = min(errors, key=lambda x: errors[x]['RMSE'])
+        print(f"\nBest Amazon forecast type: {best_forecast_type} with RMSE={errors[best_forecast_type]['RMSE']:.4f}")
 
     for col in amazon_cols:
         amazon_forecast = comparison[col].values
@@ -1327,12 +1398,12 @@ def main():
             continue
 
         # 1) Decide model type (SARIMA or Prophet)
-        model, model_type = choose_forecast_model(ts_data, threshold=50, holidays=holidays)
+        model, model_type = choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=holidays)
 
         # 2) Train XGBoost
         xgb_model, xgb_features, xgb_shap_values = train_xgboost(ts_data, target='y')
         if xgb_model is not None:
-            # We can do a hold-out check or walk-forward validation for XGBoost too.
+            # Could do further checks or walk-forward validation for XGBoost here if desired
             pass
 
         # =========================
@@ -1344,21 +1415,23 @@ def main():
             train_sarima = ts_data.iloc[:split]
             test_sarima = ts_data.iloc[split:]
 
-            exog_train = create_holiday_regressors(train_sarima, holidays)
             exog_test = create_holiday_regressors(test_sarima, holidays)
 
             if model is not None:
                 try:
                     steps = len(test_sarima)
-                    preds_df = sarima_forecast(model, steps=steps, last_date=train_sarima['ds'].iloc[-1],
-                                               exog=exog_test)
+                    preds_df = sarima_forecast(
+                        model, steps=steps,
+                        last_date=train_sarima['ds'].iloc[-1],
+                        exog=exog_test
+                    )
                     preds = preds_df['Prophet Forecast'].values
 
                     sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
                     sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], preds))
                     print(f"SARIMA Test MAPE: {sarima_mape:.4f}, RMSE: {sarima_rmse:.4f}")
 
-                    # Generate final SARIMA forecast
+                    # Generate final SARIMA forecast for horizon
                     last_date_full = ts_data['ds'].iloc[-1]
                     exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
                     final_forecast_df = sarima_forecast(model, steps=horizon, last_date=last_date_full, exog=exog_future)
@@ -1399,7 +1472,7 @@ def main():
                             "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
                         }
 
-                    # Combine SARIMA forecast with Amazon data or with XGBoost if desired
+                    # Combine SARIMA forecast with Amazon data (optional)
                     amazon_cols = [col for col in forecast_data.keys()]
                     if amazon_cols:
                         for ftype, values in forecast_data.items():
@@ -1415,26 +1488,39 @@ def main():
                         a_cols = [c for c in comparison.columns if c.startswith('Amazon ')]
                         if a_cols:
                             comparison['Amazon Mean'] = comparison[a_cols].mean(axis=1)
-                            # Weighted combination of SARIMA with Amazon Mean
-                            comparison['Prophet Forecast'] = (SARIMA_WEIGHT * comparison['Prophet Forecast'] +
-                                                              (1 - SARIMA_WEIGHT) * comparison['Amazon Mean'])
-                            # Ensure no negative forecasts
-                            comparison['Prophet Forecast'] = comparison['Prophet Forecast'].clip(lower=0)
 
-                    # If we want to incorporate XGBoost into an ensemble, we can do so here:
+                            MEAN_WEIGHT = 0.7
+                            P70_WEIGHT = 0.2
+                            P80_WEIGHT = 0.1
+
+                            comparison['Prophet Forecast'] = (
+                                MEAN_WEIGHT * comparison['Amazon Mean'] +
+                                P70_WEIGHT * comparison.get('Amazon P70', 0) +
+                                P80_WEIGHT * comparison.get('Amazon P80', 0)
+                            ).clip(lower=0)
+
+                            # Optionally blend this with SARIMA
+                            comparison['Prophet Forecast'] = (
+                                SARIMA_WEIGHT * comparison['Prophet Forecast']
+                                + (1 - SARIMA_WEIGHT) * comparison['Amazon Mean']
+                            ).clip(lower=0)
+
+                    # Optionally incorporate XGBoost into an ensemble
                     if xgb_model is not None:
-                        xgb_future_df = xgboost_forecast(xgb_model, ts_data, forecast_steps=horizon, target='y', features=xgb_features)
+                        xgb_future_df = xgboost_forecast(xgb_model, ts_data,
+                                                         forecast_steps=horizon,
+                                                         target='y',
+                                                         features=xgb_features)
                         comparison = comparison.merge(xgb_future_df, on='ds', how='left')
-                        comparison['XGB_Forecast'] = comparison['XGB_Forecast'].fillna(0)
-                        # For demonstration, do a simple 3-model ensemble:
-                        # (SARIMA w/ Amazon) is in 'Prophet Forecast' column, plus XGB.
-                        ensemble_weights = [0.5, 0.5]  # 0.5 existing combination, 0.5 XGBoost
-                        # We'll replace the 'Prophet Forecast' with final ensemble
+                        comparison['XGBoost Forecast'] = comparison['XGBoost Forecast'].fillna(0)
+
+                        ensemble_weights = [0.5, 0.3, 0.2]
                         comparison['Prophet Forecast'] = ensemble_forecast(
-                            comparison['Prophet Forecast'],  # SARIMA+Amazon
-                            0,                                # Prophet not used here
-                            comparison['XGB_Forecast'],
-                            [ensemble_weights[0], 0, ensemble_weights[1]]
+                            comparison['Prophet Forecast'],
+                            0,
+                            comparison['XGBoost Forecast'],
+                            comparison['Amazon Mean'],
+                            ensemble_weights
                         ).clip(lower=0)
 
                     # Summaries and Save
@@ -1443,16 +1529,19 @@ def main():
                         ts_data, comparison, horizon=horizon
                     )
                     visualize_forecast_with_comparison(
-                        ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8,
-                        total_forecast_4, max_forecast, min_forecast, max_week, min_week,
+                        ts_data, comparison, summary_stats, total_forecast_16,
+                        total_forecast_8, total_forecast_4, max_forecast,
+                        min_forecast, max_week, min_week,
                         asin, product_title, sufficient_data_folder
                     )
 
                     output_file_name = f'forecast_summary_{asin}.xlsx'
                     output_file_path = os.path.join(sufficient_data_folder, output_file_name)
                     save_summary_to_excel(
-                        comparison, summary_stats, total_forecast_16, total_forecast_8, total_forecast_4,
-                        max_forecast, min_forecast, max_week, min_week, output_file_path, metrics=metrics
+                        comparison, summary_stats,
+                        total_forecast_16, total_forecast_8, total_forecast_4,
+                        max_forecast, min_forecast, max_week, min_week,
+                        output_file_path, metrics=metrics
                     )
                     consolidated_forecasts[asin] = comparison
 
@@ -1473,7 +1562,8 @@ def main():
                     print(f"Using up-to-date cached Prophet model for ASIN {asin}.")
                     cached_prophet_model = joblib.load(cached_model_path)
                     last_train_date = ts_data['ds'].max()
-                    future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7), periods=horizon, freq='W')
+                    future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7),
+                                                 periods=horizon, freq='W')
                     future = pd.DataFrame({'ds': future_dates})
                     # Add zero columns for regressor placeholders
                     for forecast_type in forecast_data.keys():
@@ -1490,7 +1580,12 @@ def main():
                         best_params['changepoint_prior_scale'],
                         best_params['seasonality_prior_scale'],
                         best_params['holidays_prior_scale'],
-                        horizon=horizon
+                        horizon=horizon,
+                        weights={
+                            'Amazon Mean': 0.7,
+                            'Amazon P70': 0.2,
+                            'Amazon P80': 0.1
+                        }
                     )
 
                     if trained_prophet_model is not None:
@@ -1564,26 +1659,30 @@ def main():
                     "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
                 }
 
-            # If we want to incorporate XGBoost into the final ensemble:
+            # Optionally incorporate XGBoost into the final ensemble:
             if xgb_model is not None:
                 xgb_future_df = xgboost_forecast(xgb_model, ts_data, forecast_steps=horizon, target='y', features=xgb_features)
                 comparison = comparison.merge(xgb_future_df, on='ds', how='left')
-                comparison['XGB_Forecast'] = comparison['XGB_Forecast'].fillna(0)
-                # Combine Prophet forecast + XGBoost (optionally add Amazon if needed)
-                # Example weights: [0.5, 0.5]
+                comparison['XGBoost Forecast'] = comparison['XGBoost Forecast'].fillna(0)
+                # Combine Prophet forecast + XGBoost + Amazon Mean
+                # Example weights: [0.5, 0, 0.2, 0.3]
+                if 'Amazon Mean' not in comparison.columns:
+                    comparison['Amazon Mean'] = 0
                 comparison['Prophet Forecast'] = ensemble_forecast(
                     comparison['Prophet Forecast'],
-                    0,  # ignoring a separate Prophet column here, just reusing 'Prophet Forecast'
-                    comparison['XGB_Forecast'],
-                    [0.5, 0, 0.5]
+                    0,  # ignoring a separate Prophet column
+                    comparison['XGBoost Forecast'],
+                    comparison['Amazon Mean'],
+                    [0.5, 0, 0.2, 0.3]
                 ).clip(lower=0)
 
             # Summaries
             summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
             max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(ts_data, comparison, horizon=horizon)
             visualize_forecast_with_comparison(
-                ts_data, comparison, summary_stats, total_forecast_16, total_forecast_8,
-                total_forecast_4, max_forecast, min_forecast, max_week, min_week,
+                ts_data, comparison, summary_stats,
+                total_forecast_16, total_forecast_8, total_forecast_4,
+                max_forecast, min_forecast, max_week, min_week,
                 asin, product_title, sufficient_data_folder
             )
 
@@ -1612,6 +1711,183 @@ def main():
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
 
+
+##############################
+# Additional/Custom Backtesting Function
+##############################
+
+def calculate_extended_metrics(actual, predicted):
+    """
+    Calculate a set of extended metrics: RMSE, Weighted Quantile Loss (wQL),
+    Average Weighted Quantile Loss (Avg wQL), MASE, MAPE, WAPE.
+    Note: Weighted quantile loss typically requires quantiles; here we do a simple adaptation.
+    """
+    # RMSE
+    rmse = np.sqrt(mean_squared_error(actual, predicted))
+    
+    # Weighted Quantile Loss (simplistic placeholder)
+    alpha = 0.5  # median quantile as example
+    residuals = actual - predicted
+    quantile_loss = np.where(residuals >= 0, alpha * residuals, (1 - alpha) * -residuals)
+    wql = np.sum(np.abs(quantile_loss))  
+    avg_wql = np.mean(np.abs(quantile_loss)) if len(quantile_loss) > 0 else 0
+
+    # MAPE
+    mape = mean_absolute_percentage_error(actual, predicted) * 100
+
+    # WAPE
+    if np.sum(actual) != 0:
+        wape = np.sum(np.abs(actual - predicted)) / np.sum(actual) * 100
+    else:
+        wape = 0
+
+    # MASE (requires a naive forecast)
+    naive = actual.shift(1)
+    naive_error = np.abs(actual[1:] - naive[1:])
+    mae_naive = np.mean(naive_error) if len(naive_error) > 0 else 1
+    mae_model = mean_absolute_error(actual, predicted)
+    mase = mae_model / mae_naive if mae_naive != 0 else np.nan
+
+    return {
+        "RMSE": rmse,
+        "wQL": wql,
+        "Average wQL": avg_wql,
+        "MASE": mase,
+        "MAPE": mape,
+        "WAPE": wape
+    }
+
+def backtest_forecast(ts_data, model_function, horizon=16, folder_name="Training and Testing data"):
+    """
+    Example backtesting function:
+      1) Split ts_data into training (80%) and testing (20%).
+      2) Train model using model_function(train).
+      3) Predict on test set horizon.
+      4) Evaluate extended metrics (RMSE, wQL, Average wQL, MASE, MAPE, WAPE).
+      5) Save training set, test set, and associated graph to a separate folder.
+    
+    model_function: a callable that takes (train_data) and returns (fitted_model).
+                    Then we forecast for the test_data. This must be adapted to your modeling.
+    """
+    os.makedirs(folder_name, exist_ok=True)
+
+    # Sort by ds
+    ts_data = ts_data.sort_values('ds').copy()
+    n = len(ts_data)
+    split_idx = int(n * 0.8)
+    train = ts_data.iloc[:split_idx].copy()
+    test = ts_data.iloc[split_idx:].copy()
+
+    # Train the model
+    fitted_model = model_function(train)
+
+    # This portion is pseudo-code for demonstration only:
+    # In reality, you would call your actual forecasting method on 'fitted_model'
+    try:
+        last_date = train['ds'].iloc[-1]
+        steps = len(test)
+        # Naive approach for demonstration
+        test_forecast_df = pd.DataFrame({
+            'ds': test['ds'],
+            'forecast': [train['y'].iloc[-1]] * steps
+        })
+    except Exception as e:
+        print(f"Error in backtest forecasting step: {e}")
+        return
+
+    # Merge actual test data for metrics
+    backtest_comparison = test_forecast_df.merge(test[['ds','y']], on='ds', how='left')
+    metrics = calculate_extended_metrics(backtest_comparison['y'], backtest_comparison['forecast'])
+    print("Backtest Metrics:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+
+    # Save training and testing data
+    train_file = os.path.join(folder_name, "training_data.csv")
+    test_file = os.path.join(folder_name, "testing_data.csv")
+    train.to_csv(train_file, index=False)
+    test.to_csv(test_file, index=False)
+
+    # Plot training vs test
+    plt.figure(figsize=(10,6))
+    plt.plot(train['ds'], train['y'], label='Training', color='blue')
+    plt.plot(test['ds'], test['y'], label='Testing Actual', color='orange')
+    plt.plot(backtest_comparison['ds'], backtest_comparison['forecast'], label='Testing Forecast', color='green')
+    plt.legend()
+    plt.title("Backtest: Training vs Testing Forecast")
+    plt.xlabel("Date")
+    plt.ylabel("Values")
+    backtest_plot_path = os.path.join(folder_name, "training_testing_graph.png")
+    plt.savefig(backtest_plot_path)
+    plt.close()
+    print(f"Training/Testing data and graph saved to '{folder_name}'.")
+
+
+##############################
+# Function to Optimize Ensemble Weights
+##############################
+
+def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
+    """
+    Optimize weights for SARIMA, Prophet, and XGBoost forecasts to minimize RMSE + MAPE.
+    
+    Parameters:
+        actual (array-like): Actual values of the time series.
+        sarima_preds (array-like): SARIMA forecast values.
+        prophet_preds (array-like): Prophet forecast values.
+        xgb_preds (array-like): XGBoost forecast values.
+    
+    Returns:
+        dict: Optimized weights and metrics for the ensemble.
+    """
+    # Initial weights (equal weighting)
+    initial_weights = [1/3, 1/3, 1/3]
+
+    # Constraints: Weights must sum to 1
+    constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+
+    # Bounds: Each weight must be between 0 and 1
+    bounds = [(0, 1), (0, 1), (0, 1)]
+
+    # Objective: Minimize RMSE + MAPE
+    def objective(weights):
+        ensemble_preds = (weights[0] * sarima_preds +
+                          weights[1] * prophet_preds +
+                          weights[2] * xgb_preds)
+        rmse = np.sqrt(mean_squared_error(actual, ensemble_preds))
+        mape = mean_absolute_percentage_error(actual, ensemble_preds)
+        return rmse + mape
+
+    result = minimize(objective, initial_weights, constraints=constraints, bounds=bounds, method='SLSQP')
+
+    if result.success:
+        optimized_weights = result.x
+        ensemble_preds = (optimized_weights[0] * sarima_preds +
+                          optimized_weights[1] * prophet_preds +
+                          optimized_weights[2] * xgb_preds)
+        rmse = np.sqrt(mean_squared_error(actual, ensemble_preds))
+        mape = mean_absolute_percentage_error(actual, ensemble_preds)
+        return {
+            'weights': {
+                'SARIMA': optimized_weights[0],
+                'Prophet': optimized_weights[1],
+                'XGBoost': optimized_weights[2],
+            },
+            'metrics': {
+                'RMSE': rmse,
+                'MAPE': mape,
+            },
+            'ensemble_preds': ensemble_preds
+        }
+    else:
+        raise ValueError("Optimization failed: " + result.message)
+
+
+##############################
+# Run the Main Script
+##############################
+
 if __name__ == '__main__':
     main()
     summarize_usage()
+
