@@ -1327,6 +1327,12 @@ def analyze_amazon_buying_habits(comparison, holidays):
                 print(f"    Avg Diff (Amazon-Prophet): {np.mean(seg_diff):.2f}")
 
 ##############################
+# FallBack Mechanism
+##############################
+
+
+
+##############################
 # Main
 ##############################
 
