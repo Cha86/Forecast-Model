@@ -885,8 +885,8 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
             amazon_col_name: values
         })
         comparison = comparison.merge(forecast_df, on='ds', how='left')
-        print("Merged comparison DataFrame columns:")
-        print(comparison.columns)
+        #print("Merged comparison DataFrame columns:")
+        #print(comparison.columns)
     comparison.fillna(0, inplace=True)
     for col in comparison.columns:
         if col.startswith('Amazon ') and col.endswith('Forecast'):
@@ -1687,16 +1687,16 @@ def main():
     asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
     consolidated_forecasts = {}
-    param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1],
-        'seasonality_prior_scale': [0.5, 0.1],
-        'holidays_prior_scale': [5, 10, 15, 20]
-    }
     #param_grid = {
-    #    'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-    #    'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5, 10],
+    #    'changepoint_prior_scale': [0.05, 0.1],
+    #    'seasonality_prior_scale': [0.5, 0.1],
     #    'holidays_prior_scale': [5, 10, 15, 20]
     #}
+    param_grid = {
+        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5, 10],
+        'holidays_prior_scale': [5, 10, 15, 20]
+    }
 
     holidays = get_shifted_holidays()
 
@@ -1966,6 +1966,9 @@ def main():
 
             # Update the comparison DataFrame after adjustment
             comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
+            print("\n--- Prophet Forecast Before Adjustment ---")
+            print(comparison[['ds', 'Prophet Forecast']].head(10))  # Adjust the number as needed
+            print("-----------------------------------------\n")
 
             # Adjust forecasts if they are out of range
             comparison = adjust_forecast_if_out_of_range(comparison)
