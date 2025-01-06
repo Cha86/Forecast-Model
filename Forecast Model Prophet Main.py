@@ -67,7 +67,7 @@ def summarize_usage():
         print(f"  Changepoint Prior Scale: {params['changepoint_prior_scale']}")
         print(f"  Seasonality Prior Scale: {params['seasonality_prior_scale']}")
         print(f"  Holidays Prior Scale: {params['holidays_prior_scale']}")
-
+    
     print("\n=== Most Common Parameters Across All Products ===")
     print("Most Common Changepoint Settings:")
     for value, count in changepoint_counter.most_common():
@@ -81,7 +81,6 @@ def summarize_usage():
     for value, count in holiday_counter.most_common():
         print(f"  {value}: {count} times")
     print("================================")
-
 
 ##############################
 # Added Functions for Caching
@@ -441,7 +440,10 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
     forecast_data = {}
     for file_name in os.listdir(folder_path):
         if file_name.endswith('.xlsx'):
+            # Extract forecast type without ' Forecast' suffix
             forecast_type = os.path.splitext(file_name)[0].replace('_', ' ').title()
+            if forecast_type.endswith(' Forecast'):
+                forecast_type = forecast_type.replace(' Forecast', '')  # Remove if present
             file_path = os.path.join(folder_path, file_name)
             df = pd.read_excel(file_path)
 
@@ -527,7 +529,7 @@ def train_xgboost(ts_data, target='y', features=None):
     if features is None:
         # Default to just the lag feature if not specified
         features = [col for col in ts_data.columns if col.startswith('lag_')]
-    
+
     # Drop rows where target or features are NaN
     valid_data = ts_data.dropna(subset=[target] + features)
     if valid_data.empty:
@@ -558,6 +560,7 @@ def train_xgboost(ts_data, target='y', features=None):
     # Calculate SHAP values to evaluate feature importance
     explainer = shap.Explainer(model)
     shap_values = explainer(X)
+
     # Summarize feature importance (plot suppressed in script)
     shap.summary_plot(shap_values, X, show=False)
 
@@ -743,7 +746,7 @@ def forecast_with_custom_params(ts_data, forecast_data,
             ]
         )
         extended_values = extended_values[:len(combined_df)]
-        combined_df[f'Amazon_{forecast_type}'] = extended_values
+        combined_df[f'Amazon_{forecast_type} Forecast'] = extended_values
 
     regressor_cols = [col for col in combined_df.columns if col.startswith('Amazon_')]
     combined_df[regressor_cols] = combined_df[regressor_cols].fillna(0)
@@ -776,8 +779,7 @@ def forecast_with_custom_params(ts_data, forecast_data,
     model.fit(train_df[['ds', 'y'] + regressor_cols + ['prime_day']])
 
     # Evaluate on test split
-    test_future = test_df.drop(columns='y').copy()
-    test_forecast = model.predict(test_future)
+    test_forecast = model.predict(test_df.drop(columns='y').copy())
     test_actual = combined_df.iloc[split:].dropna(subset=['y'])
     if not test_actual.empty:
         test_eval = test_forecast[test_forecast['ds'].isin(test_actual['ds'])]
@@ -788,16 +790,15 @@ def forecast_with_custom_params(ts_data, forecast_data,
 
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
     forecast = model.predict(future_df)
-
+    
     # Apply custom weighting mechanism to adjust forecasts
     for amazon_col, weight in weights.items():
-        if f'Amazon_{amazon_col}' in future_df.columns:
-            forecast['yhat'] += weight * future_df[f'Amazon_{amazon_col}']
+        if f'Amazon_{amazon_col} Forecast' in future_df.columns:
+            forecast['yhat'] += weight * future_df[f'Amazon_{amazon_col} Forecast']
 
     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int).clip(lower=0)
 
     return forecast[['ds', 'Prophet Forecast', 'yhat', 'yhat_upper']], model
-
 
 ##############################
 # Prophet Parameter Optimization
@@ -874,18 +875,24 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
     for forecast_type, values in forecast_data.items():
         values = values[:horizon]
         values = np.array(values, dtype=int)
+        # Check if 'Forecast' is already in forecast_type
+        if 'Forecast' in forecast_type:
+            amazon_col_name = f'Amazon {forecast_type}'
+        else:
+            amazon_col_name = f'Amazon {forecast_type} Forecast'
         forecast_df = pd.DataFrame({
             'ds': prophet_forecast['ds'],
-            f'Amazon {forecast_type}': values
+            amazon_col_name: values
         })
         comparison = comparison.merge(forecast_df, on='ds', how='left')
         print("Merged comparison DataFrame columns:")
         print(comparison.columns)
     comparison.fillna(0, inplace=True)
     for col in comparison.columns:
-        if col.startswith('Amazon '):
-            diff_col = f"Diff_{col.split('Amazon ')[1]}"
-            pct_col = f"Pct_{col.split('Amazon ')[1]}"
+        if col.startswith('Amazon ') and col.endswith('Forecast'):
+            base_name = col.replace('Amazon ', '').replace(' Forecast', '')
+            diff_col = f"Diff_{base_name}"
+            pct_col = f"Pct_{base_name}"
             comparison[diff_col] = (comparison['Prophet Forecast'] - comparison[col]).astype(int)
             comparison[pct_col] = np.where(
                 comparison[col] != 0,
@@ -894,9 +901,10 @@ def format_output_with_forecasts(prophet_forecast, forecast_data, horizon=16):
             )
     comparison['Prophet Forecast'] = comparison['Prophet Forecast'].astype(int)
     for col in comparison.columns:
-        if col.startswith("Amazon ") or col.startswith("Diff_"):
+        if col.startswith("Amazon ") or col.startswith("Diff_") or col.startswith("Pct_"):
             comparison[col] = comparison[col].astype(int, errors='ignore')
     return comparison
+
 
 def adjust_forecast_weights(forecast, yhat_weight, yhat_upper_weight):
     """Adjust final Prophet forecast by combining yhat and yhat_upper with specified weights."""
@@ -1037,7 +1045,7 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats,
     ax.plot(comparison['ds'], comparison['Prophet Forecast'], label='Prophet Forecast', marker='o', linestyle='--', color='blue')
 
     for column in comparison.columns:
-        if column.startswith('Amazon '):
+        if column.startswith('Amazon ') and column.endswith('Forecast'):
             ax.plot(comparison['ds'], comparison[column], label=f'{column}', linestyle=':')
 
     ax.set_title(f'Sales Forecast Comparison for {product_title}')
@@ -1161,6 +1169,7 @@ def save_summary_to_excel(comparison,
     wb.save(output_file_path)
     print(f"Comparison and summary saved to '{output_file_path}'")
 
+
 def save_4_8_16_forecast_summary(consolidated_data, output_folder):
     """
     Save the cumulative 4th, 8th, and 16th-week forecasts for each ASIN into a standalone Excel file.
@@ -1256,7 +1265,6 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
 
         ws_summary.append([asin, product_title, four_wk_val, eight_wk_val, sixteen_wk_val])
 
-
     wb.save(output_path)
     print(f"All forecasts saved to {output_path}")
 
@@ -1293,7 +1301,10 @@ def analyze_amazon_buying_habits(comparison, holidays):
         return
 
     # Check for Amazon forecast columns
-    amazon_cols = [col for col in comparison.columns if col.startswith('Amazon ')]
+    amazon_cols = [
+    col for col in comparison.columns
+    if col.startswith('Amazon ') and col.endswith('Forecast') and not col.endswith('Forecast Forecast')
+]
     if not amazon_cols:
         print("No Amazon forecasts found for analysis.")
         return
@@ -1305,12 +1316,13 @@ def analyze_amazon_buying_habits(comparison, holidays):
     comparison['is_holiday_week'] = ds_dates.isin(holiday_dates) if 'ds' in comparison.columns else False
 
     # Improve error analysis for Amazon forecast types
-    amazon_types = ['Amazon Mean', 'Amazon P70', 'Amazon P80', 'Amazon P90']
+    amazon_types = ['Mean', 'P70', 'P80', 'P90']
     errors = {}
     for forecast_type in amazon_types:
-        if forecast_type in comparison.columns:
-            current_rmse = np.sqrt(mean_squared_error(comparison['y'], comparison[forecast_type]))
-            current_mape = mean_absolute_percentage_error(comparison['y'], comparison[forecast_type])
+        forecast_col = f"Amazon {forecast_type} Forecast"
+        if forecast_col in comparison.columns:
+            current_rmse = np.sqrt(mean_squared_error(comparison['y'], comparison[forecast_col]))
+            current_mape = mean_absolute_percentage_error(comparison['y'], comparison[forecast_col])
             errors[forecast_type] = {
                 'RMSE': current_rmse,
                 'MAPE': current_mape
@@ -1322,14 +1334,17 @@ def analyze_amazon_buying_habits(comparison, holidays):
         print(f"\nBest Amazon forecast type: {best_forecast_type} with RMSE={errors[best_forecast_type]['RMSE']:.4f}")
 
     # Analyze forecasts
-    for col in amazon_cols:
-        amazon_forecast = comparison[col].values
+    for forecast_type in amazon_types:
+        forecast_col = f"Amazon {forecast_type} Forecast"
+        if forecast_col not in comparison.columns:
+            continue
+        amazon_forecast = comparison[forecast_col].values
         safe_prophet = np.where(prophet_forecast == 0, 1e-9, prophet_forecast)
         ratio = amazon_forecast / safe_prophet
         diff = amazon_forecast - prophet_forecast
         avg_ratio = np.mean(ratio)
         avg_diff = np.mean(diff)
-        print(f"\nFor {col}:")
+        print(f"\nFor {forecast_type}:")
         print(f"  Average Amazon/Prophet Ratio: {avg_ratio:.2f}")
         print(f"  Average Difference (Amazon - Prophet): {avg_diff:.2f}")
 
@@ -1343,8 +1358,8 @@ def analyze_amazon_buying_habits(comparison, holidays):
         # Analyze holiday weeks
         holiday_mask = comparison['is_holiday_week']
         if holiday_mask.any():
-            holiday_ratio = amazon_forecast[holiday_mask] / safe_prophet[holiday_mask]
-            holiday_diff = amazon_forecast[holiday_mask] - prophet_forecast[holiday_mask]
+            holiday_ratio = ratio[holiday_mask]
+            holiday_diff = diff[holiday_mask]
             if len(holiday_diff) > 0:
                 print("  During holiday weeks:")
                 print(f"    Avg Ratio (Amazon/Prophet): {np.mean(holiday_ratio):.2f}")
@@ -1365,8 +1380,6 @@ def analyze_amazon_buying_habits(comparison, holidays):
                 print(f"  {segment_name}:")
                 print(f"    Avg Ratio (Amazon/Prophet): {np.mean(seg_ratio):.2f}")
                 print(f"    Avg Diff (Amazon-Prophet): {np.mean(seg_diff):.2f}")
-
-
 
 ##############################
 # Additional/Custom Backtesting Function
@@ -1479,7 +1492,6 @@ def backtest_forecast(ts_data, model_function, horizon=16, folder_name="Training
     plt.close()
     print(f"Training/Testing data and graph saved to '{folder_name}'.")
 
-
 ##############################
 # Function to Optimize Ensemble Weights
 ##############################
@@ -1538,7 +1550,6 @@ def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
         }
     else:
         raise ValueError("Optimization failed: " + result.message)
-    
 
 ##############################
 # Adjust Forecast If Out of Range
@@ -1555,32 +1566,20 @@ def adjust_forecast_if_out_of_range(comparison, adjustment_threshold=0.3):
     Returns:
         DataFrame: Updated comparison with adjusted forecasts if needed.
     """
-    # Rename columns for consistency
-    comparison.rename(columns={
-        'Amazon Mean Forecast': 'Amazon Mean',
-        'Amazon P70 Forecast': 'Amazon P70',
-        'Amazon P80 Forecast': 'Amazon P80',
-        'Amazon P90 Forecast': 'Amazon P90'
-    }, inplace=True)
-
-    # Debug: Check columns before adjustment
-    print("Columns before adjustment:")
-    print(comparison.columns)
-
-    # Check for missing columns and initialize if needed
-    for col in ['Amazon Mean', 'Amazon P70', 'Amazon P80', 'Amazon P90']:
+    # Ensure Amazon forecast columns exist
+    for col in ['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']:
         if col not in comparison.columns:
             print(f"Warning: Missing column {col}. Initializing it with zeros.")
             comparison[col] = 0
 
     # Debug: Verify Amazon forecast data
     print("Amazon Forecast Statistics for Debugging:")
-    print(comparison[['Amazon Mean', 'Amazon P70', 'Amazon P80', 'Amazon P90']].head())
+    print(comparison[['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']].head())
 
     # Calculate out-of-range rows
     comparison['is_out_of_range'] = (
-        (comparison['Prophet Forecast'] < comparison['Amazon Mean'] * (1 - adjustment_threshold)) |
-        (comparison['Prophet Forecast'] > comparison['Amazon Mean'] * (1 + adjustment_threshold))
+        (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - adjustment_threshold)) |
+        (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + adjustment_threshold))
     )
 
     adjustment_mask = comparison['is_out_of_range']
@@ -1589,30 +1588,30 @@ def adjust_forecast_if_out_of_range(comparison, adjustment_threshold=0.3):
     if adjustment_mask.any():
         print(f"Adjusting {adjustment_mask.sum()} out-of-range forecasts using Amazon data.")
         comparison.loc[adjustment_mask, 'Prophet Forecast'] = (
-            0.7 * comparison.loc[adjustment_mask, 'Amazon Mean'] +
-            0.2 * comparison.loc[adjustment_mask, 'Amazon P70'] +
-            0.1 * comparison.loc[adjustment_mask, 'Amazon P80']
+            0.7 * comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] +
+            0.2 * comparison.loc[adjustment_mask, 'Amazon P70 Forecast'] +
+            0.1 * comparison.loc[adjustment_mask, 'Amazon P80 Forecast']
         ).clip(lower=0)
 
         # Identify rows still out of range after adjustment
         comparison['is_still_out_of_range'] = (
-            (comparison['Prophet Forecast'] < comparison['Amazon Mean'] * (1 - adjustment_threshold)) |
-            (comparison['Prophet Forecast'] > comparison['Amazon Mean'] * (1 + adjustment_threshold))
+            (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - adjustment_threshold)) |
+            (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + adjustment_threshold))
         )
 
         # Debug: Rows still out of range
         if comparison['is_still_out_of_range'].any():
             print("Rows still out of range after primary adjustment:")
             print(comparison.loc[comparison['is_still_out_of_range'], [
-                'ds', 'Prophet Forecast', 'Amazon Mean', 'Amazon P70', 'Amazon P80', 'Amazon P90'
+                'ds', 'Prophet Forecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'
             ]])
 
     # Debug: Adjusted rows
     print("Adjusted forecasts for out-of-range rows:")
-    print(comparison.loc[adjustment_mask, ['ds', 'Prophet Forecast', 'Amazon Mean', 'Amazon P70', 'Amazon P80']])
+    print(comparison.loc[adjustment_mask, ['ds', 'Prophet Forecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast']])
 
     # Final debug for the adjusted data
-    available_columns = [col for col in ['Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean', 'Amazon P70', 'Amazon P80', 'Amazon P90'] if col in comparison.columns]
+    available_columns = [col for col in ['Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'] if col in comparison.columns]
     if available_columns:
         print("Final adjusted forecast data:")
         print(comparison[available_columns].head())
@@ -1620,8 +1619,6 @@ def adjust_forecast_if_out_of_range(comparison, adjustment_threshold=0.3):
         print("Warning: None of the specified columns ('Week', 'ASIN') are in the DataFrame.")
 
     return comparison
-
-
 
 def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallback_triggers.csv"):
     """
@@ -1662,8 +1659,6 @@ def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallba
     else:
         print(f"No outliers detected for ASIN: {asin}")
 
-
-
 ##############################
 # Main
 ##############################
@@ -1693,10 +1688,15 @@ def main():
 
     consolidated_forecasts = {}
     param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-        'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5, 10],
+        'changepoint_prior_scale': [0.05, 0.1],
+        'seasonality_prior_scale': [0.5, 0.1],
         'holidays_prior_scale': [5, 10, 15, 20]
     }
+    #param_grid = {
+    #    'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+    #    'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5, 10],
+    #    'holidays_prior_scale': [5, 10, 15, 20]
+    #}
 
     holidays = get_shifted_holidays()
 
@@ -1821,27 +1821,27 @@ def main():
                                                         'constant', constant_values=horizon_values[-1])
                             elif len(horizon_values) == 0:
                                 horizon_values = np.zeros(horizon)
-                            comparison[f'Amazon {ftype}'] = horizon_values
+                            comparison[f'Amazon {ftype} Forecast'] = horizon_values
 
                         # Compute mean Amazon forecast
                         a_cols = [c for c in comparison.columns if c.startswith('Amazon ')]
                         if a_cols:
-                            comparison['Amazon Mean'] = comparison[a_cols].mean(axis=1)
+                            comparison['Amazon Mean Forecast'] = comparison[a_cols].mean(axis=1)
 
                             MEAN_WEIGHT = 0.7
                             P70_WEIGHT = 0.2
                             P80_WEIGHT = 0.1
 
                             comparison['Prophet Forecast'] = (
-                                MEAN_WEIGHT * comparison['Amazon Mean'] +
-                                P70_WEIGHT * comparison.get('Amazon P70', 0) +
-                                P80_WEIGHT * comparison.get('Amazon P80', 0)
+                                MEAN_WEIGHT * comparison['Amazon Mean Forecast'] +
+                                P70_WEIGHT * comparison.get('Amazon P70 Forecast', 0) +
+                                P80_WEIGHT * comparison.get('Amazon P80 Forecast', 0)
                             ).clip(lower=0)
 
                             # Optionally blend this with SARIMA
                             comparison['Prophet Forecast'] = (
                                 SARIMA_WEIGHT * comparison['Prophet Forecast']
-                                + (1 - SARIMA_WEIGHT) * comparison['Amazon Mean']
+                                + (1 - SARIMA_WEIGHT) * comparison['Amazon Mean Forecast']
                             ).clip(lower=0)
 
                     # Optionally incorporate XGBoost into an ensemble
@@ -1857,7 +1857,7 @@ def main():
 
                         comparison['Prophet Forecast'] = (
                             0.7 * comparison['XGBoost Forecast'] +
-                            0.3 * comparison['Amazon Mean']
+                            0.3 * comparison['Amazon Mean Forecast']
                         ).clip(lower=0)
 
                     # Summaries and Save
@@ -1909,7 +1909,7 @@ def main():
                     future = pd.DataFrame({'ds': future_dates})
                     # Add zero columns for regressor placeholders
                     for forecast_type in forecast_data.keys():
-                        future[f"Amazon_{forecast_type}"] = 0
+                        future[f"Amazon_{forecast_type} Forecast"] = 0
                     future['prime_day'] = 0
                     forecast = cached_prophet_model.predict(future)
                     forecast['Prophet Forecast'] = forecast['yhat'].round().astype(int)
@@ -1956,7 +1956,7 @@ def main():
                 with open(no_data_output, 'w') as f:
                     f.write("Final forecasting failed.\n")
                 continue
-        
+
             comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
             best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05)
             print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
@@ -2014,13 +2014,13 @@ def main():
                 comparison['XGBoost Forecast'] = comparison['XGBoost Forecast'].fillna(0)
                 # Combine Prophet forecast + XGBoost + Amazon Mean
                 # Example weights: [0.5, 0, 0.2, 0.3]
-                if 'Amazon Mean' not in comparison.columns:
-                    comparison['Amazon Mean'] = 0
+                if 'Amazon Mean Forecast' not in comparison.columns:
+                    comparison['Amazon Mean Forecast'] = 0
                 comparison['Prophet Forecast'] = ensemble_forecast(
                     comparison['Prophet Forecast'],
                     0,  # ignoring a separate Prophet column
                     comparison['XGBoost Forecast'],
-                    comparison['Amazon Mean'],
+                    comparison['Amazon Mean Forecast'],
                     [0.5, 0, 0.2, 0.3]
                 ).clip(lower=0)
 
@@ -2061,7 +2061,6 @@ def main():
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
 
-
 ##############################
 # Run the Main Script
 ##############################
@@ -2069,4 +2068,3 @@ def main():
 if __name__ == '__main__':
     main()
     summarize_usage()
-
