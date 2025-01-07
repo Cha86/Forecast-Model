@@ -1342,7 +1342,10 @@ def analyze_amazon_buying_habits(comparison, holidays):
     for forecast_type in amazon_types:
         forecast_col = f"Amazon {forecast_type} Forecast"
         if forecast_col in comparison.columns:
-            current_rmse = mean_squared_error(comparison['y'], comparison[forecast_col], squared=False)
+            valid_data = comparison[['y', forecast_col]].dropna()
+            if len(valid_data) == 0:
+                continue
+            current_rmse = np.sqrt(mean_squared_error(comparison['y'], comparison[forecast_col]))
             current_mape = mean_absolute_percentage_error(comparison['y'], comparison[forecast_col]) * 100
             errors[forecast_type] = {
                 'RMSE': current_rmse,
@@ -1822,14 +1825,16 @@ def main():
                     comparison = final_forecast_df.copy()
                     comparison['ASIN'] = asin
                     comparison['Product Title'] = product_title
-                    # Merge 'is_holiday_week' from ts_data if available
-                    if 'ds' in comparison.columns and 'is_holiday_week' in ts_data.columns:
-                        comparison = comparison.merge(ts_data[['ds', 'is_holiday_week']], on='ds', how='left')
-                        comparison['is_holiday_week'] = comparison['is_holiday_week'].fillna(0).astype(int)
+
+                    # Merge historical 'y' values into comparison DataFrame
+                    comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
+
+                    # Safely drop rows where 'y' is missing if the column exists
+                    if 'y' in comparison.columns:
+                        comparison_historical = comparison.dropna(subset=['y'])
                     else:
-                        comparison['is_holiday_week'] = 0  # Default if not available
-                    
-                    comparison_historical = comparison.dropna(subset=['y'])
+                        print("No 'y' column found in comparison. Skipping historical metrics calculation.")
+                        comparison_historical = pd.DataFrame()
 
                     if comparison_historical.empty:
                         print("No overlapping historical data to calculate metrics. Skipping metrics.")
@@ -2023,12 +2028,21 @@ def main():
             # Log fallback triggers for out-of-range forecasts
             log_fallback_triggers(comparison, asin, product_title)
 
+            if 'ds' in comparison.columns and 'y' not in comparison.columns:
+                comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
+
             # Analyze Amazon vs. Prophet
             analyze_amazon_buying_habits(comparison, holidays)
 
-            # Merge historical data to compute error metrics
-            comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
-            comparison_historical = comparison.dropna(subset=['y'])
+            # Merge historical 'y' data if not present
+            if 'y' not in comparison.columns:
+                comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
+
+            # Create a DataFrame with historical data for error metrics if 'y' exists
+            if 'y' in comparison.columns:
+                comparison_historical = comparison.dropna(subset=['y'])
+            else:
+                comparison_historical = pd.DataFrame()
 
             if comparison_historical.empty:
                 print("No overlapping historical data to calculate metrics. Skipping metrics.")
