@@ -1748,16 +1748,16 @@ def main():
     asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
     consolidated_forecasts = {}
-    param_grid = {
-        'changepoint_prior_scale': [0.1, 0.3, 0.5],
-        'seasonality_prior_scale': [0.1, 1, 3, 5],
-        'holidays_prior_scale': [5, 10, 15]
-    }
     #param_grid = {
-    #    'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-    #    'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5],
+    #    'changepoint_prior_scale': [0.1, 0.3, 0.5],
+    #    'seasonality_prior_scale': [0.1, 1, 3, 5],
     #    'holidays_prior_scale': [5, 10, 15]
     #}
+    param_grid = {
+        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5],
+        'holidays_prior_scale': [5, 10, 15]
+    }
 
     holidays = get_shifted_holidays()
 
