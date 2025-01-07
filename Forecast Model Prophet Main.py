@@ -38,6 +38,13 @@ holiday_counter = Counter()
 out_of_range_counter = Counter()
 out_of_range_stats = {}
 
+# Global dictionaries to store feedback for each model type
+prophet_feedback = {}
+sarima_feedback = {}
+xgboost_feedback = {}
+forecast_errors = {}  
+
+
 ##############################
 # Configuration
 ##############################
@@ -818,11 +825,11 @@ POOR_PARAM_FOUND = False
 EARLY_STOP_THRESHOLD = 10_000
 
 def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
-    global changepoint_counter, seasonality_counter, holiday_counter
-    global PARAM_COUNTER, POOR_PARAM_FOUND
+    global PARAM_COUNTER, POOR_PARAM_FOUND, prophet_feedback
     best_rmse = float('inf')
     best_params = None
     best_rmse_values = None
+    asin = ts_data['asin'].iloc[0] if 'asin' in ts_data.columns else 'unknown'
     for changepoint_prior_scale in param_grid['changepoint_prior_scale']:
         for seasonality_prior_scale in param_grid['seasonality_prior_scale']:
             for holidays_prior_scale in param_grid['holidays_prior_scale']:
@@ -860,7 +867,14 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
         print("Optimization failed. Using default parameters.")
         best_params = {'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 1, 'holidays_prior_scale': 10}
         best_rmse_values = {}
+    # Record feedback for Prophet
+    prophet_feedback[asin] = {
+        'best_params': best_params,
+        'rmse_values': best_rmse_values,
+        'total_tests': PARAM_COUNTER
+    }
     return best_params, best_rmse_values
+
 
 def calculate_rmse(forecast, forecast_data, horizon):
     """Calculate RMSE comparing Prophet forecast with various Amazon forecast streams."""
@@ -1288,6 +1302,30 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
 
     wb.save(output_path)
     print(f"All forecasts saved to {output_path}")
+
+def save_feedback_to_excel(feedback_dict, filename):
+    """
+    Save feedback information from models into an Excel file.
+    feedback_dict: Dictionary containing feedback keyed by ASIN.
+    filename: Path to the output Excel file.
+    """
+    records = []
+    for asin, info in feedback_dict.items():
+        record = {'ASIN': asin}
+        best_params = info.get('best_params', {})
+        for param, value in best_params.items():
+            record[param] = value
+        if 'rmse_values' in info and info['rmse_values']:
+            for k, v in info['rmse_values'].items():
+                record[f'RMSE_{k}'] = v
+        record['Total Tests'] = info.get('total_tests', None)
+        records.append(record)
+    
+    df_feedback = pd.DataFrame(records)
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df_feedback.to_excel(writer, index=False, sheet_name='Model Feedback')
+    print(f"Feedback saved to {filename}")
+
 
 ##############################
 # Additional Prophet Cross-Validation
@@ -1721,6 +1759,46 @@ def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallba
         print(f"No outliers detected for ASIN: {asin}")
 
 ##############################
+# Feedback Loop Functions
+##############################
+
+
+def record_forecast_errors(asin, forecast_df, actual_df):
+    """
+    Compare forecast with actual data for the given ASIN and record errors.
+    """
+    merged = forecast_df.merge(actual_df[['ds', 'y']], on='ds', how='left')
+    merged = merged.dropna(subset=['y'])
+    if merged.empty:
+        print(f"No actual data available yet to compare for ASIN {asin}.")
+        return
+    mae = mean_absolute_error(merged['y'], merged['Prophet Forecast'])
+    mape = mean_absolute_percentage_error(merged['y'], merged['Prophet Forecast']) * 100
+    forecast_errors.setdefault(asin, []).append({'mae': mae, 'mape': mape})
+    print(f"Recorded forecast errors for ASIN {asin}: MAE={mae}, MAPE={mape}%")
+
+
+def update_prophet_model_with_feedback(asin, ts_data, forecast_data, param_grid, horizon, current_model=None):
+    """
+    Update the Prophet model for a given ASIN using new actual data.
+    """
+    print(f"Updating Prophet model for ASIN {asin} with new data...")
+    # Re-optimize parameters with updated data
+    best_params, _ = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
+    # Retrain Prophet model with new parameters
+    forecast, updated_model = forecast_with_custom_params(
+        ts_data, forecast_data,
+        best_params['changepoint_prior_scale'],
+        best_params['seasonality_prior_scale'],
+        best_params['holidays_prior_scale'],
+        horizon=horizon
+    )
+    # Save the updated model
+    save_model(updated_model, "Prophet", asin, ts_data)
+    print(f"Prophet model for ASIN {asin} updated.")
+    return forecast, updated_model
+
+##############################
 # Main
 ##############################
 
@@ -1848,6 +1926,8 @@ def main():
                     # Merge historical 'y' values into comparison DataFrame
                     comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
 
+                    comparison = adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3)
+
                     # Safely drop rows where 'y' is missing if the column exists
                     if 'y' in comparison.columns:
                         comparison_historical = comparison.dropna(subset=['y'])
@@ -1922,6 +2002,9 @@ def main():
                         print("Merged comparison DataFrame columns:")
                         print(comparison.columns)
                         comparison['XGBoost Forecast'] = comparison['XGBoost Forecast'].fillna(0)
+
+                        # Apply out-of-range adjustment for XGBoost forecasts
+                        comparison = adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3)
 
                         comparison['Prophet Forecast'] = (
                             0.7 * comparison['XGBoost Forecast'] +
@@ -2140,6 +2223,8 @@ def main():
 
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
+    save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
+
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
     if POOR_PARAM_FOUND:
