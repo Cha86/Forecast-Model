@@ -1117,23 +1117,30 @@ def save_summary_to_excel(comparison,
     ]
 
     comparison_for_excel = comparison.copy()
+
     if 'ds' in comparison_for_excel.columns:
         for i in range(len(comparison_for_excel)):
             comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
-        comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')  # *** CHANGED ***
-    
+        comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
+
+    # Ensure all desired columns are present
     for col in desired_columns:
         if col not in comparison_for_excel.columns:
             comparison_for_excel[col] = np.nan
 
+    # Reorder columns to match desired_columns
     comparison_for_excel = comparison_for_excel[desired_columns]
 
+    # Create a new Workbook
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Forecast Comparison"
+
+    # Write DataFrame to Excel
     for r in dataframe_to_rows(comparison_for_excel, index=False, header=True):
         ws1.append(r)
 
+    # Create Summary Sheet
     ws2 = wb.create_sheet(title="Summary")
     summary_data = {
         "Metric": [
@@ -1178,8 +1185,10 @@ def save_summary_to_excel(comparison,
     for r in dataframe_to_rows(summary_df, index=False, header=True):
         ws2.append(r)
 
+    # Save Workbook
     wb.save(output_file_path)
     print(f"Comparison and summary saved to '{output_file_path}'")
+
 
 def save_4_8_16_forecast_summary(consolidated_data, output_folder):
     """
@@ -1717,16 +1726,16 @@ def main():
     asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
     consolidated_forecasts = {}
-    #param_grid = {
-    #    'changepoint_prior_scale': [0.05, 0.1],
-    #    'seasonality_prior_scale': [0.5, 0.1],
-    #    'holidays_prior_scale': [5, 10, 15, 20]
-    #}
     param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-        'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5],
+        'changepoint_prior_scale': [0.1, 0.3, 0.5],
+        'seasonality_prior_scale': [0.1, 1, 3, 5],
         'holidays_prior_scale': [5, 10, 15]
     }
+    #param_grid = {
+    #    'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+    #    'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5],
+    #    'holidays_prior_scale': [5, 10, 15]
+    #}
 
     holidays = get_shifted_holidays()
 
@@ -1813,7 +1822,12 @@ def main():
                     comparison = final_forecast_df.copy()
                     comparison['ASIN'] = asin
                     comparison['Product Title'] = product_title
-                    comparison = comparison.merge(ts_data[['ds','y']], on='ds', how='left')
+                    # Merge 'is_holiday_week' from ts_data if available
+                    if 'ds' in comparison.columns and 'is_holiday_week' in ts_data.columns:
+                        comparison = comparison.merge(ts_data[['ds', 'is_holiday_week']], on='ds', how='left')
+                        comparison['is_holiday_week'] = comparison['is_holiday_week'].fillna(0).astype(int)
+                    else:
+                        comparison['is_holiday_week'] = 0  # Default if not available
                     
                     comparison_historical = comparison.dropna(subset=['y'])
 
@@ -1904,6 +1918,9 @@ def main():
 
                     comparison = adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3)
                     log_fallback_triggers(comparison, asin, product_title)
+
+                    comparison['ASIN'] = asin
+                    comparison['Product Title'] = product_title
 
                     output_file_name = f'forecast_summary_{asin}.xlsx'
                     output_file_path = os.path.join(sufficient_data_folder, output_file_name)
@@ -2065,6 +2082,9 @@ def main():
                 min_forecast, max_week, min_week,
                 asin, product_title, sufficient_data_folder
             )
+
+            comparison['ASIN'] = asin
+            comparison['Product Title'] = product_title
 
             output_file_name = f'forecast_summary_{asin}.xlsx'
             output_file_path = os.path.join(sufficient_data_folder, output_file_name)
