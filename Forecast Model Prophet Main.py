@@ -1604,10 +1604,24 @@ def adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3):
     print("\nAmazon Forecast Statistics for Debugging:")
     print(comparison[['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']].head())
 
+     # Calculate historical median sales for dynamic thresholding
+    if 'y' in comparison.columns:
+        historical_median = comparison['y'].median()
+    else:
+        historical_median = 0
+
+    # Adjust threshold based on historical median sales
+    low_sales_threshold = 20  # Define a low sales cutoff based on domain knowledge
+    if historical_median < low_sales_threshold:
+        local_threshold = 0.6  # Increase tolerance if sales are low
+        print(f"Low historical sales detected (median: {historical_median}). Using higher threshold: {local_threshold}")
+    else:
+        local_threshold = adjustment_threshold
+
     # Calculate out-of-range rows
     comparison['is_out_of_range'] = (
-        (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - adjustment_threshold)) |
-        (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + adjustment_threshold))
+        (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
+        (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
     )
 
     adjustment_mask = comparison['is_out_of_range']
@@ -1637,8 +1651,8 @@ def adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3):
 
         # Identify rows still out of range after adjustment
         comparison['is_still_out_of_range'] = (
-            (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - adjustment_threshold)) |
-            (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + adjustment_threshold))
+            (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
+            (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
         )
 
         # Debug: Rows still out of range
@@ -1675,6 +1689,11 @@ def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallba
     Returns:
         None
     """
+    # Check if 'is_still_out_of_range' column exists
+    if 'is_still_out_of_range' not in comparison.columns:
+        print(f"No 'is_still_out_of_range' column present in DataFrame for ASIN: {asin}. No fallback to log.")
+        return
+
     # Detect rows where the fallback mechanism was triggered
     fallback_rows = comparison[comparison['is_still_out_of_range']]
 
