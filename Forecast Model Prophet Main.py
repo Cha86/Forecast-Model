@@ -1617,18 +1617,7 @@ def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
 # Adjust Forecast If Out of Range
 ##############################
 
-def adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3):
-    """
-    Adjust the Prophet forecast if it deviates significantly from Amazon forecasts.
-
-    Parameters:
-        comparison (DataFrame): The forecast comparison DataFrame.
-        asin (str): The ASIN of the product.
-        adjustment_threshold (float): The ratio threshold to trigger adjustments.
-
-    Returns:
-        DataFrame: Updated comparison with adjusted forecasts if needed.
-    """
+def adjust_forecast_if_out_of_range(comparison, asin, forecast_col_name='Prophet Forecast', adjustment_threshold=0.3):
     global out_of_range_counter
     global out_of_range_stats
 
@@ -1638,74 +1627,58 @@ def adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3):
             print(f"Warning: Missing column {col}. Initializing it with zeros.")
             comparison[col] = 0
 
-    # Debug: Verify Amazon forecast data
     print("\nAmazon Forecast Statistics for Debugging:")
     print(comparison[['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']].head())
 
-     # Calculate historical median sales for dynamic thresholding
     if 'y' in comparison.columns:
         historical_median = comparison['y'].median()
     else:
         historical_median = 0
 
-    # Adjust threshold based on historical median sales
-    low_sales_threshold = 20  # Define a low sales cutoff based on domain knowledge
+    low_sales_threshold = 20
+    local_threshold = 0.6 if historical_median < low_sales_threshold else adjustment_threshold
     if historical_median < low_sales_threshold:
-        local_threshold = 0.6  # Increase tolerance if sales are low
         print(f"Low historical sales detected (median: {historical_median}). Using higher threshold: {local_threshold}")
-    else:
-        local_threshold = adjustment_threshold
 
-    # Calculate out-of-range rows
     comparison['is_out_of_range'] = (
-        (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
-        (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
+        (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
+        (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
     )
 
     adjustment_mask = comparison['is_out_of_range']
-
-    # Total forecasts for ASIN
     total_forecasts = len(comparison)
 
-    # Apply adjustment to out-of-range rows
     if adjustment_mask.any():
         num_adjustments = adjustment_mask.sum()
         print(f"\nAdjusting {num_adjustments} out-of-range forecasts for ASIN {asin} using Amazon data.")
 
-        # Update the global counter
         out_of_range_counter[asin] += num_adjustments
-
-        # Update percentage stats
         if asin not in out_of_range_stats:
             out_of_range_stats[asin] = {'total': 0, 'adjusted': 0}
         out_of_range_stats[asin]['total'] += total_forecasts
         out_of_range_stats[asin]['adjusted'] += num_adjustments
 
-        comparison.loc[adjustment_mask, 'Prophet Forecast'] = (
+        comparison.loc[adjustment_mask, forecast_col_name] = (
             0.7 * comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] +
             0.2 * comparison.loc[adjustment_mask, 'Amazon P70 Forecast'] +
             0.1 * comparison.loc[adjustment_mask, 'Amazon P80 Forecast']
         ).clip(lower=0)
 
-        # Identify rows still out of range after adjustment
         comparison['is_still_out_of_range'] = (
-            (comparison['Prophet Forecast'] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
-            (comparison['Prophet Forecast'] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
+            (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
+            (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
         )
 
-        # Debug: Rows still out of range
         if comparison['is_still_out_of_range'].any():
             print("\nRows still out of range after primary adjustment:")
             print(comparison.loc[comparison['is_still_out_of_range'], [
-                'ds', 'Prophet Forecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'
+                'ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'
             ]])
 
-    # Debug: Adjusted rows
     print("\nAdjusted forecasts for out-of-range rows:")
-    print(comparison.loc[adjustment_mask, ['ds', 'Prophet Forecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast']])
+    print(comparison.loc[adjustment_mask, ['ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast']])
 
-    # Final debug for the adjusted data
-    available_columns = [col for col in ['Week', 'ASIN', 'Prophet Forecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'] if col in comparison.columns]
+    available_columns = [col for col in ['Week', 'ASIN', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'] if col in comparison.columns]
     if available_columns:
         print("\nFinal adjusted forecast data:")
         print(comparison[available_columns].head())
@@ -1713,6 +1686,7 @@ def adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3):
         print("Warning: None of the specified columns ('Week', 'ASIN') are in the DataFrame.")
 
     return comparison
+
 
 def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallback_triggers.csv"):
     """
@@ -1826,16 +1800,16 @@ def main():
     asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
     consolidated_forecasts = {}
-    #param_grid = {
-    #    'changepoint_prior_scale': [0.1, 0.3, 0.5],
-    #    'seasonality_prior_scale': [0.1, 1, 3, 5],
-    #    'holidays_prior_scale': [5, 10, 15]
-    #}
     param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-        'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5],
+        'changepoint_prior_scale': [0.1, 0.3, 0.5],
+        'seasonality_prior_scale': [0.1, 1, 3, 5],
         'holidays_prior_scale': [5, 10, 15]
     }
+    #param_grid = {
+    #    'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+    #    'seasonality_prior_scale': [0.5, 0.1, 1, 2, 3, 4, 5],
+    #    'holidays_prior_scale': [5, 10, 15]
+    #}
 
     holidays = get_shifted_holidays()
 
@@ -1923,10 +1897,15 @@ def main():
                     comparison['ASIN'] = asin
                     comparison['Product Title'] = product_title
 
-                    # Merge historical 'y' values into comparison DataFrame
+                    # After merging historical 'y' values for SARIMA forecasts
                     comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
 
-                    comparison = adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3)
+                    comparison.rename(columns={'SARIMA Forecast': 'Prophet Forecast'}, inplace=True)
+
+                    # Use SARIMA forecast column in the adjustment
+                    comparison = adjust_forecast_if_out_of_range(comparison, asin, forecast_col_name='SARIMA Forecast', adjustment_threshold=0.3)
+
+                    comparison.rename(columns={'Prophet Forecast': 'SARIMA Forecast'}, inplace=True)
 
                     # Safely drop rows where 'y' is missing if the column exists
                     if 'y' in comparison.columns:
@@ -2003,8 +1982,12 @@ def main():
                         print(comparison.columns)
                         comparison['XGBoost Forecast'] = comparison['XGBoost Forecast'].fillna(0)
 
+                        comparison.rename(columns={'XGBoost Forecast': 'Prophet Forecast'}, inplace=True)
+
                         # Apply out-of-range adjustment for XGBoost forecasts
                         comparison = adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3)
+
+                        comparison.rename(columns={'Prophet Forecast': 'XGBoost Forecast'}, inplace=True)
 
                         comparison['Prophet Forecast'] = (
                             0.7 * comparison['XGBoost Forecast'] +
