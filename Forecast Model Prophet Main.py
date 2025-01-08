@@ -1141,6 +1141,12 @@ def save_summary_to_excel(comparison,
     for col in desired_columns:
         if col not in comparison_for_excel.columns:
             comparison_for_excel[col] = np.nan
+        else:
+            # Round values and convert to pandas nullable integer type to handle NaNs
+            try:
+                comparison_for_excel[col] = comparison_for_excel[col].round().astype('Int64')
+            except Exception as e:
+                print(f"Could not convert column {col} to integer: {e}")
 
     # Reorder columns to match desired_columns
     comparison_for_excel = comparison_for_excel[desired_columns]
@@ -1267,6 +1273,12 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
         for col in desired_columns:
             if col not in df_for_excel.columns:
                 df_for_excel[col] = np.nan
+            else:
+                # Round values and convert to pandas nullable integer type to handle NaNs
+                try:
+                    df_for_excel[col] = df_for_excel[col].round().astype('Int64')
+                except Exception as e:
+                    print(f"Could not convert column {col} to integer: {e}")
 
         df_for_excel = df_for_excel[desired_columns]
 
@@ -1346,7 +1358,7 @@ def generate_4_week_report(consolidated_forecasts):
 
         # Sum forecasts over the first 4 weeks if column exists
         if my_forecast_column and my_forecast_column in comp_df.columns:
-            my_4w_forecast = comp_df[my_forecast_column].iloc[:4].sum()
+            my_4w_forecast = int(round(comp_df[my_forecast_column].iloc[:4].sum()))
         else:
             my_4w_forecast = np.nan
 
@@ -1675,6 +1687,7 @@ def adjust_forecast_if_out_of_range(comparison, asin, forecast_col_name='Prophet
     print("\nAmazon Forecast Statistics for Debugging:")
     print(comparison[['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']].head())
 
+    # Existing dynamic thresholding logic...
     if 'y' in comparison.columns:
         historical_median = comparison['y'].median()
     else:
@@ -1722,6 +1735,26 @@ def adjust_forecast_if_out_of_range(comparison, asin, forecast_col_name='Prophet
 
     print("\nAdjusted forecasts for out-of-range rows:")
     print(comparison.loc[adjustment_mask, ['ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast']])
+
+    # New Logic: Adjust based on last 8 weeks of actual sales
+    if 'y' in comparison.columns:
+        historical_data = comparison['y'].dropna()
+        if len(historical_data) >= 8:
+            recent_avg = historical_data.tail(8).mean()
+            print(f"Recent 8-week average sales for ASIN {asin}: {recent_avg}")
+            lower_bound = recent_avg * 0.7
+            upper_bound = recent_avg * 1.3
+            # Adjust forecasts that are too high or too low based on recent_avg
+            for idx in comparison.index:
+                current_forecast = comparison.at[idx, forecast_col_name]
+                if current_forecast < lower_bound:
+                    comparison.at[idx, forecast_col_name] = lower_bound
+                elif current_forecast > upper_bound:
+                    comparison.at[idx, forecast_col_name] = upper_bound
+        else:
+            print(f"Insufficient historical data to compute recent average for ASIN {asin}.")
+    else:
+        print("No historical 'y' data available for recent average calculation.")
 
     available_columns = [col for col in ['Week', 'ASIN', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'] if col in comparison.columns]
     if available_columns:
@@ -2252,12 +2285,15 @@ def main():
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
-    generate_4_week_report(consolidated_forecasts)
+    generate_4_week_report(consolidated_forecasts, sufficient_data_folder, output_file)
+    
 
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
+
+    print("All reports generated.")
 
 ##############################
 # Run the Main Script
