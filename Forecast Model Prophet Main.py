@@ -1326,6 +1326,51 @@ def save_feedback_to_excel(feedback_dict, filename):
         df_feedback.to_excel(writer, index=False, sheet_name='Model Feedback')
     print(f"Feedback saved to {filename}")
 
+def generate_4_week_report(consolidated_forecasts):
+    """
+    Generate an Excel report summarizing the first 4 weeks of forecasts for each ASIN.
+    The report includes columns: ASIN, Model, My 4 Weeks Forecast, AMZ Forecast Mean, AMZ Forecast P70, AMZ Forecast P80, AMZ Forecast P90.
+    """
+    report_rows = []
+    for asin, comp_df in consolidated_forecasts.items():
+        # Determine the model used based on available forecast columns
+        if 'SARIMA Forecast' in comp_df.columns:
+            model_used = 'SARIMA'
+            my_forecast_column = 'SARIMA Forecast'
+        elif 'Prophet Forecast' in comp_df.columns:
+            model_used = 'Prophet'
+            my_forecast_column = 'Prophet Forecast'
+        else:
+            model_used = 'Unknown'
+            my_forecast_column = None
+
+        # Sum forecasts over the first 4 weeks if column exists
+        if my_forecast_column and my_forecast_column in comp_df.columns:
+            my_4w_forecast = comp_df[my_forecast_column].iloc[:4].sum()
+        else:
+            my_4w_forecast = np.nan
+
+        # Sum Amazon forecasts over the first 4 weeks for each type
+        amz_mean = comp_df['Amazon Mean Forecast'].iloc[:4].sum() if 'Amazon Mean Forecast' in comp_df.columns else np.nan
+        amz_p70   = comp_df['Amazon P70 Forecast'].iloc[:4].sum() if 'Amazon P70 Forecast' in comp_df.columns else np.nan
+        amz_p80   = comp_df['Amazon P80 Forecast'].iloc[:4].sum() if 'Amazon P80 Forecast' in comp_df.columns else np.nan
+        amz_p90   = comp_df['Amazon P90 Forecast'].iloc[:4].sum() if 'Amazon P90 Forecast' in comp_df.columns else np.nan
+
+        report_rows.append({
+            'ASIN': asin,
+            'Model': model_used,
+            'My 4 Weeks Forecast': my_4w_forecast,
+            'AMZ Forecast Mean': amz_mean,
+            'AMZ Forecast P70': amz_p70,
+            'AMZ Forecast P80': amz_p80,
+            'AMZ Forecast P90': amz_p90
+        })
+
+    report_df = pd.DataFrame(report_rows)
+    report_filename = '4_week_report.xlsx'
+    report_df.to_excel(report_filename, index=False)
+    print(f"4-week report saved to {report_filename}")
+
 
 ##############################
 # Additional Prophet Cross-Validation
@@ -2207,6 +2252,7 @@ def main():
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
+    generate_4_week_report(consolidated_forecasts)
 
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
