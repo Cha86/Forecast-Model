@@ -2285,7 +2285,7 @@ def main():
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
-    generate_4_week_report(consolidated_forecasts, sufficient_data_folder, output_file)
+    generate_4_week_report(consolidated_forecasts)
     
 
 
