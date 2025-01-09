@@ -1323,6 +1323,10 @@ def generate_4_week_report(consolidated_forecasts):
     for asin, comp_df in consolidated_forecasts.items():
         # Determine the model used based on available info
         # (We only unify the final forecast column as "MyForecast")
+        product_title = ''
+        if 'Product Title' in comp_df.columns and not comp_df.empty:
+            product_title = comp_df['Product Title'].iloc[0]
+
         if 'MyForecast' in comp_df.columns:
             model_used = 'Unified'
             my_forecast_column = 'MyForecast'
@@ -1342,7 +1346,7 @@ def generate_4_week_report(consolidated_forecasts):
 
         report_rows.append({
             'ASIN': asin,
-            'Model': model_used,
+            'Product Title': product_title,
             'My 4 Weeks Forecast': my_4w_forecast,
             'AMZ Forecast Mean': amz_mean,
             'AMZ Forecast P70': amz_p70,
@@ -2157,7 +2161,7 @@ def main():
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
     generate_4_week_report(consolidated_forecasts)
 
-    print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
+    print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
 
