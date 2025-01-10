@@ -1359,6 +1359,52 @@ def generate_4_week_report(consolidated_forecasts):
     report_df.to_excel(report_filename, index=False)
     print(f"4-week report saved to {report_filename}")
 
+def generate_combined_weekly_report(consolidated_forecasts):
+    """
+    Generate an Excel report summarizing 4-, 8-, and 16-week forecasts for both
+    your model and Amazon's mean forecasts.
+    
+    Output Columns:
+    ASIN, Product Name, 4 Weeks Forecast, 8 Weeks Forecast, 16 Weeks Forecast,
+    AMZ 4 Weeks Forecast, AMZ 8 Weeks Forecast, AMZ 16 Weeks Forecast
+    """
+    report_rows = []
+    for asin, comp_df in consolidated_forecasts.items():
+        # Extract product name if available
+        product_name = ""
+        if 'Product Title' in comp_df.columns and not comp_df.empty:
+            product_name = comp_df['Product Title'].iloc[0]
+        
+        # Use 'MyForecast' column; if missing, default to zeros
+        my_forecast = comp_df['MyForecast'] if 'MyForecast' in comp_df.columns else pd.Series([0]*len(comp_df))
+        # Use 'Amazon Mean Forecast' column; if missing, default to zeros
+        amz_forecast = comp_df['Amazon Mean Forecast'] if 'Amazon Mean Forecast' in comp_df.columns else pd.Series([0]*len(comp_df))
+
+        # Calculate cumulative sums for specified weeks
+        forecast_4 = int(round(my_forecast.iloc[:4].sum())) if len(my_forecast) >= 4 else int(round(my_forecast.sum()))
+        forecast_8 = int(round(my_forecast.iloc[:8].sum())) if len(my_forecast) >= 8 else int(round(my_forecast.sum()))
+        forecast_16 = int(round(my_forecast.iloc[:16].sum())) if len(my_forecast) >= 16 else int(round(my_forecast.sum()))
+
+        amz_4 = int(round(amz_forecast.iloc[:4].sum())) if len(amz_forecast) >= 4 else int(round(amz_forecast.sum()))
+        amz_8 = int(round(amz_forecast.iloc[:8].sum())) if len(amz_forecast) >= 8 else int(round(amz_forecast.sum()))
+        amz_16 = int(round(amz_forecast.iloc[:16].sum())) if len(amz_forecast) >= 16 else int(round(amz_forecast.sum()))
+
+        report_rows.append({
+            'ASIN': asin,
+            'Product Name': product_name,
+            '4 Weeks Forecast': forecast_4,
+            '8 Weeks Forecast': forecast_8,
+            '16 Weeks Forecast': forecast_16,
+            'AMZ 4 Weeks Forecast': amz_4,
+            'AMZ 8 Weeks Forecast': amz_8,
+            'AMZ 16 Weeks Forecast': amz_16
+        })
+
+    report_df = pd.DataFrame(report_rows)
+    report_filename = 'combined_4_8_16_week_report.xlsx'
+    report_df.to_excel(report_filename, index=False)
+    print(f"Combined 4-8-16 week report saved to {report_filename}")
+
 
 ##############################
 # Additional Prophet Cross-Validation
@@ -2160,6 +2206,8 @@ def main():
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
     generate_4_week_report(consolidated_forecasts)
+    generate_combined_weekly_report(consolidated_forecasts)
+
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
     if POOR_PARAM_FOUND:
