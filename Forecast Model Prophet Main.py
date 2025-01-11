@@ -1792,6 +1792,180 @@ def update_prophet_model_with_feedback(asin, ts_data, forecast_data, param_grid,
     print(f"Prophet model for ASIN {asin} updated.")
     return forecast, updated_model
 
+##############################
+# Analyze PO Order
+##############################
+
+def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, output_folder="po_analysis_by_asin"):
+    """
+    Analyze PO orders by each ASIN to understand buying habits based on requested quantities.
+    Generates weekly and monthly requested quantity trend graphs and creates an Excel file 
+    for each ASIN with separate sheets for weekly and monthly data.
+
+    Parameters:
+      po_file: Path to the PO Excel file.
+      product_filter: Optional ASIN or product filter to limit analysis.
+      output_folder: Folder to save individual ASIN reports and graphs.
+
+    Returns:
+      A dictionary with aggregated data and paths to generated graphs for each ASIN.
+    """
+    # Load PO data
+    po_df = pd.read_excel(po_file)
+
+    # Standardize column names (strip spaces)
+    po_df.columns = po_df.columns.str.strip()
+
+    # Convert date columns to datetime
+    for date_col in ['Order date', 'Expected date']:
+        if date_col in po_df.columns:
+            po_df[date_col] = pd.to_datetime(po_df[date_col], errors='coerce')
+
+    # Filter by product if specified
+    if product_filter:
+        po_df = po_df[po_df['ASIN'] == product_filter]
+
+    # Ensure numeric conversion for Requested quantity
+    po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
+
+    # Create output folder if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
+
+    results = {}
+    unique_asins = po_df['ASIN'].dropna().unique()
+    for asin in unique_asins:
+        # Filter data for the current ASIN
+        asin_df = po_df[po_df['ASIN'] == asin].copy()
+        if asin_df.empty:
+            continue
+
+        # Weekly aggregation for requested quantities
+        asin_df['Order Week'] = asin_df['Order date'].dt.to_period('W').apply(lambda r: r.start_time)
+        weekly_agg = asin_df.groupby('Order Week').agg({
+            'Requested quantity': 'sum'
+        }).reset_index()
+
+        # Monthly aggregation for requested quantities
+        asin_df['Order Month'] = asin_df['Order date'].dt.to_period('M').apply(lambda r: r.start_time)
+        monthly_trend = asin_df.groupby('Order Month').agg({
+            'Requested quantity': 'sum'
+        }).reset_index()
+
+        # Plot weekly trend for this ASIN
+        plt.figure(figsize=(10, 6))
+        plt.plot(weekly_agg['Order Week'], weekly_agg['Requested quantity'], marker='o')
+        plt.title(f'Weekly Requested Quantities for ASIN {asin}')
+        plt.xlabel('Week')
+        plt.ylabel('Total Requested Quantity')
+        plt.grid()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        weekly_chart = os.path.join(output_folder, f"{asin}_weekly_requested_quantity.png")
+        plt.savefig(weekly_chart)
+        plt.close()
+
+        # Plot monthly trend for this ASIN
+        plt.figure(figsize=(10, 6))
+        plt.plot(monthly_trend['Order Month'], monthly_trend['Requested quantity'], marker='o', color='green')
+        plt.title(f'Monthly Requested Quantities for ASIN {asin}')
+        plt.xlabel('Month')
+        plt.ylabel('Total Requested Quantity')
+        plt.grid()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        monthly_chart = os.path.join(output_folder, f"{asin}_monthly_requested_quantity.png")
+        plt.savefig(monthly_chart)
+        plt.close()
+
+        # Save weekly and monthly data into an Excel file for this ASIN
+        excel_path = os.path.join(output_folder, f"{asin}_po_data.xlsx")
+        with pd.ExcelWriter(excel_path) as writer:
+            weekly_agg.to_excel(writer, sheet_name='Weekly Quantity', index=False)
+            monthly_trend.to_excel(writer, sheet_name='Monthly Trend', index=False)
+
+        # Store results for this ASIN
+        results[asin] = {
+            'weekly_agg': weekly_agg,
+            'monthly_trend': monthly_trend,
+            'weekly_chart': weekly_chart,
+            'monthly_chart': monthly_chart,
+            'excel_report': excel_path
+        }
+
+    print(f"Generated graphs and Excel reports for {len(unique_asins)} ASINs in folder '{output_folder}'.")
+    return results
+
+##############################
+# Compare PO Orders with Forecasts
+##############################
+
+def compare_historical_po_with_forecast(asin, forecast_df, po_df, output_folder="po forecast comparison"):
+    """
+    Compare forecasted sales with historical PO requested quantities for a given ASIN.
+    It overlays forecast and PO trends, computes correlation, and saves results.
+    
+    Parameters:
+      asin: The ASIN to analyze.
+      forecast_df: DataFrame containing forecasted data with columns ['ds', 'MyForecast'].
+      po_df: DataFrame containing historical PO data with columns including 'ASIN', 'Order date', and 'Requested quantity'.
+      output_folder: Directory where results will be saved.
+    
+    Returns:
+      merged_df: DataFrame merging forecast and PO data.
+      correlation: Correlation coefficient between forecasted sales and PO requested quantities.
+    """
+    # Create output folder if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Filter PO data for the specified ASIN
+    asin_po = po_df[po_df['ASIN'] == asin].copy()
+    
+    # Ensure 'Order date' is datetime, then convert to week start
+    asin_po['Order date'] = pd.to_datetime(asin_po['Order date'], errors='coerce')
+    asin_po['Order Week'] = asin_po['Order date'].dt.to_period('W').apply(lambda r: r.start_time)
+    
+    # Aggregate PO requested quantities by week
+    weekly_po = asin_po.groupby('Order Week').agg({'Requested quantity': 'sum'}).reset_index()
+    weekly_po.rename(columns={'Order Week': 'ds', 'Requested quantity': 'PO_Requested_Qty'}, inplace=True)
+    
+    # Merge forecast data with weekly aggregated PO data on 'ds'
+    merged_df = pd.merge(forecast_df, weekly_po, on='ds', how='left')
+    merged_df['PO_Requested_Qty'] = merged_df['PO_Requested_Qty'].fillna(0)
+    
+    # Plot overlay of forecasted sales and PO requested quantities
+    plt.figure(figsize=(12, 6))
+    plt.plot(merged_df['ds'], merged_df['MyForecast'], marker='o', label='Forecasted Sales')
+    plt.plot(merged_df['ds'], merged_df['PO_Requested_Qty'], marker='x', label='PO Requested Qty')
+    plt.title(f'Forecast vs. PO Requested Quantities for ASIN {asin}')
+    plt.xlabel('Week')
+    plt.ylabel('Quantity')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.grid(True)
+    plt.tight_layout()
+    
+    # Save the overlay graph
+    plot_filename = os.path.join(output_folder, f'{asin}_forecast_vs_po.png')
+    plt.savefig(plot_filename)
+    plt.close()
+    print(f"Overlay graph saved as {plot_filename}")
+    
+    # Save merged comparison DataFrame to Excel
+    excel_filename = os.path.join(output_folder, f'{asin}_forecast_po_comparison.xlsx')
+    merged_df.to_excel(excel_filename, index=False)
+    print(f"Merged comparison data saved as {excel_filename}")
+    
+    # Compute correlation over periods where PO data exists
+    valid_idx = merged_df['PO_Requested_Qty'] > 0
+    if valid_idx.sum() > 1:
+        correlation = merged_df.loc[valid_idx, ['MyForecast', 'PO_Requested_Qty']].corr().iloc[0, 1]
+        print(f"Correlation between forecast and PO requested quantity for ASIN {asin}: {correlation:.2f}")
+    else:
+        correlation = None
+        print(f"Not enough overlapping data to compute correlation for ASIN {asin}.")
+    
+    return merged_df, correlation
+
 
 ##############################
 # Main
@@ -2199,6 +2373,27 @@ def main():
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
     generate_4_week_report(consolidated_forecasts)
     generate_combined_weekly_report(consolidated_forecasts)
+
+    print("\n--- Analyzing Purchase Order Data ---")
+    analyze_po_data_by_asin(po_file="po database.xlsx", output_folder="po_analysis_by_asin")
+
+    # Load PO data for comparison
+    po_data = pd.read_excel("po database.xlsx")
+    po_data.columns = po_data.columns.str.strip()  # Standardize column names
+
+    print("\n--- Comparing PO Orders with Forecasts ---")
+
+    # Loop through each ASIN forecast in consolidated_forecasts to compare with PO data
+    for asin, comp_df in consolidated_forecasts.items():
+        print(f"\nComparing data for ASIN: {asin}")
+        # Check for required columns in forecast data
+        if 'ds' in comp_df.columns and 'MyForecast' in comp_df.columns:
+            forecast_df = comp_df[['ds', 'MyForecast']].copy()
+            # Call the comparison function for the current ASIN
+            merged_result, correlation = compare_historical_po_with_forecast(asin, forecast_df, po_data)
+            print(f"Completed comparison for ASIN {asin}. Correlation: {correlation}")
+        else:
+            print(f"Forecast data for ASIN {asin} is missing required columns.")
 
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
