@@ -1899,71 +1899,68 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
 # Compare PO Orders with Forecasts
 ##############################
 
-def compare_historical_po_with_forecast(asin, forecast_df, po_df, output_folder="po forecast comparison"):
+def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po forecast comparison"):
     """
-    Compare forecasted sales with historical PO requested quantities for a given ASIN.
-    It overlays forecast and PO trends, computes correlation, and saves results.
+    Compare historical sales with PO requested quantities for a given ASIN.
+    Overlays historical sales and PO trends, computes correlation, 
+    and saves overlay graphs and merged data.
     
     Parameters:
       asin: The ASIN to analyze.
-      forecast_df: DataFrame containing forecasted data with columns ['ds', 'MyForecast'].
-      po_df: DataFrame containing historical PO data with columns including 'ASIN', 'Order date', and 'Requested quantity'.
+      sales_df: DataFrame containing weekly aggregated historical sales with columns ['ds', 'y'].
+      po_df: DataFrame containing historical PO data.
       output_folder: Directory where results will be saved.
     
     Returns:
-      merged_df: DataFrame merging forecast and PO data.
-      correlation: Correlation coefficient between forecasted sales and PO requested quantities.
+      merged_df: DataFrame merging historical sales and PO data.
+      correlation: Correlation coefficient between sales and PO requested quantities.
     """
     # Create output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
     
-    # Filter PO data for the specified ASIN
+    # Filter PO data for the specified ASIN and aggregate weekly requested quantities
     asin_po = po_df[po_df['ASIN'] == asin].copy()
-    
-    # Ensure 'Order date' is datetime, then convert to week start
     asin_po['Order date'] = pd.to_datetime(asin_po['Order date'], errors='coerce')
     asin_po['Order Week'] = asin_po['Order date'].dt.to_period('W').apply(lambda r: r.start_time)
-    
-    # Aggregate PO requested quantities by week
     weekly_po = asin_po.groupby('Order Week').agg({'Requested quantity': 'sum'}).reset_index()
     weekly_po.rename(columns={'Order Week': 'ds', 'Requested quantity': 'PO_Requested_Qty'}, inplace=True)
-    
-    # Merge forecast data with weekly aggregated PO data on 'ds'
-    merged_df = pd.merge(forecast_df, weekly_po, on='ds', how='left')
+
+    # Merge historical sales data with weekly PO data on 'ds'
+    merged_df = pd.merge(sales_df, weekly_po, on='ds', how='left')
     merged_df['PO_Requested_Qty'] = merged_df['PO_Requested_Qty'].fillna(0)
-    
-    # Plot overlay of forecasted sales and PO requested quantities
+
+    # Plot overlay of historical sales and PO requested quantities
     plt.figure(figsize=(12, 6))
-    plt.plot(merged_df['ds'], merged_df['MyForecast'], marker='o', label='Forecasted Sales')
+    plt.plot(merged_df['ds'], merged_df['y'], marker='o', label='Historical Sales')
     plt.plot(merged_df['ds'], merged_df['PO_Requested_Qty'], marker='x', label='PO Requested Qty')
-    plt.title(f'Forecast vs. PO Requested Quantities for ASIN {asin}')
+    plt.title(f'Historical Sales vs. PO Requested Quantities for ASIN {asin}')
     plt.xlabel('Week')
     plt.ylabel('Quantity')
     plt.legend()
     plt.xticks(rotation=45)
     plt.grid(True)
     plt.tight_layout()
-    
+
     # Save the overlay graph
-    plot_filename = os.path.join(output_folder, f'{asin}_forecast_vs_po.png')
+    plot_filename = os.path.join(output_folder, f"{asin}_sales_vs_po.png")
     plt.savefig(plot_filename)
     plt.close()
     print(f"Overlay graph saved as {plot_filename}")
-    
-    # Save merged comparison DataFrame to Excel
-    excel_filename = os.path.join(output_folder, f'{asin}_forecast_po_comparison.xlsx')
-    merged_df.to_excel(excel_filename, index=False)
-    print(f"Merged comparison data saved as {excel_filename}")
-    
-    # Compute correlation over periods where PO data exists
+
+    # Compute correlation where PO data exists
     valid_idx = merged_df['PO_Requested_Qty'] > 0
     if valid_idx.sum() > 1:
-        correlation = merged_df.loc[valid_idx, ['MyForecast', 'PO_Requested_Qty']].corr().iloc[0, 1]
-        print(f"Correlation between forecast and PO requested quantity for ASIN {asin}: {correlation:.2f}")
+        correlation = merged_df.loc[valid_idx, ['y', 'PO_Requested_Qty']].corr().iloc[0, 1]
+        print(f"Correlation between historical sales and PO requested quantity for ASIN {asin}: {correlation:.2f}")
     else:
         correlation = None
         print(f"Not enough overlapping data to compute correlation for ASIN {asin}.")
-    
+
+    # Save merged data to Excel
+    excel_filename = os.path.join(output_folder, f"{asin}_sales_po_comparison.xlsx")
+    merged_df.to_excel(excel_filename, index=False)
+    print(f"Merged comparison data saved as {excel_filename}")
+
     return merged_df, correlation
 
 
@@ -2381,20 +2378,26 @@ def main():
     po_data = pd.read_excel("po database.xlsx")
     po_data.columns = po_data.columns.str.strip()  # Standardize column names
 
-    print("\n--- Comparing PO Orders with Forecasts ---")
+    print("\n--- Comparing Historical Sales with PO Data ---")
+    # Load PO data for comparison
+    po_data = pd.read_excel("po database.xlsx")
+    po_data.columns = po_data.columns.str.strip()
 
-    # Loop through each ASIN forecast in consolidated_forecasts to compare with PO data
+    # Create output folder for comparison results
+    comparison_output_folder = "po forecast comparison"
+    os.makedirs(comparison_output_folder, exist_ok=True)
+
+    # Loop through each ASIN for which forecasts were generated
     for asin, comp_df in consolidated_forecasts.items():
-        print(f"\nComparing data for ASIN: {asin}")
-        # Check for required columns in forecast data
-        if 'ds' in comp_df.columns and 'MyForecast' in comp_df.columns:
-            forecast_df = comp_df[['ds', 'MyForecast']].copy()
-            # Call the comparison function for the current ASIN
-            merged_result, correlation = compare_historical_po_with_forecast(asin, forecast_df, po_data)
-            print(f"Completed comparison for ASIN {asin}. Correlation: {correlation}")
-        else:
-            print(f"Forecast data for ASIN {asin} is missing required columns.")
+        print(f"\nComparing sales and PO for ASIN {asin}")
+        # Filter historical sales data for the current ASIN and aggregate weekly
+        sales_subset = valid_data[valid_data['asin'] == asin][['ds', 'y']].copy()
+        sales_subset['Order Week'] = sales_subset['ds'].dt.to_period('W').apply(lambda r: r.start_time)
+        weekly_sales = sales_subset.groupby('Order Week').agg({'y': 'sum'}).reset_index()
+        weekly_sales.rename(columns={'Order Week': 'ds'}, inplace=True)
 
+        # Call the comparison function
+        merged_result, corr = compare_historical_sales_po(asin, weekly_sales, po_data, output_folder=comparison_output_folder)
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
     if POOR_PARAM_FOUND:
