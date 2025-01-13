@@ -1132,7 +1132,7 @@ def save_summary_to_excel(comparison,
 
     if 'ds' in comparison_for_excel.columns:
         for i in range(len(comparison_for_excel)):
-            comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
+            comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1)}"
         comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
 
     # Ensure all desired columns are present
