@@ -26,7 +26,6 @@ import time
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from scipy.optimize import minimize
-import logging
 
 warnings.filterwarnings("ignore")
 
@@ -915,14 +914,14 @@ def format_output_with_forecasts(my_forecast_df, forecast_data, horizon=16):
             base_name = col.replace('Amazon ', '').replace(' Forecast', '')
             diff_col = f"Diff_{base_name}"
             pct_col = f"Pct_{base_name}"
-            comparison[diff_col] = (comparison['MyForecast'] - comparison[col]).astype(int)
+            comparison[diff_col] = (comparison['MyForecast'] - comparison[col]).round().astype(int)
             comparison[pct_col] = np.where(
                 comparison[col] != 0,
                 (comparison[diff_col] / comparison[col]) * 100,
                 0
             )
 
-    comparison['MyForecast'] = comparison['MyForecast'].astype(int)
+    comparison['MyForecast'] = comparison['MyForecast'].round().astype(int)
 
     for col in comparison.columns:
         if col.startswith("Amazon ") or col.startswith("Diff_") or col.startswith("Pct_"):
@@ -1118,47 +1117,62 @@ def save_summary_to_excel(comparison,
                           max_week,
                           min_week,
                           output_file_path,
-                          metrics=None):
-    """
-    Save forecast comparison + summary stats to an Excel file.
-    """
-    desired_columns = [
-        'Week', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
+                          metrics=None,
+                          base_year=2025):
+
+    def week_label_to_date(week_label, base_year):
+        # Convert week label like 'W01' to a start date
+        week_num = int(week_label[1:])
+        # Assume first week of base_year starts on January 1st
+        start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num-1)
+        return start_date.strftime('%Y-%m-%d')
+
+    # Create Week_Start_Date based on available information
+    if 'ds' in comparison.columns:
+        comparison['ds'] = pd.to_datetime(comparison['ds'], errors='coerce')
+        comparison['Week_Start_Date'] = comparison['ds'].dt.strftime('%Y-%m-%d')
+    elif 'Week' in comparison.columns:
+        comparison['Week_Start_Date'] = comparison['Week'].apply(lambda w: week_label_to_date(w, base_year))
+
+    # Create Week label column if not present
+    if 'Week' not in comparison.columns:
+        # Sort by Week_Start_Date to ensure correct order
+        comparison = comparison.sort_values('Week_Start_Date').reset_index(drop=True)
+        comparison['Week'] = ['W' + str(i+1) for i in range(len(comparison))]
+
+    # Round forecast values to integers for specified columns
+    for col in ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast',
+                'Amazon P80 Forecast', 'Amazon P90 Forecast']:
+        if col in comparison.columns:
+            comparison[col] = comparison[col].round().astype(int)
+
+    # Drop 'ds' column if it exists since we now use Week and Week_Start_Date
+    if 'ds' in comparison.columns:
+        comparison.drop(columns=['ds'], inplace=True)
+
+    # Define the desired column order, including the new columns
+    columns_to_include = [
+        'Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
         'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
         'Product Title', 'is_holiday_week'
     ]
 
-    comparison_for_excel = comparison.copy()
+    # Ensure all desired columns are present in the DataFrame
+    for col in columns_to_include:
+        if col not in comparison.columns:
+            comparison[col] = np.nan
 
-    if 'ds' in comparison_for_excel.columns:
-        for i in range(len(comparison_for_excel)):
-            comparison_for_excel.loc[i, 'Week'] = f"W{str(i+1)}"
-        comparison_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
-
-    # Ensure all desired columns are present
-    for col in desired_columns:
-        if col not in comparison_for_excel.columns:
-            comparison_for_excel[col] = np.nan
-        else:
-            if pd.api.types.is_numeric_dtype(comparison_for_excel[col]):
-                try:
-                    comparison_for_excel[col] = comparison_for_excel[col].round().astype('Int64')
-                except Exception as e:
-                    print(f"Could not convert column {col} to integer: {e}")
-            else:
-                print(f"Skipping conversion for non-numeric column: {col}")
-
-    # Reorder columns
-    comparison_for_excel = comparison_for_excel[desired_columns]
+    comparison = comparison[columns_to_include]
 
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Forecast Comparison"
 
-    for r in dataframe_to_rows(comparison_for_excel, index=False, header=True):
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    for r in dataframe_to_rows(comparison, index=False, header=True):
         ws1.append(r)
 
-    # Summary Sheet
+    # Prepare summary sheet as before
     ws2 = wb.create_sheet(title="Summary")
     summary_data = {
         "Metric": [
@@ -1237,45 +1251,75 @@ def save_4_8_16_forecast_summary(consolidated_data, output_folder):
     summary_df.to_excel(output_file_path, index=False)
     print(f"4-8-16 Weeks Forecast Summary saved to {output_file_path}")
 
-def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
+def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, base_year=2025):
     """
     Save multiple ASIN forecasts (with "MyForecast") and any missing ASIN data into one Excel file,
     each ASIN in a separate sheet.
     """
+
     desired_columns = [
-        'Week', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
+        'Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
         'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
         'Product Title', 'is_holiday_week'
     ]
+
+    def week_label_to_date(week_label, base_year):
+        week_num = int(week_label[1:])
+        start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num-1)
+        return start_date.strftime('%Y-%m-%d')
 
     wb = Workbook()
 
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
+
+        # Calculate Week_Start_Date
         if 'ds' in df_for_excel.columns:
-            for i in range(len(df_for_excel)):
-                df_for_excel.loc[i, 'Week'] = f"W{str(i+1).zfill(2)}"
-            df_for_excel.drop(columns=['ds'], inplace=True, errors='ignore')
-    
+            df_for_excel['ds'] = pd.to_datetime(df_for_excel['ds'], errors='coerce')
+            df_for_excel['Week_Start_Date'] = df_for_excel['ds'].dt.strftime('%Y-%m-%d')
+            # Create Week labels if missing
+            if 'Week' not in df_for_excel.columns:
+                df_for_excel = df_for_excel.sort_values('Week_Start_Date').reset_index(drop=True)
+                df_for_excel['Week'] = ['W' + str(i+1).zfill(2) for i in range(len(df_for_excel))]
+        elif 'Week' in df_for_excel.columns:
+            df_for_excel['Week_Start_Date'] = df_for_excel['Week'].apply(lambda w: week_label_to_date(w, base_year))
+
+        # Round forecast columns to integers
+        forecast_cols = ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 
+                         'Amazon P80 Forecast', 'Amazon P90 Forecast']
+        for col in forecast_cols:
+            if col in df_for_excel.columns:
+                df_for_excel[col] = df_for_excel[col].round().astype(int)
+
+        # Ensure all desired columns exist
         for col in desired_columns:
             if col not in df_for_excel.columns:
                 df_for_excel[col] = np.nan
 
+        # Fill 'ASIN' and 'Product Title' if missing
+        df_for_excel['ASIN'] = asin
+        df_for_excel['Product Title'] = forecast_df['Product Title'].iloc[0] if 'Product Title' in forecast_df.columns else ''
+
+        # Select desired columns only
         df_for_excel = df_for_excel[desired_columns]
 
-        ws = wb.create_sheet(title=str(asin)[:31])  # 31-char limit
+        ws = wb.create_sheet(title=str(asin)[:31])  # Excel sheet names limited to 31 characters
+
         for r in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(r)
 
+    # Handle missing ASIN data
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
         for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(r)
 
+    # Remove default 'Sheet' if it exists
     if 'Sheet' in wb.sheetnames:
         del wb['Sheet']
 
-    ws_summary = wb.create_sheet(title="4-16 Weeks Summary")
+    # Add a Summary Sheet
+    ws_summary = wb.create_sheet(title="Summary")
     ws_summary.append(["ASIN", "Product Title", "4 Week Forecast", "8 Week Forecast", "16 Week Forecast"])
 
     for asin, df in consolidated_data.items():
@@ -1284,14 +1328,15 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
             continue
 
         product_title = df['Product Title'].iloc[0] if 'Product Title' in df.columns else ''
-        four_wk_val = df['MyForecast'].iloc[3] if len(df) >= 4 else None
-        eight_wk_val = df['MyForecast'].iloc[7] if len(df) >= 8 else None
-        sixteen_wk_val = df['MyForecast'].iloc[15] if len(df) >= 16 else None
+        four_wk_val = df['MyForecast'].iloc[:4].sum() if len(df) >= 4 else df['MyForecast'].sum()
+        eight_wk_val = df['MyForecast'].iloc[:8].sum() if len(df) >= 8 else df['MyForecast'].sum()
+        sixteen_wk_val = df['MyForecast'].iloc[:16].sum() if len(df) >= 16 else df['MyForecast'].sum()
 
         ws_summary.append([asin, product_title, four_wk_val, eight_wk_val, sixteen_wk_val])
 
     wb.save(output_path)
-    print(f"All forecasts saved to {output_path}")
+    print(f"All forecasts saved to '{output_path}'")
+
 
 def save_feedback_to_excel(feedback_dict, filename):
     """
@@ -1396,6 +1441,68 @@ def generate_combined_weekly_report(consolidated_forecasts):
     report_filename = 'combined_4_8_16_week_report.xlsx'
     report_df.to_excel(report_filename, index=False)
     print(f"Combined 4-8-16 week report saved to {report_filename}")
+
+def save_consolidated_forecasts(output_path, consolidated_data, base_year=2025):
+    import numpy as np
+    import pandas as pd
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
+    desired_columns = [
+        'Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
+        'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
+        'Product Title', 'is_holiday_week'
+    ]
+
+    def week_label_to_date(week_label, base_year):
+        week_num = int(week_label[1:])
+        start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num-1)
+        return start_date.strftime('%Y-%m-%d')
+
+    consolidated_list = []
+    for asin, df in consolidated_data.items():
+        df_copy = df.copy()
+
+        # Calculate Week_Start_Date
+        if 'ds' in df_copy.columns:
+            df_copy['ds'] = pd.to_datetime(df_copy['ds'], errors='coerce')
+            df_copy['Week_Start_Date'] = df_copy['ds'].dt.strftime('%Y-%m-%d')
+        elif 'Week' in df_copy.columns:
+            df_copy['Week_Start_Date'] = df_copy['Week'].apply(lambda w: week_label_to_date(w, base_year))
+
+        # Round forecast columns to integers
+        forecast_cols = ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 
+                         'Amazon P80 Forecast', 'Amazon P90 Forecast']
+        for col in forecast_cols:
+            if col in df_copy.columns:
+                df_copy[col] = df_copy[col].round().astype(int)
+
+        # Create Week labels if missing
+        if 'Week' not in df_copy.columns:
+            df_copy = df_copy.sort_values('Week_Start_Date').reset_index(drop=True)
+            df_copy['Week'] = ['W' + str(i+1).zfill(2) for i in range(len(df_copy))]
+
+        # Ensure all desired columns exist
+        for col in desired_columns:
+            if col not in df_copy.columns:
+                df_copy[col] = np.nan
+
+        # Select desired columns only
+        df_copy = df_copy[desired_columns]
+
+        consolidated_list.append(df_copy)
+
+    # Combine all ASIN dataframes
+    if consolidated_list:
+        consolidated_df = pd.concat(consolidated_list, ignore_index=True)
+        consolidated_df = consolidated_df.sort_values(['Week_Start_Date', 'ASIN']).reset_index(drop=True)
+    else:
+        consolidated_df = pd.DataFrame(columns=desired_columns)
+
+    # Save the consolidated DataFrame to Excel
+    with pd.ExcelWriter(output_path) as writer:
+        consolidated_df.to_excel(writer, sheet_name='Consolidated Forecast', index=False)
+    print(f"All forecasts saved to '{output_path}'")
 
 
 ##############################
@@ -1899,36 +2006,94 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
 # Compare PO Orders with Forecasts
 ##############################
 
-def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po forecast comparison"):
+def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecast_comparison"):
     """
     Compare historical sales with PO requested quantities for a given ASIN.
     Overlays historical sales and PO trends, computes correlation, 
-    and saves overlay graphs and merged data.
+    calculates growth percentages and volume insights,
+    and provides a basic prediction for future PO quantities.
+    Saves overlay graphs and merged data.
     
     Parameters:
       asin: The ASIN to analyze.
       sales_df: DataFrame containing weekly aggregated historical sales with columns ['ds', 'y'].
-      po_df: DataFrame containing historical PO data.
+      po_df: DataFrame containing historical PO data with columns ['ASIN', 'Order date', 'Requested quantity'].
       output_folder: Directory where results will be saved.
     
     Returns:
       merged_df: DataFrame merging historical sales and PO data.
       correlation: Correlation coefficient between sales and PO requested quantities.
+      growth_info: Dictionary containing growth percentages, volume insights, and predicted next week PO quantity.
     """
     # Create output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
+    
+    # Ensure numeric conversion for Requested quantity; handle commas and spaces
+    po_df['Requested quantity'] = (
+         po_df['Requested quantity']
+         .astype(str)
+         .str.replace(',', '')
+         .str.strip()
+         .replace('', '0')
+    )
+    po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
     
     # Filter PO data for the specified ASIN and aggregate weekly requested quantities
     asin_po = po_df[po_df['ASIN'] == asin].copy()
     asin_po['Order date'] = pd.to_datetime(asin_po['Order date'], errors='coerce')
     asin_po['Order Week'] = asin_po['Order date'].dt.to_period('W').apply(lambda r: r.start_time)
+    
+    # Aggregate PO requested quantities by week
     weekly_po = asin_po.groupby('Order Week').agg({'Requested quantity': 'sum'}).reset_index()
     weekly_po.rename(columns={'Order Week': 'ds', 'Requested quantity': 'PO_Requested_Qty'}, inplace=True)
-
+    weekly_po.sort_values('ds', inplace=True)
+    
+    # Calculate Growth Percentage
+    weekly_po['Growth%'] = weekly_po['PO_Requested_Qty'].pct_change() * 100
+    weekly_po['Growth%'] = weekly_po['Growth%'].replace([np.inf, -np.inf], np.nan).fillna(0)
+    
+    # Volume Insights
+    total_po_qty = weekly_po['PO_Requested_Qty'].sum()
+    average_po_qty = weekly_po['PO_Requested_Qty'].mean() if not weekly_po.empty else 0
+    max_po_qty = weekly_po['PO_Requested_Qty'].max() if not weekly_po.empty else 0
+    min_po_qty = weekly_po['PO_Requested_Qty'].min() if not weekly_po.empty else 0
+    
+    volume_insights = {
+        'Total_PO_Quantity': total_po_qty,
+        'Average_PO_Quantity': average_po_qty,
+        'Max_PO_Quantity': max_po_qty,
+        'Min_PO_Quantity': min_po_qty
+    }
+    
+    # Basic Prediction for Next Week's PO Quantity using Linear Regression
+    predicted_next_po_qty = 0
+    if len(weekly_po) > 1:
+        weekly_po = weekly_po.reset_index(drop=True)
+        weekly_po['Week_Number'] = np.arange(1, len(weekly_po)+1)
+        X = weekly_po[['Week_Number']]
+        y = weekly_po['PO_Requested_Qty']
+        model = LinearRegression()
+        model.fit(X, y)
+        next_week_number = weekly_po['Week_Number'].iloc[-1] + 1
+        predicted_next_po_qty = model.predict([[next_week_number]])[0]
+        predicted_next_po_qty = max(predicted_next_po_qty, 0)  # Ensure non-negative
+    
+    prediction_info = {
+        'Predicted_Next_Week_PO_Quantity': predicted_next_po_qty
+    }
+    
+    # Combine growth and prediction info
+    growth_info = {
+        'weekly_growth': weekly_po[['ds', 'PO_Requested_Qty', 'Growth%']],
+        'volume_insights': volume_insights,
+        'prediction_info': prediction_info
+    }
+    
     # Merge historical sales data with weekly PO data on 'ds'
-    merged_df = pd.merge(sales_df, weekly_po, on='ds', how='left')
+    merged_df = pd.merge(sales_df, weekly_po[['ds', 'PO_Requested_Qty']], on='ds', how='left')
     merged_df['PO_Requested_Qty'] = merged_df['PO_Requested_Qty'].fillna(0)
-
+    merged_df.sort_values('ds', inplace=True)
+    
     # Plot overlay of historical sales and PO requested quantities
     plt.figure(figsize=(12, 6))
     plt.plot(merged_df['ds'], merged_df['y'], marker='o', label='Historical Sales')
@@ -1940,14 +2105,14 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po forecas
     plt.xticks(rotation=45)
     plt.grid(True)
     plt.tight_layout()
-
+    
     # Save the overlay graph
     plot_filename = os.path.join(output_folder, f"{asin}_sales_vs_po.png")
     plt.savefig(plot_filename)
     plt.close()
     print(f"Overlay graph saved as {plot_filename}")
-
-    # Compute correlation where PO data exists
+    
+    # Compute correlation between historical sales and PO requested quantities where PO data exists
     valid_idx = merged_df['PO_Requested_Qty'] > 0
     if valid_idx.sum() > 1:
         correlation = merged_df.loc[valid_idx, ['y', 'PO_Requested_Qty']].corr().iloc[0, 1]
@@ -1955,14 +2120,17 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po forecas
     else:
         correlation = None
         print(f"Not enough overlapping data to compute correlation for ASIN {asin}.")
-
-    # Save merged data to Excel
+    
+    # Save merged data and growth insights to Excel
     excel_filename = os.path.join(output_folder, f"{asin}_sales_po_comparison.xlsx")
-    merged_df.to_excel(excel_filename, index=False)
-    print(f"Merged comparison data saved as {excel_filename}")
-
-    return merged_df, correlation
-
+    with pd.ExcelWriter(excel_filename) as writer:
+        merged_df.to_excel(writer, sheet_name='Sales vs PO', index=False)
+        growth_info['weekly_growth'].to_excel(writer, sheet_name='Weekly Growth', index=False)
+        pd.DataFrame([volume_insights]).to_excel(writer, sheet_name='Volume Insights', index=False)
+        pd.DataFrame([prediction_info]).to_excel(writer, sheet_name='Prediction Info', index=False)
+    print(f"Merged comparison data and growth insights saved as {excel_filename}")
+    
+    return merged_df, correlation, growth_info
 
 ##############################
 # Main
@@ -2366,7 +2534,8 @@ def main():
 
     # After all ASINs
     final_output_path = output_file
-    save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data)
+    save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data, base_year=2025)
+
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
     generate_4_week_report(consolidated_forecasts)
     generate_combined_weekly_report(consolidated_forecasts)
@@ -2379,11 +2548,6 @@ def main():
     po_data.columns = po_data.columns.str.strip()  # Standardize column names
 
     print("\n--- Comparing Historical Sales with PO Data ---")
-    # Load PO data for comparison
-    po_data = pd.read_excel("po database.xlsx")
-    po_data.columns = po_data.columns.str.strip()
-
-    # Create output folder for comparison results
     comparison_output_folder = "po forecast comparison"
     os.makedirs(comparison_output_folder, exist_ok=True)
 
@@ -2397,12 +2561,19 @@ def main():
         weekly_sales.rename(columns={'Order Week': 'ds'}, inplace=True)
 
         # Call the comparison function
-        merged_result, corr = compare_historical_sales_po(asin, weekly_sales, po_data, output_folder=comparison_output_folder)
+        merged_result, correlation, growth_info = compare_historical_sales_po(
+            asin=asin,
+            sales_df=sales_subset,
+            po_df=po_data,
+            output_folder=comparison_output_folder
+        )
+
+        print(f"Growth Info for ASIN {asin}: {growth_info}")
+        print(f"Correlation for ASIN {asin}: {correlation}")
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
-
 
 ##############################
 # Run the Main Script
