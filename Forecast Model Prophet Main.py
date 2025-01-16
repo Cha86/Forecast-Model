@@ -1946,17 +1946,22 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         if asin_df.empty:
             continue
 
-        # Weekly aggregation for requested quantities
-        asin_df['Order Week'] = asin_df['Order date'].dt.to_period('W').apply(lambda r: r.start_time)
-        weekly_agg = asin_df.groupby('Order Week').agg({
-            'Requested quantity': 'sum'
-        }).reset_index()
+        asin_df['Order_Week_Period'] = asin_df['Order date'].dt.to_period('W-SUN')
+        asin_df['Order Week'] = asin_df['Order_Week_Period'].apply(lambda p: p.end_time)
 
-        # Monthly aggregation for requested quantities
-        asin_df['Order Month'] = asin_df['Order date'].dt.to_period('M').apply(lambda r: r.start_time)
-        monthly_trend = asin_df.groupby('Order Month').agg({
-            'Requested quantity': 'sum'
-        }).reset_index()
+        weekly_agg = (
+            asin_df
+            .groupby('Order Week', as_index=False)
+            .agg({'Requested quantity': 'sum'})
+        )
+
+        asin_df['Order_Month_Period'] = asin_df['Order date'].dt.to_period('M')
+        asin_df['Order Month'] = asin_df['Order_Month_Period'].apply(lambda p: p.end_time)
+        monthly_trend = (
+            asin_df
+            .groupby('Order Month', as_index=False)
+            .agg({'Requested quantity': 'sum'})
+        )
 
         # Plot weekly trend for this ASIN
         plt.figure(figsize=(10, 6))
@@ -2017,6 +2022,7 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
     Parameters:
       asin: The ASIN to analyze.
       sales_df: DataFrame containing weekly aggregated historical sales with columns ['ds', 'y'].
+                - 'ds' is assumed to be a Sunday date (week-end).
       po_df: DataFrame containing historical PO data with columns ['ASIN', 'Order date', 'Requested quantity'].
       output_folder: Directory where results will be saved.
     
@@ -2038,26 +2044,33 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
     )
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
     
-    # Filter PO data for the specified ASIN and aggregate weekly requested quantities
+    # Filter PO data for the specified ASIN and convert order dates
     asin_po = po_df[po_df['ASIN'] == asin].copy()
     asin_po['Order date'] = pd.to_datetime(asin_po['Order date'], errors='coerce')
-    asin_po['Order Week'] = asin_po['Order date'].dt.to_period('W').apply(lambda r: r.start_time)
     
-    # Aggregate PO requested quantities by week
-    weekly_po = asin_po.groupby('Order Week').agg({'Requested quantity': 'sum'}).reset_index()
-    weekly_po.rename(columns={'Order Week': 'ds', 'Requested quantity': 'PO_Requested_Qty'}, inplace=True)
+    # 1) Convert to a Sunday-based weekly period.
+    #    If your sales 'ds' is a Sunday date (e.g., 2024-10-06 for a given week),
+    #    use 'W-SUN' so the aggregator end_time is also that Sunday.
+    asin_po['OrderWeek'] = asin_po['Order date'].dt.to_period('W-SUN')
+    
+    # 2) Extract the end_time of that period => results in a Sunday date.
+    asin_po['ds'] = asin_po['OrderWeek'].apply(lambda r: r.end_time)
+    
+    # 3) Aggregate PO requested quantities by that Sunday 'ds'
+    weekly_po = asin_po.groupby('ds', as_index=False)['Requested quantity'].sum()
+    weekly_po.rename(columns={'Requested quantity': 'PO_Requested_Qty'}, inplace=True)
     weekly_po.sort_values('ds', inplace=True)
     
-    # Calculate Growth Percentage
+    # 4) Calculate week-over-week Growth %
     weekly_po['Growth%'] = weekly_po['PO_Requested_Qty'].pct_change() * 100
-    weekly_po['Growth%'] = weekly_po['Growth%'].replace([np.inf, -np.inf], np.nan).fillna(0)
+    weekly_po['Growth%'].replace([np.inf, -np.inf], np.nan, inplace=True)
+    weekly_po['Growth%'] = weekly_po['Growth%'].fillna(0)
     
     # Volume Insights
     total_po_qty = weekly_po['PO_Requested_Qty'].sum()
     average_po_qty = weekly_po['PO_Requested_Qty'].mean() if not weekly_po.empty else 0
     max_po_qty = weekly_po['PO_Requested_Qty'].max() if not weekly_po.empty else 0
     min_po_qty = weekly_po['PO_Requested_Qty'].min() if not weekly_po.empty else 0
-    
     volume_insights = {
         'Total_PO_Quantity': total_po_qty,
         'Average_PO_Quantity': average_po_qty,
@@ -2065,55 +2078,53 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
         'Min_PO_Quantity': min_po_qty
     }
     
-    # Basic Prediction for Next Week's PO Quantity using Linear Regression
+    # Basic linear model prediction for next week's PO
     predicted_next_po_qty = 0
     if len(weekly_po) > 1:
         weekly_po = weekly_po.reset_index(drop=True)
-        weekly_po['Week_Number'] = np.arange(1, len(weekly_po)+1)
-        X = weekly_po[['Week_Number']]
+        weekly_po['Week_Index'] = np.arange(1, len(weekly_po) + 1)
+        X = weekly_po[['Week_Index']]
         y = weekly_po['PO_Requested_Qty']
         model = LinearRegression()
         model.fit(X, y)
-        next_week_number = weekly_po['Week_Number'].iloc[-1] + 1
-        predicted_next_po_qty = model.predict([[next_week_number]])[0]
+        next_week_index = weekly_po['Week_Index'].iloc[-1] + 1
+        predicted_next_po_qty = model.predict([[next_week_index]])[0]
         predicted_next_po_qty = max(predicted_next_po_qty, 0)  # Ensure non-negative
-    
+
     prediction_info = {
         'Predicted_Next_Week_PO_Quantity': predicted_next_po_qty
     }
     
-    # Combine growth and prediction info
     growth_info = {
         'weekly_growth': weekly_po[['ds', 'PO_Requested_Qty', 'Growth%']],
         'volume_insights': volume_insights,
         'prediction_info': prediction_info
     }
     
-    # Merge historical sales data with weekly PO data on 'ds'
+    # 5) Merge historical sales (already weekly by Sunday in 'ds') with PO data
     merged_df = pd.merge(sales_df, weekly_po[['ds', 'PO_Requested_Qty']], on='ds', how='left')
     merged_df['PO_Requested_Qty'] = merged_df['PO_Requested_Qty'].fillna(0)
     merged_df.sort_values('ds', inplace=True)
     
-    # Plot overlay of historical sales and PO requested quantities
+    # 6) Plot overlay of historical sales vs PO requested quantity
     plt.figure(figsize=(12, 6))
     plt.plot(merged_df['ds'], merged_df['y'], marker='o', label='Historical Sales')
     plt.plot(merged_df['ds'], merged_df['PO_Requested_Qty'], marker='x', label='PO Requested Qty')
     plt.title(f'Historical Sales vs. PO Requested Quantities for ASIN {asin}')
-    plt.xlabel('Week')
+    plt.xlabel('Week Ending (Sunday)')
     plt.ylabel('Quantity')
     plt.legend()
     plt.xticks(rotation=45)
     plt.grid(True)
     plt.tight_layout()
     
-    # Save the overlay graph
     plot_filename = os.path.join(output_folder, f"{asin}_sales_vs_po.png")
     plt.savefig(plot_filename)
     plt.close()
     print(f"Overlay graph saved as {plot_filename}")
     
-    # Compute correlation between historical sales and PO requested quantities where PO data exists
-    valid_idx = merged_df['PO_Requested_Qty'] > 0
+    # 7) Correlation where both sets > 0
+    valid_idx = (merged_df['PO_Requested_Qty'] > 0) & (merged_df['y'] >= 0)
     if valid_idx.sum() > 1:
         correlation = merged_df.loc[valid_idx, ['y', 'PO_Requested_Qty']].corr().iloc[0, 1]
         print(f"Correlation between historical sales and PO requested quantity for ASIN {asin}: {correlation:.2f}")
@@ -2121,7 +2132,7 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
         correlation = None
         print(f"Not enough overlapping data to compute correlation for ASIN {asin}.")
     
-    # Save merged data and growth insights to Excel
+    # 8) Save everything to Excel
     excel_filename = os.path.join(output_folder, f"{asin}_sales_po_comparison.xlsx")
     with pd.ExcelWriter(excel_filename) as writer:
         merged_df.to_excel(writer, sheet_name='Sales vs PO', index=False)
@@ -2131,6 +2142,7 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
     print(f"Merged comparison data and growth insights saved as {excel_filename}")
     
     return merged_df, correlation, growth_info
+
 
 ##############################
 # Main
@@ -2556,14 +2568,14 @@ def main():
         print(f"\nComparing sales and PO for ASIN {asin}")
         # Filter historical sales data for the current ASIN and aggregate weekly
         sales_subset = valid_data[valid_data['asin'] == asin][['ds', 'y']].copy()
-        sales_subset['Order Week'] = sales_subset['ds'].dt.to_period('W').apply(lambda r: r.start_time)
-        weekly_sales = sales_subset.groupby('Order Week').agg({'y': 'sum'}).reset_index()
-        weekly_sales.rename(columns={'Order Week': 'ds'}, inplace=True)
+        sales_subset['Week_Period'] = sales_subset['ds'].dt.to_period('W-SUN')
+        sales_subset['ds'] = sales_subset['Week_Period'].apply(lambda r: r.end_time)
+        weekly_sales = sales_subset.groupby('ds', as_index=False)['y'].sum()
 
         # Call the comparison function
         merged_result, correlation, growth_info = compare_historical_sales_po(
             asin=asin,
-            sales_df=sales_subset,
+            sales_df=weekly_sales,
             po_df=po_data,
             output_folder=comparison_output_folder
         )
