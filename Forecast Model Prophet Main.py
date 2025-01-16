@@ -2236,73 +2236,40 @@ def main():
                 continue
 
             try:
-                # Forecast on test set to evaluate
+                # 1) Forecast on test set to evaluate performance
                 steps = len(test_sarima)
                 preds_df = sarima_forecast(
                     model, steps=steps,
                     last_date=train_sarima['ds'].iloc[-1],
                     exog=exog_test
                 )
-                preds = preds_df['MyForecast'].values
+                sarima_preds = preds_df['MyForecast'].values  # SARIMA predictions on test portion
 
-                sarima_mape = mean_absolute_percentage_error(test_sarima['y'], preds)
-                sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], preds))
+                # Evaluate on test portion
+                sarima_mape = mean_absolute_percentage_error(test_sarima['y'], sarima_preds)
+                sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], sarima_preds))
                 print(f"SARIMA Test MAPE: {sarima_mape:.4f}, RMSE: {sarima_rmse:.4f}")
 
-                # Now generate the final forecast
+                # 2) Generate final future forecast
                 last_date_full = ts_data['ds'].iloc[-1]
                 exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
                 final_forecast_df = sarima_forecast(model, steps=horizon, last_date=last_date_full, exog=exog_future)
                 if final_forecast_df.empty:
                     print(f"Forecasting failed for ASIN {asin}, skipping.")
-                    no_data_output = os.path.join(insufficient_data_folder, f"{asin}_forecast_failed.txt")
+                    no_data_output = os.path.join(insufficient_data_folder, f'{asin}_forecast_failed.txt')
                     with open(no_data_output, 'w') as f:
-                        f.write("Failed to forecast due to insufficient data.\n")
+                        f.write('Failed to forecast due to insufficient data.\n')
                     continue
 
-                # Create the comparison DataFrame
+                # 3) Create comparison DataFrame with SARIMA's final forecast
                 comparison = final_forecast_df.copy()
                 comparison['ASIN'] = asin
                 comparison['Product Title'] = product_title
+
+                # Merge historical 'y' so fallback can detect the real median
                 comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
 
-                # 1) Adjust out of range
-                comparison = adjust_forecast_if_out_of_range(
-                    comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
-                )
-
-                # 2) Historical metrics if y is available
-                if 'y' in comparison.columns:
-                    comparison_historical = comparison.dropna(subset=['y'])
-                else:
-                    print("No 'y' column found in comparison. Skipping historical metrics.")
-                    comparison_historical = pd.DataFrame()
-
-                if comparison_historical.empty:
-                    print("No overlapping historical data to calculate metrics. Skipping metrics.")
-                    metrics = {}
-                else:
-                    MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['MyForecast'])
-                    MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['MyForecast'])
-                    MSE = mean_squared_error(comparison_historical['y'], comparison_historical['MyForecast'])
-                    RMSE = sqrt(MSE)
-                    MAPE = mean_absolute_percentage_error(comparison_historical['y'], comparison_historical['MyForecast'])
-
-                    print('Mean Absolute Error (MAE): ' + str(np.round(MAE, 2)))
-                    print('Median Absolute Error (MedAE): ' + str(np.round(MEDAE, 2)))
-                    print('Mean Squared Error (MSE): ' + str(np.round(MSE, 2)))
-                    print('Root Mean Squared Error (RMSE): ' + str(np.round(RMSE, 2)))
-                    print('Mean Absolute Percentage Error (MAPE): ' + str(np.round(MAPE, 2)) + ' %')
-
-                    metrics = {
-                        "Mean Absolute Error (MAE)": np.round(MAE, 2),
-                        "Median Absolute Error (MedAE)": np.round(MEDAE, 2),
-                        "Mean Squared Error (MSE)": np.round(MSE, 2),
-                        "Root Mean Squared Error (RMSE)": np.round(RMSE, 2),
-                        "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
-                    }
-
-                # 3) Optionally blend with Amazon
+                # 4) Optionally blend with Amazon forecasts
                 if forecast_data:
                     for ftype, values in forecast_data.items():
                         horizon_values = values[:horizon] if len(values) >= horizon else values
@@ -2315,28 +2282,32 @@ def main():
                             horizon_values = np.zeros(horizon, dtype=int)
                         comparison[f'Amazon {ftype} Forecast'] = horizon_values
 
+                    # If you have multiple Amazon columns, compute an average
                     a_cols = [c for c in comparison.columns if c.startswith('Amazon ')]
                     if a_cols:
                         comparison['Amazon Mean Forecast'] = comparison[a_cols].mean(axis=1)
 
+                        # Example: Weighted blend with the final SARIMA forecast
                         MEAN_WEIGHT = 0.7
-                        P70_WEIGHT = 0.2
-                        P80_WEIGHT = 0.1
+                        P70_WEIGHT  = 0.2
+                        P80_WEIGHT  = 0.1
 
-                        # Temporary blended Amazon forecast
-                        blended_forecast = (
+                        # Build a single "Amazon forecast"
+                        blended_amz = (
                             MEAN_WEIGHT * comparison['Amazon Mean Forecast']
                             + P70_WEIGHT * comparison.get('Amazon P70 Forecast', 0)
                             + P80_WEIGHT * comparison.get('Amazon P80 Forecast', 0)
                         ).clip(lower=0)
 
-                        # Then combine with SARIMA's MyForecast
+                        # Then combine with SARIMA's MyForecast using some ratio
+                        # e.g., 30% Amazon fallback, 70% SARIMA:
+                        FALLBACK_RATIO = 0.3
                         comparison['MyForecast'] = (
-                            SARIMA_WEIGHT * blended_forecast
-                            + (1 - SARIMA_WEIGHT) * comparison['MyForecast']
+                            (1 - FALLBACK_RATIO) * comparison['MyForecast']
+                            + FALLBACK_RATIO * blended_amz
                         ).clip(lower=0)
 
-                # 4) Optionally incorporate XGBoost
+                # 5) Optionally incorporate XGBoost
                 if xgb_model is not None:
                     xgb_future_df = xgboost_forecast(
                         xgb_model, ts_data,
@@ -2344,14 +2315,21 @@ def main():
                         target='y',
                         features=xgb_features
                     )
+                    # Merge XGBoost future forecast
                     comparison = comparison.merge(xgb_future_df, on='ds', how='left', suffixes=('', '_XGB'))
                     comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
-                    # Example blend with the existing MyForecast
+                    # Example blend: 70% XGB + 30% existing MyForecast
                     comparison['MyForecast'] = (
-                        0.7 * comparison['MyForecast_XGB'] + 0.3 * comparison['MyForecast']
+                        0.7 * comparison['MyForecast_XGB']
+                        + 0.3 * comparison['MyForecast']
                     ).clip(lower=0)
 
-                # 5) Final summary stats & visualization
+                # 6) Now that we have the final MyForecast, do fallback last:
+                comparison = adjust_forecast_if_out_of_range(
+                    comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
+                )
+
+                # 7) Summaries, visuals, etc.
                 summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
                 max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
                     ts_data, comparison, horizon=horizon
@@ -2363,12 +2341,10 @@ def main():
                     asin, product_title, sufficient_data_folder
                 )
 
-                # Log fallback triggers and then finalize
+                # Log fallback triggers
                 log_fallback_triggers(comparison, asin, product_title)
 
-                comparison['ASIN'] = asin
-                comparison['Product Title'] = product_title
-
+                # 8) Save final
                 output_file_name = f'forecast_summary_{asin}.xlsx'
                 output_file_path = os.path.join(sufficient_data_folder, output_file_name)
                 with pd.ExcelWriter(output_file_path, mode='w') as writer:
@@ -2378,7 +2354,7 @@ def main():
                     comparison, summary_stats,
                     total_forecast_16, total_forecast_8, total_forecast_4,
                     max_forecast, min_forecast, max_week, min_week,
-                    output_file_path, metrics=metrics
+                    output_file_path
                 )
                 consolidated_forecasts[asin] = comparison
 
