@@ -2347,6 +2347,19 @@ def main():
                     comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
                 )
 
+                # Adjust forecast if past 8-week sales are much lower
+
+                past_8_weeks = ts_data.sort_values('ds').tail(8)
+                if not past_8_weeks.empty and 'MyForecast' in comparison.columns:
+                    past8_avg = past_8_weeks['y'].mean()
+                    forecast_mean = comparison['MyForecast'].mean()
+                    # Condition: if forecast mean is significantly higher than past 8-week average
+                    if forecast_mean > 1.5 * past8_avg:
+                        print(f"Adjusting SARIMA forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
+                        comparison['MyForecast'] = (
+                            0.8 * past8_avg + 0.2 * comparison['MyForecast']
+                        ).clip(lower=0)
+
                 # 7) Summaries, visuals, etc.
                 summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
                 max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
@@ -2442,6 +2455,18 @@ def main():
 
             # 2) If needed, log fallback triggers
             log_fallback_triggers(comparison, asin, product_title)
+
+            # Adjust forecast if past 8-week sales are much lower
+            past_8_weeks = ts_data.sort_values('ds').tail(8)
+            if not past_8_weeks.empty and 'MyForecast' in comparison.columns:
+                past8_avg = past_8_weeks['y'].mean()
+                forecast_mean = comparison['MyForecast'].mean()
+                # Condition: if forecast mean is significantly higher than past 8-week average
+                if forecast_mean > 1.5 * past8_avg:
+                    print(f"Adjusting Prophet forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
+                    comparison['MyForecast'] = (
+                        0.8 * past8_avg + 0.2 * comparison['MyForecast']
+                    ).clip(lower=0)
 
             # 3) Add historical y if missing
             if 'ds' in comparison.columns and 'y' not in comparison.columns:
