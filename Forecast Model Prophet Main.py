@@ -2372,6 +2372,7 @@ def main():
     print(f"ASINs to forecast: {asins_to_forecast}")
 
     asin_list = valid_data['asin'].unique()
+    # Filter to ensure only valid ASINs in the list to forecast
     asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
     consolidated_forecasts = {}
@@ -2404,9 +2405,11 @@ def main():
         if pd.isna(asin) or asin == '#N/A':
             print(f"Skipping invalid ASIN: {asin}")
             continue
-    
+
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
+        
+        # Load Amazon forecasts
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
             print(f"No forecast data found for ASIN {asin}, skipping.")
@@ -2415,6 +2418,7 @@ def main():
         # Prepare data
         ts_data = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
         print(f"Time series data for ASIN {asin} prepared. Dataset size: {len(ts_data)}")
+
         non_nan_count = len(ts_data.dropna())
         if non_nan_count < 2:
             print(f"Not enough data for ASIN {asin} (only {non_nan_count} data points), skipping.")
@@ -2423,14 +2427,14 @@ def main():
                 f.write("Insufficient data for training/forecasting.\n")
             continue
 
-        # Decide model type
+        # Decide model type (SARIMA or Prophet)
         model, model_type = choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=holidays)
 
-        # Train XGBoost
+        # Train XGBoost, but do NOT blend with MyForecast
         xgb_model, xgb_features, xgb_shap_values = train_xgboost(ts_data, target='y')
 
         # =========================
-        # If model_type == SARIMA
+        # SARIMA Block
         # =========================
         if model_type == "SARIMA":
             n = len(ts_data)
@@ -2450,13 +2454,13 @@ def main():
 
             try:
                 # =========================
-                # 1. Fit SARIMA Model with R/P System
+                # 1. Fit SARIMA Model (R/P system inside)
                 # =========================
                 best_sarima_model = fit_sarima_model(
                     data=ts_data,
                     holidays=holidays,
                     seasonal_period=52,
-                    asin=asin  # Pass current ASIN
+                    asin=asin  # For R/P tracking
                 )
 
                 if best_sarima_model is None:
@@ -2467,38 +2471,27 @@ def main():
                     continue
 
                 # =========================
-                # 2. Forecast on Test Set to Evaluate Performance
+                # 2. Forecast on Test Set (Evaluation)
                 # =========================
                 steps = len(test_sarima)
                 sarima_test_forecast_df = sarima_forecast(
-                    model_fit=best_sarima_model,  # Corrected keyword argument
+                    model_fit=best_sarima_model,
                     steps=steps,
                     last_date=train_sarima['ds'].iloc[-1],
                     exog=exog_test
                 )
 
-                # Extract SARIMA predictions
-                sarima_preds = sarima_test_forecast_df['MyForecast'].values  # SARIMA predictions on test portion
-
-                # =========================
-                # 3. Evaluate Forecast Performance
-                # =========================
+                # Evaluate forecast on the test portion
+                sarima_preds = sarima_test_forecast_df['MyForecast'].values
                 sarima_mape = mean_absolute_percentage_error(test_sarima['y'], sarima_preds)
                 sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], sarima_preds))
                 print(f"SARIMA Test MAPE: {sarima_mape:.4f}, RMSE: {sarima_rmse:.4f}")
 
                 # =========================
-                # 4. Update SARIMA Parameter History with Performance Metrics
-                # =========================
-                # The `update_param_history` function is already called within `fit_sarima_model`
-                # So no need to call it again here
-
-                # =========================
-                # 5. Generate Final Future Forecast
+                # 3. Generate Final Future Forecast
                 # =========================
                 last_date_full = ts_data['ds'].iloc[-1]
                 exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
-
                 final_forecast_df = sarima_forecast(
                     model_fit=best_sarima_model,
                     steps=steps,
@@ -2514,29 +2507,31 @@ def main():
                     continue
 
                 # =========================
-                # 6. Create Comparison DataFrame with SARIMA's Final Forecast
+                # 4. Create Comparison DataFrame
                 # =========================
                 comparison = final_forecast_df.copy()
                 comparison['ASIN'] = asin
                 comparison['Product Title'] = product_title
 
-                # Merge historical 'y' so fallback can detect the real median
+                # Merge historical 'y' for fallback detection
                 comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
 
                 # =========================
-                # 7. Optionally Blend with Amazon Forecasts
+                # 5. Blend with Amazon Forecasts Only
                 # =========================
                 if forecast_data:
                     for ftype, values in forecast_data.items():
                         # Load each forecast type
                         horizon_values = values[:horizon] if len(values) >= horizon else values
                         if len(horizon_values) < horizon and len(horizon_values) > 0:
-                            horizon_values = np.pad(horizon_values, (0, horizon - len(horizon_values)),
-                                                    'constant', constant_values=horizon_values[-1])
+                            horizon_values = np.pad(
+                                horizon_values, (0, horizon - len(horizon_values)),
+                                'constant', constant_values=horizon_values[-1]
+                            )
                         elif len(horizon_values) == 0:
                             horizon_values = np.zeros(horizon, dtype=int)
 
-                        # Assign forecasts based on their type
+                        # Assign to DataFrame columns
                         ftype_lower = ftype.lower()
                         if 'mean' in ftype_lower:
                             comparison['Amazon Mean Forecast'] = horizon_values
@@ -2549,19 +2544,17 @@ def main():
                         else:
                             print(f"Warning: Unrecognized forecast type '{ftype}'. Skipping.")
 
-                    # Example: Weighted blend with the final SARIMA forecast
+                    # Weighted blend with Amazon
                     MEAN_WEIGHT = 0.7
                     P70_WEIGHT  = 0.2
                     P80_WEIGHT  = 0.1
 
-                    # Build a single "Amazon forecast" by blending different Amazon forecast types
                     blended_amz = (
                         MEAN_WEIGHT * comparison['Amazon Mean Forecast']
                         + P70_WEIGHT * comparison.get('Amazon P70 Forecast', 0)
                         + P80_WEIGHT * comparison.get('Amazon P80 Forecast', 0)
                     ).clip(lower=0)
 
-                    # Combine SARIMA's MyForecast with blended Amazon forecast using a fallback ratio
                     FALLBACK_RATIO = 0.3  # 30% Amazon, 70% SARIMA
                     comparison['MyForecast'] = (
                         (1 - FALLBACK_RATIO) * comparison['MyForecast']
@@ -2569,7 +2562,7 @@ def main():
                     ).clip(lower=0)
 
                 # =========================
-                # 8. Optionally Incorporate XGBoost
+                # 6. Generate XGBoost Forecast Separately (No Blending)
                 # =========================
                 if xgb_model is not None:
                     xgb_future_df = xgboost_forecast(
@@ -2577,30 +2570,24 @@ def main():
                         forecast_steps=horizon, target='y',
                         features=xgb_features
                     )
-                    # Merge XGBoost future forecast
                     comparison = comparison.merge(xgb_future_df, on='ds', how='left', suffixes=('', '_XGB'))
                     comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
-                    # Example: 70% XGBoost + 30% existing MyForecast
-                    comparison['MyForecast'] = (
-                        0.7 * comparison['MyForecast_XGB']
-                        + 0.3 * comparison['MyForecast']
-                    ).clip(lower=0)
+                    print(f"XGBoost forecasts generated for ASIN {asin} and saved separately (not blended).")
 
                 # =========================
-                # 9. Adjust Forecasts if Out of Range
+                # 7. Adjust Forecasts if Out of Range
                 # =========================
                 comparison = adjust_forecast_if_out_of_range(
                     comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
                 )
 
                 # =========================
-                # 10. Adjust Forecast Based on Past 8-Week Sales
+                # 8. Adjust Forecast Based on Past 8-Week Sales
                 # =========================
                 past_8_weeks = ts_data.sort_values('ds').tail(8)
                 if not past_8_weeks.empty and 'MyForecast' in comparison.columns:
                     past8_avg = past_8_weeks['y'].mean()
                     forecast_mean = comparison['MyForecast'].mean()
-                    # Condition: if forecast mean is significantly higher than past 8-week average
                     if forecast_mean > 1.5 * past8_avg:
                         print(f"Adjusting SARIMA forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
                         comparison['MyForecast'] = (
@@ -2608,7 +2595,7 @@ def main():
                         ).clip(lower=0)
 
                 # =========================
-                # 11. Summaries and Visualizations
+                # 9. Summaries and Visualization
                 # =========================
                 summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
                 max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
@@ -2622,12 +2609,12 @@ def main():
                 )
 
                 # =========================
-                # 12. Log Fallback Triggers
+                # 10. Log Fallback Triggers
                 # =========================
                 log_fallback_triggers(comparison, asin, product_title)
 
                 # =========================
-                # 13. Save Final Forecast and Summary
+                # 11. Save Final Forecast and Summary
                 # =========================
                 output_file_name = f'forecast_summary_{asin}.xlsx'
                 output_file_path = os.path.join(sufficient_data_folder, output_file_name)
@@ -2645,7 +2632,7 @@ def main():
                     max_week,
                     min_week,
                     output_file_path,
-                    metrics=None  # You can pass metrics if calculated earlier
+                    metrics=None
                 )
                 consolidated_forecasts[asin] = comparison
 
@@ -2654,9 +2641,10 @@ def main():
                 continue
 
         # =========================
-        # If model_type == Prophet
+        # Prophet Block
         # =========================
         else:
+            # Check for a cached model
             cached_model_path = os.path.join("model_cache", f"{asin}_Prophet.pkl")
             if os.path.exists(cached_model_path) and is_model_up_to_date(cached_model_path, ts_data):
                 print(f"Using up-to-date cached Prophet model for ASIN {asin}.")
@@ -2678,7 +2666,7 @@ def main():
                     forecast_data=forecast_data,
                     param_grid=param_grid,
                     horizon=horizon,
-                    asin=asin  
+                    asin=asin
                 )
                 forecast, trained_prophet_model = forecast_with_custom_params(
                     ts_data=ts_data,
@@ -2705,7 +2693,7 @@ def main():
                     f.write("Final forecasting failed.\n")
                 continue
 
-            # Format comparison
+            # Format final Prophet forecast
             comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
             best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05)
             print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
@@ -2717,25 +2705,24 @@ def main():
             print(comparison[['MyForecast']].head(10))
             print("-----------------------------------------\n")
 
-            # 1) Out-of-range check
+            # Adjust out-of-range
             comparison = adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3)
 
-            # 2) If needed, log fallback triggers
+            # Log fallback triggers
             log_fallback_triggers(comparison, asin, product_title)
 
-            # Adjust forecast if past 8-week sales are much lower
+            # Adjust if past 8-week sales are much lower
             past_8_weeks = ts_data.sort_values('ds').tail(8)
             if not past_8_weeks.empty and 'MyForecast' in comparison.columns:
                 past8_avg = past_8_weeks['y'].mean()
                 forecast_mean = comparison['MyForecast'].mean()
-                # Condition: if forecast mean is significantly higher than past 8-week average
                 if forecast_mean > 1.5 * past8_avg:
                     print(f"Adjusting Prophet forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
                     comparison['MyForecast'] = (
                         0.8 * past8_avg + 0.2 * comparison['MyForecast']
                     ).clip(lower=0)
 
-            # 3) Summaries, visuals, etc.
+            # Summaries, visuals, etc.
             summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
             max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
                 ts_data, comparison, horizon=horizon
@@ -2747,14 +2734,13 @@ def main():
                 asin, product_title, sufficient_data_folder
             )
 
-            # Log fallback triggers
+            # Log fallback triggers again
             log_fallback_triggers(comparison, asin, product_title)
 
-            # 4) Add historical y if missing
+            # Ensure 'y' is in comparison for completeness
             if 'ds' in comparison.columns and 'y' not in comparison.columns:
                 comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
 
-            # Analyze Amazon buying habits
             analyze_amazon_buying_habits(comparison, holidays)
 
             if 'y' not in comparison.columns:
@@ -2789,7 +2775,7 @@ def main():
                     "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
                 }
 
-            # 5) XGBoost ensemble (optional)
+            # Generate XGBoost forecasts separately (no blending)
             if xgb_model is not None:
                 xgb_future_df = xgboost_forecast(
                     xgb_model, ts_data,
@@ -2798,19 +2784,9 @@ def main():
                 )
                 comparison = comparison.merge(xgb_future_df, on='ds', how='left', suffixes=('', '_XGB'))
                 comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
-                # Example: 50% MyForecast, 20% XGBoost, 30% Amazon Mean
-                if 'Amazon Mean Forecast' not in comparison.columns:
-                    comparison['Amazon Mean Forecast'] = 0
+                print(f"XGBoost forecasts generated for ASIN {asin} and saved separately (not blended).")
 
-                comparison['MyForecast'] = ensemble_forecast(
-                    comparison['MyForecast'],
-                    0,
-                    comparison['MyForecast_XGB'],
-                    comparison['Amazon Mean Forecast'],
-                    [0.5, 0, 0.2, 0.3]
-                ).clip(lower=0)
-
-            # 6) Final summary & chart
+            # Final summary & chart
             summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
             max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
                 ts_data, comparison, horizon=horizon
@@ -2822,7 +2798,6 @@ def main():
                 asin, product_title, sufficient_data_folder
             )
 
-            # Wrap up
             comparison['ASIN'] = asin
             comparison['Product Title'] = product_title
 
@@ -2846,7 +2821,7 @@ def main():
             )
             consolidated_forecasts[asin] = comparison
 
-    # After all ASINs are processed
+    # After processing all ASINs
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data, base_year=2025)
 
@@ -2874,7 +2849,7 @@ def main():
         sales_subset['ds'] = sales_subset['Week_Period'].apply(lambda r: r.end_time)
         weekly_sales = sales_subset.groupby('ds', as_index=False)['y'].sum()
 
-        # Call the comparison function
+        # Compare historical sales with purchase order data
         merged_result, correlation, growth_info = compare_historical_sales_po(
             asin=asin,
             sales_df=weekly_sales,
@@ -2891,8 +2866,6 @@ def main():
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
-
-
 
 ##############################
 # Run the Main Script
