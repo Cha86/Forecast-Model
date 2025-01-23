@@ -3,7 +3,7 @@ import numpy as np
 import shap
 import xgboost as xgb
 from collections import Counter
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+
 from prophet import Prophet
 from prophet.diagnostics import cross_validation, performance_metrics
 import matplotlib.pyplot as plt
@@ -12,7 +12,6 @@ import os
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from sklearn.metrics import make_scorer, mean_squared_error
 import joblib
 from sklearn.metrics import (
     mean_absolute_error,
@@ -27,7 +26,6 @@ import time
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from scipy.optimize import minimize
-import json
 
 warnings.filterwarnings("ignore")
 
@@ -44,102 +42,6 @@ prophet_feedback = {}
 sarima_feedback = {}
 xgboost_feedback = {}
 forecast_errors = {}
-
-prophet_param_scores = {}
-sarima_param_scores = {}
-
-SCORES_DIR = "param_scores"
-PROPHE_SCORES_FILE = os.path.join(SCORES_DIR, "prophet_param_scores.json")
-SARIMA_SCORES_FILE = os.path.join(SCORES_DIR, "sarima_param_scores.json")
-
-##############################
-# PARAMETER TUNING
-##############################
-
-def load_param_scores():
-    """Load parameter scores from JSON files."""
-    global prophet_param_scores, sarima_param_scores
-    os.makedirs(SCORES_DIR, exist_ok=True)
-    
-    if os.path.exists(PROPHE_SCORES_FILE):
-        with open(PROPHE_SCORES_FILE, 'r') as f:
-            prophet_param_scores = json.load(f)
-    else:
-        prophet_param_scores = {}
-    
-    if os.path.exists(SARIMA_SCORES_FILE):
-        with open(SARIMA_SCORES_FILE, 'r') as f:
-            sarima_param_scores = json.load(f)
-    else:
-        sarima_param_scores = {}
-
-def save_param_scores():
-    """Save parameter scores to JSON files."""
-    with open(PROPHE_SCORES_FILE, 'w') as f:
-        json.dump(prophet_param_scores, f, indent=4)
-    
-    with open(SARIMA_SCORES_FILE, 'w') as f:
-        json.dump(sarima_param_scores, f, indent=4)
-
-def update_param_scores(asin, model_type, params, rmse, mape, reward_weight=0.7, penalty_weight=0.3):
-    """
-    Update the parameter scores for a given ASIN and model type based on performance.
-    
-    Args:
-        asin (str): The ASIN identifier.
-        model_type (str): 'Prophet' or 'SARIMA'.
-        params (dict): The parameter set being evaluated.
-        rmse (float): The RMSE of the forecast.
-        mape (float): The MAPE of the forecast.
-        reward_weight (float): Weight for RMSE in scoring.
-        penalty_weight (float): Weight for MAPE in scoring.
-    """
-    param_tuple = tuple(sorted(params.items()))
-    score = max(0, 100 - (rmse * reward_weight + mape * penalty_weight))  # Example scoring formula
-    
-    if model_type == 'Prophet':
-        if asin not in prophet_param_scores:
-            prophet_param_scores[asin] = {}
-        if param_tuple in prophet_param_scores[asin]:
-            prophet_param_scores[asin][param_tuple] += score
-        else:
-            prophet_param_scores[asin][param_tuple] = score
-    elif model_type == 'SARIMA':
-        if asin not in sarima_param_scores:
-            sarima_param_scores[asin] = {}
-        if param_tuple in sarima_param_scores[asin]:
-            sarima_param_scores[asin][param_tuple] += score
-        else:
-            sarima_param_scores[asin][param_tuple] = score
-    else:
-        print(f"Unknown model type: {model_type}")
-
-def get_top_param_sets(asin, model_type, top_n=5):
-    """
-    Retrieve the top N parameter sets for a given ASIN and model type based on scores.
-    
-    Args:
-        asin (str): The ASIN identifier.
-        model_type (str): 'Prophet' or 'SARIMA'.
-        top_n (int): Number of top parameter sets to retrieve.
-        
-    Returns:
-        List of parameter dictionaries.
-    """
-    if model_type == 'Prophet':
-        param_scores = prophet_param_scores.get(asin, {})
-    elif model_type == 'SARIMA':
-        param_scores = sarima_param_scores.get(asin, {})
-    else:
-        print(f"Unknown model type: {model_type}")
-        return []
-    
-    # Sort parameter sets by score in descending order
-    sorted_params = sorted(param_scores.items(), key=lambda item: item[1], reverse=True)
-    
-    top_params = [dict(param) for param, score in sorted_params[:top_n]]
-    return top_params
-
 
 
 ##############################
@@ -193,23 +95,15 @@ def summarize_usage():
 # Added Functions for Caching
 ##############################
 
-def save_cached_model(model, model_type, asin, ts_data):
+def save_model(model, model_type, asin, ts_data):
     model_cache_folder = "model_cache"
     os.makedirs(model_cache_folder, exist_ok=True)
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
-    metadata_path = os.path.join(model_cache_folder, f"{asin}_{model_type}_metadata.json")
-    
-    # Save the model
+    # Store the last training date in the model object
+    model.last_train_date = ts_data['ds'].max()
     joblib.dump(model, model_path)
-    
-    # Save metadata separately
-    metadata = {
-        'last_train_date': ts_data['ds'].max().strftime('%Y-%m-%d')
-    }
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f)
 
-def load_cached_model(model_type, asin):
+def load_model(model_type, asin):
     model_cache_folder = "model_cache"
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
     exog_path = os.path.join(model_cache_folder, f"{asin}_{model_type}_exog.pkl")
@@ -222,20 +116,16 @@ def load_cached_model(model_type, asin):
         return model, None
     return None, None
 
-def is_model_up_to_date(model_type, asin, ts_data):
-    model_cache_folder = "model_cache"
-    model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
-    metadata_path = os.path.join(model_cache_folder, f"{asin}_{model_type}_metadata.json")
-
-    if not os.path.exists(model_path) or not os.path.exists(metadata_path):
+def is_model_up_to_date(cached_model_path, ts_data):
+    """Check if a cached model was trained up to the most recent data in ts_data."""
+    if not os.path.exists(cached_model_path):
         return False
-    
-    with open(metadata_path, 'r') as f:
-        metadata = json.load(f)
-    
-    last_train_date = pd.to_datetime(metadata.get('last_train_date'))
-    latest_data_date = ts_data['ds'].max()
-    return last_train_date >= latest_data_date
+    model = joblib.load(cached_model_path)
+    if hasattr(model, 'last_train_date'):
+        last_train_date = model.last_train_date
+        latest_data_date = ts_data['ds'].max()
+        return last_train_date >= latest_data_date
+    return False
 
 
 ##############################
@@ -387,19 +277,10 @@ def calculate_forecast_metrics(actual, predicted):
     
     return rmse, mape
 
-def fit_sarima_model(data, holidays, seasonal_period=52, asin='unknown'):
+def fit_sarima_model(data, holidays, seasonal_period=52):
     """
     Automatically fit a SARIMA model by iterating over a set of p, d, q, P, D, Q, m values.
-    Implements a reward and penalty system based on forecast performance.
-    
-    Args:
-        data (DataFrame): Time series data with 'y' and 'ds' columns.
-        holidays (DataFrame): Holiday data.
-        seasonal_period (int): Seasonal period for SARIMA.
-        asin (str): ASIN identifier.
-        
-    Returns:
-        SARIMAXResults: Fitted SARIMA model or None.
+    We use holiday regressors if provided.
     """
     exog = create_holiday_regressors(data, holidays)
     sample_size = len(data)
@@ -432,45 +313,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin='unknown'):
     best_model = None
     best_metrics = None
 
-    # Retrieve top parameter sets if available
-    top_params = get_top_param_sets(asin, 'SARIMA')
-    # Convert list of dicts to list of tuples for iteration
-    top_param_tuples = [tuple(sorted(p.items())) for p in top_params]
-
-    # Iterate over top parameter sets first
-    for param in top_param_tuples:
-        p = param.get('p', 0)
-        d = param.get('d', 0)
-        q = param.get('q', 0)
-        P = param.get('P', 0)
-        D = param.get('D', 0)
-        Q = param.get('Q', 0)
-        m = param.get('m', 1)
-        try:
-            model = SARIMAX(
-                data['y'],
-                order=(p, d, q),
-                seasonal_order=(P, D, Q, m),
-                exog=exog if not exog.empty else None,
-                enforce_stationarity=False,
-                enforce_invertibility=False
-            )
-            model_fit = model.fit(disp=False)
-            forecast = model_fit.fittedvalues
-            actual = data['y']
-            rmse, mape = calculate_forecast_metrics(actual, forecast)
-            update_param_scores(asin, 'SARIMA', {'p': p, 'd': d, 'q': q, 'P': P, 'D': D, 'Q': Q, 'm': m}, rmse, mape)
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_model = model_fit
-                best_metrics = {'RMSE': rmse, 'MAPE': mape,
-                                'p': p, 'd': d, 'q': q,
-                                'P': P, 'D': D, 'Q': Q, 'm': m}
-        except Exception as e:
-            print(f"Error with SARIMA params {param}: {e}")
-            continue
-
-    # Continue with remaining parameter sets
     for p in p_values:
         for d in d_values:
             for q in q_values:
@@ -479,10 +321,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin='unknown'):
                         for D in D_values:
                             for Q in Q_values:
                                 for m in m_values:
-                                    param = {'p': p, 'd': d, 'q': q, 'P': P, 'D': D, 'Q': Q, 'm': m}
-                                    param_tuple = tuple(sorted(param.items()))
-                                    if param_tuple in top_param_tuples:
-                                        continue  # Already evaluated
                                     try:
                                         model = SARIMAX(
                                             data['y'],
@@ -496,14 +334,13 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin='unknown'):
                                         forecast = model_fit.fittedvalues
                                         actual = data['y']
                                         rmse, mape = calculate_forecast_metrics(actual, forecast)
-                                        update_param_scores(asin, 'SARIMA', param, rmse, mape)
                                         if rmse < best_rmse:
                                             best_rmse = rmse
                                             best_model = model_fit
                                             best_metrics = {'RMSE': rmse, 'MAPE': mape,
                                                             'p': p, 'd': d, 'q': q,
                                                             'P': P, 'D': D, 'Q': Q, 'm': m}
-                                    except Exception as e:
+                                    except:
                                         continue
                 else:
                     try:
@@ -519,8 +356,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin='unknown'):
                         forecast = model_fit.fittedvalues
                         actual = data['y']
                         rmse, mape = calculate_forecast_metrics(actual, forecast)
-                        param = {'p': p, 'd': d, 'q': q, 'P': 0, 'D': 0, 'Q': 0, 'm': 1}
-                        update_param_scores(asin, 'SARIMA', param, rmse, mape)
                         if rmse < best_rmse:
                             best_rmse = rmse
                             best_model = model_fit
@@ -534,11 +369,10 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin='unknown'):
         print("No suitable SARIMA model found.")
         return None
     else:
-        print(f"Best SARIMA Model for ASIN {asin}: (p,d,q)=({best_metrics['p']},{best_metrics['d']},{best_metrics['q']}), "
+        print(f"Best SARIMA Model: (p,d,q)=({best_metrics['p']},{best_metrics['d']},{best_metrics['q']}), "
               f"(P,D,Q,m)=({best_metrics['P']},{best_metrics['D']},{best_metrics['Q']},{best_metrics['m']}), "
               f"RMSE={best_metrics['RMSE']:.2f}, MAPE={best_metrics['MAPE']:.2f}%")
         return best_model
-
 
 def sarima_forecast(model_fit, steps, last_date, exog=None):
     """Generate SARIMA forecasts for the specified number of steps ahead."""
@@ -573,7 +407,7 @@ def choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=None):
         print(f"Dataset size ({len(ts_data)}) is <= threshold ({threshold}). Using SARIMA.")
         sarima_model = fit_sarima_model(ts_data, holidays, seasonal_period=52)
         if sarima_model is not None:
-            save_cached_model(sarima_model, "SARIMA", ts_data['asin'].iloc[0], ts_data)
+            save_model(sarima_model, "SARIMA", ts_data['asin'].iloc[0], ts_data)
         return sarima_model, "SARIMA"
     else:
         print(f"Dataset size ({len(ts_data)}) is > threshold ({threshold}). Using Prophet.")
@@ -593,9 +427,9 @@ def clean_weekly_sales_data(data):
 def load_weekly_sales_data(file_path):
     """Load weekly sales data from Excel, ensuring required columns are present."""
     data = pd.read_excel(file_path)
-    data.columns = data.columns.str.strip().str.lower().str.replace(' ', '_')
+    data.columns = data.columns.str.strip().str.lower()
 
-    required_columns = ['product_title', 'week', 'year', 'units_sold', 'asin']
+    required_columns = ['product title', 'week', 'year', 'units_sold', 'asin']
     missing_required = [col for col in required_columns if col not in data.columns]
     if missing_required:
         raise ValueError(f"Missing required columns: {missing_required}")
@@ -621,33 +455,33 @@ def load_asins_to_forecast(file_path):
 def load_amazon_forecasts_from_folder(folder_path, asin):
     """
     Load Amazon forecast data from multiple Excel files in a folder.
-    Each file should contain columns with weeks (WXX) and an 'ASIN' column.
+    Each file should correspond to a specific forecast type (Mean, P70, etc.).
     """
     forecast_data = {}
     for file_name in os.listdir(folder_path):
         if file_name.endswith('.xlsx'):
-            # Extract forecast type without ' Forecast' suffix
+            # Extract forecast type from filename, e.g., 'Mean Forecast.xlsx' -> 'Mean'
             forecast_type = os.path.splitext(file_name)[0].replace('_', ' ').title()
             if forecast_type.endswith(' Forecast'):
                 forecast_type = forecast_type.replace(' Forecast', '')
             file_path = os.path.join(folder_path, file_name)
             df = pd.read_excel(file_path)
-
+    
             df.columns = df.columns.str.strip().str.upper()
             if 'ASIN' not in df.columns:
                 print(f"Error: Column 'ASIN' not found in {file_name}")
                 continue
-
+    
             asin_row = df[df['ASIN'].str.upper() == asin.upper()]
             if asin_row.empty:
                 print(f"Warning: ASIN {asin} not found in {file_name}")
                 continue
-
+    
             week_columns = [col for col in df.columns if 'W' in col.upper()]
             if not week_columns:
                 print(f"Warning: No week columns found in {file_name}")
                 continue
-
+    
             forecast_values = (
                 asin_row.iloc[0][week_columns]
                 .astype(str)
@@ -660,36 +494,27 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
             forecast_data[forecast_type] = forecast_values
     return forecast_data
 
-def add_lag_features(ts_data, max_lag=4):
+def add_lag_features(ts_data, lag_weeks=1):
     """Add lag features to the time series DataFrame."""
     ts_data = ts_data.copy()
-    ts_data = ts_data.sort_values('ds').reset_index(drop=True)
-    for lag in range(1, max_lag + 1):
-        ts_data[f'lag_{lag}_week'] = ts_data['y'].shift(lag)
-    ts_data.fillna(0, inplace=True) 
+    ts_data = ts_data.sort_values('ds')
+    ts_data[f'lag_{lag_weeks}_week'] = ts_data['y'].shift(lag_weeks)
+    ts_data[f'lag_{lag_weeks}_week'].fillna(0, inplace=True)
     return ts_data
 
-def prepare_time_series_with_lags(data, asin, forecast_data, max_lag=4):
+def prepare_time_series_with_lags(data, asin, lag_weeks=1):
     """
     Prepare a single ASIN's data for modeling:
-      - rename columns
-      - sort by date
-      - preprocess (missing/outliers)
-      - add multiple lag features
-      - merge Amazon forecast regressors
+    - rename columns
+    - sort by date
+    - preprocess (missing/outliers)
+    - add lag features
     """
     ts_data = data[data['asin'] == asin].copy()
     ts_data = ts_data.sort_values('ds')
     ts_data = preprocess_data(ts_data)
-    ts_data = add_lag_features(ts_data, max_lag=max_lag)
-    
-    # Merge Amazon forecast regressors
-    for forecast_type, values in forecast_data.items():
-        ts_data[f'Amazon_{forecast_type} Forecast'] = values
-    
-    ts_data.fillna(0, inplace=True)
+    ts_data = add_lag_features(ts_data, lag_weeks)
     return ts_data
-
 
 def get_shifted_holidays():
     """
@@ -717,14 +542,63 @@ def get_shifted_holidays():
 # XGBoost Training and SHAP Feature Importance
 ##############################
 
+def train_xgboost(ts_data, target='y', features=None):
+    """
+    Train an XGBoost model on the provided ts_data, using specified features for regression.
+    Returns the trained model, feature names, and SHAP values for importance.
+    """
+    if features is None:
+        # Default to just the lag feature if not specified
+        features = [col for col in ts_data.columns if col.startswith('lag_')]
+
+    # Drop rows where target or features are NaN
+    valid_data = ts_data.dropna(subset=[target] + features)
+    if valid_data.empty:
+        print("No valid data available for XGBoost training.")
+        return None, None, None
+
+    X = valid_data[features]
+    y = valid_data[target]
+
+    # Basic train/test split (can be replaced with walk-forward if needed)
+    split_idx = int(len(valid_data) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    model = xgb.XGBRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    model.fit(X_train, y_train, 
+              eval_set=[(X_test, y_test)], 
+              verbose=False)
+
+    explainer = shap.Explainer(model)
+    shap_values = explainer(X)
+
+    # Suppress the SHAP plot in code (no display in many environments)
+    shap.summary_plot(shap_values, X, show=False)
+
+    return model, features, shap_values
+
 def xgboost_forecast(model, ts_data, forecast_steps=16, target='y', features=None):
+    """
+    Generate XGBoost forecasts for the specified future steps using last known features as the basis.
+    We unify the forecast column to "MyForecast".
+    """
     if features is None:
         features = [col for col in ts_data.columns if col.startswith('lag_')]
+
     ts_data = ts_data.sort_values('ds').copy()
     last_date = ts_data['ds'].max()
 
     future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=forecast_steps, freq='W')
     forecasts = []
+
     current_data = ts_data.copy()
 
     for i in range(forecast_steps):
@@ -733,12 +607,8 @@ def xgboost_forecast(model, ts_data, forecast_steps=16, target='y', features=Non
         y_pred = max(int(round(y_pred)), 0)
 
         forecast_date = future_dates[i]
-        # Logging debug info
-        print(f"Step {i+1}: Predicting ds={forecast_date}, features={X_pred.values}, pred={y_pred}")
-
         forecasts.append((forecast_date, y_pred))
 
-        # Update lag features
         for feat in features:
             if 'lag_' in feat:
                 lag_num = int(feat.split('_')[1])
@@ -756,129 +626,7 @@ def xgboost_forecast(model, ts_data, forecast_steps=16, target='y', features=Non
     df_forecasts = pd.DataFrame(forecasts, columns=['ds', 'MyForecast'])
     return df_forecasts
 
-def train_xgboost_with_grid_search(ts_data, asin, target='y', features=None, model_folder='models', shap_folder='Shap summary'):
-    """
-    Train an XGBoost model on the provided ts_data using GridSearchCV for hyperparameter tuning.
-    Returns the best model, feature names, and SHAP values for importance.
-    Saves the trained model and SHAP summary plots to disk.
-    """
-    if features is None:
-        # Default to all lag features if not specified
-        features = [col for col in ts_data.columns if col.startswith('lag_')]
 
-    # Drop rows where target or features are NaN
-    valid_data = ts_data.dropna(subset=[target] + features)
-    if valid_data.empty:
-        print(f"No valid data available for XGBoost training for ASIN {asin}.")
-        return None, None, None
-
-    X = valid_data[features]
-    y = valid_data[target]
-
-    # TimeSeriesSplit for time-series cross-validation
-    tscv = TimeSeriesSplit(n_splits=5)
-
-    # Example parameter grid for XGBoost
-    param_grid = {
-        'n_estimators': [100, 200, 300],
-        'learning_rate': [0.01, 0.05, 0.1],
-        'max_depth': [3, 4, 5, 6],
-        'subsample': [0.7, 0.8, 0.9, 1.0],
-        'colsample_bytree': [0.7, 0.8, 0.9, 1.0],
-        'gamma': [0, 0.1, 0.2],
-        'min_child_weight': [1, 5, 10]
-    }
-
-    # Define a scoring function (using RMSE here)
-    def rmse(y_true, y_pred):
-        return np.sqrt(mean_squared_error(y_true, y_pred))
-    rmse_scorer = make_scorer(rmse, greater_is_better=False)
-
-    # Create a base XGBRegressor (no fixed params except random_state).
-    xgb_estimator = xgb.XGBRegressor(
-        objective='reg:squarederror',
-        random_state=42
-    )
-
-    # GridSearchCV setup with early stopping
-    grid_search = GridSearchCV(
-        estimator=xgb_estimator,
-        param_grid=param_grid,
-        scoring=rmse_scorer,
-        cv=tscv,
-        verbose=1,
-        n_jobs=-1
-    )
-
-    # Fit the grid-search on all data (since TimeSeriesSplit handles splits)
-    grid_search.fit(X, y)
-
-    # Extract the best estimator
-    best_model = grid_search.best_estimator_
-    print(f"ASIN {asin} - Best Params: {grid_search.best_params_}")
-    print(f"ASIN {asin} - Best Score (negative RMSE): {grid_search.best_score_}")
-
-    # Predict on the entire dataset to compute overall RMSE (optional)
-    y_pred = best_model.predict(X)
-    overall_rmse = rmse(y, y_pred)
-    print(f"ASIN {asin} - Overall RMSE on training data: {overall_rmse:.4f}")
-
-    # SHAP analysis on the best model
-    explainer = shap.TreeExplainer(best_model)
-    shap_values = explainer.shap_values(X)
-
-    save_xgb_model(best_model, asin, ts_data, model_folder=model_folder)
-
-    # Ensure the SHAP summary folder exists
-    os.makedirs(shap_folder, exist_ok=True)
-
-    # Plot SHAP summary and save to file
-    shap.summary_plot(shap_values, X, show=False)
-    # Create a safe filename by replacing or removing invalid characters
-    safe_asin = ''.join(c for c in asin if c.isalnum() or c in ('-', '_')).rstrip()
-    shap_plot_path = os.path.join(shap_folder, f'shap_summary_{safe_asin}.png')
-    plt.savefig(shap_plot_path, bbox_inches='tight')
-    plt.close()
-    print(f"SHAP summary plot saved to {shap_plot_path}")
-
-    # Save the best model
-    os.makedirs(model_folder, exist_ok=True)
-    model_path = os.path.join(model_folder, f"xgb_model_{safe_asin}.pkl")
-    joblib.dump(best_model, model_path)
-    print(f"Best XGBoost model saved to {model_path}")
-
-    return best_model, features, shap_values
-
-def save_xgb_model(model, asin, ts_data, model_folder='models'):
-    """
-    Save the trained XGBoost model to disk with a standardized naming convention.
-    """
-    os.makedirs(model_folder, exist_ok=True)
-    
-    # Create a safe filename by removing or replacing invalid characters
-    safe_asin = ''.join(c for c in asin if c.isalnum() or c in ('-', '_')).rstrip()
-    
-    # Define the file path
-    model_filename = f"xgb_model_{safe_asin}.pkl"
-    model_path = os.path.join(model_folder, model_filename)
-    
-    # Save the model using joblib
-    joblib.dump(model, model_path)
-    print(f"XGBoost model for ASIN {asin} saved to {model_path}")
-    
-    # Optionally, save the time series data for reference
-    ts_data_filename = f"xgb_ts_data_{safe_asin}.csv"
-    ts_data_path = os.path.join(model_folder, ts_data_filename)
-    ts_data.to_csv(ts_data_path, index=False)
-    print(f"Time series data for ASIN {asin} saved to {ts_data_path}")
-
-def load_xgb_model(asin, folder='models'):
-    model_path = os.path.join(folder, f"xgb_model_{asin}.pkl")
-    if os.path.exists(model_path):
-        return joblib.load(model_path)
-    else:
-        return None
-    
 ##############################
 # Ensemble Approach (SARIMA, Prophet, XGBoost)
 ##############################
@@ -1016,13 +764,6 @@ def forecast_with_custom_params(ts_data, forecast_data,
         lambda x: 0.2 if x in holidays[holidays['holiday'] == 'Prime Day']['ds'].values else 0
     )
 
-    for regressor in regressor_cols + ['prime_day']:
-        if regressor not in combined_df.columns:
-            combined_df[regressor] = 0
-
-    for regressor in regressor_cols + ['prime_day']:
-        model.add_regressor(regressor, mode='multiplicative')
-
     n = len(ts_data)
     split = int(n * 0.8)
     train_df = combined_df.iloc[:split].dropna(subset=['y']).copy()
@@ -1077,26 +818,12 @@ PARAM_COUNTER = 0
 POOR_PARAM_FOUND = False
 EARLY_STOP_THRESHOLD = 10_000
 
-def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16, asin='unknown'):
-    """
-    Optimize Prophet parameters with a reward and penalty system.
-    
-    Args:
-        ts_data (DataFrame): Time series data with 'ds' and 'y' columns.
-        forecast_data (dict): Amazon forecast data.
-        param_grid (dict): Grid of parameters to test.
-        horizon (int): Forecast horizon in weeks.
-        asin (str): ASIN identifier.
-    
-    Returns:
-        best_params (dict): Best parameter set found.
-        best_rmse_values (dict): RMSE and MAPE values for the best parameter set.
-    """
+def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16):
     global PARAM_COUNTER, POOR_PARAM_FOUND, prophet_feedback
     best_rmse = float('inf')
     best_params = None
     best_rmse_values = None
-    
+    asin = ts_data['asin'].iloc[0] if 'asin' in ts_data.columns else 'unknown'
     for changepoint_prior_scale in param_grid['changepoint_prior_scale']:
         for seasonality_prior_scale in param_grid['seasonality_prior_scale']:
             for holidays_prior_scale in param_grid['holidays_prior_scale']:
@@ -1104,89 +831,36 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16, asin
                 print(f"Testing Params #{PARAM_COUNTER}: changepoint={changepoint_prior_scale}, "
                       f"seasonality={seasonality_prior_scale}, holidays={holidays_prior_scale}")
                 try:
-                    # Refit Prophet on training data
-                    model = Prophet(
-                        yearly_seasonality=True,
-                        weekly_seasonality=True,
-                        seasonality_mode='multiplicative',
-                        changepoint_prior_scale=changepoint_prior_scale,
-                        seasonality_prior_scale=seasonality_prior_scale,
-                        holidays_prior_scale=holidays_prior_scale,
-                        growth='linear'
+                    forecast, _ = forecast_with_custom_params(
+                        ts_data, forecast_data,
+                        changepoint_prior_scale,
+                        seasonality_prior_scale,
+                        holidays_prior_scale,
+                        horizon=horizon
                     )
-                    
-                    # Add regressors dynamically
-                    regressor_cols = [f'Amazon_{ft} Forecast' for ft in forecast_data.keys()]
-                    regressor_cols += ['prime_day']
-                    
-                    # **Ensure regressors exist**
-                    for regressor in regressor_cols:
-                        if regressor not in ts_data.columns:
-                            ts_data[regressor] = 0
-
-                    for regressor in regressor_cols + ['prime_day']:
-                        if regressor in ts_data.columns:
-                            model.add_regressor(regressor, mode='multiplicative')
-                        else:
-                            print(f"Warning: Regressor '{regressor}' not found in ts_data. Skipping.")
-                    
-                    model.fit(ts_data[['ds', 'y'] + regressor_cols + ['prime_day']])
-                    
-                    # Create future dataframe for validation
-                    n = len(ts_data)
-                    split = int(n * 0.8)
-                    train_df = ts_data.iloc[:split]
-                    val_df = ts_data.iloc[split:]
-                    
-                    future = val_df[['ds']].copy()
-                    for regressor in regressor_cols + ['prime_day']:
-                        if regressor in forecast_data:
-                            future[regressor] = forecast_data[regressor][:len(future)]
-                        else:
-                            future[regressor] = 0  # Default value if regressor is missing
-                    
-                    val_forecast = model.predict(future)
-                    val_forecast['MyForecast'] = val_forecast['yhat'].round().astype(int).clip(lower=0)
-                    
-                    # Calculate RMSE and MAPE
-                    actual = val_df['y']
-                    predicted = val_forecast['MyForecast']
-                    rmse, mape = calculate_forecast_metrics(actual, predicted)
-                    
-                    # Update parameter scores
-                    update_param_scores(asin, 'Prophet', {
-                        'changepoint_prior_scale': changepoint_prior_scale,
-                        'seasonality_prior_scale': seasonality_prior_scale,
-                        'holidays_prior_scale': holidays_prior_scale
-                    }, rmse, mape)
-                    
-                    if rmse < best_rmse:
-                        best_rmse = rmse
+                    if forecast.empty or 'MyForecast' not in forecast.columns:
+                        raise ValueError("Forecast failed to generate 'MyForecast' column.")
+                    rmse_values = calculate_rmse(forecast, forecast_data, horizon)
+                    avg_rmse = np.mean(list(rmse_values.values()))
+                    if avg_rmse > EARLY_STOP_THRESHOLD:
+                        print("Early stopping triggered due to poor parameter performance.")
+                        POOR_PARAM_FOUND = True
+                        return best_params, best_rmse_values
+                    if avg_rmse < best_rmse:
+                        best_rmse = avg_rmse
                         best_params = {
                             'changepoint_prior_scale': changepoint_prior_scale,
                             'seasonality_prior_scale': seasonality_prior_scale,
                             'holidays_prior_scale': holidays_prior_scale
                         }
-                        best_rmse_values = {'RMSE': rmse, 'MAPE': mape}
-                    
+                        best_rmse_values = rmse_values
                 except Exception as e:
-                    print(f"Error during Prophet parameter testing: {e}")
+                    print(f"Error during optimization: {e}")
                     continue
-                
-                if PARAM_COUNTER >= EARLY_STOP_THRESHOLD:
-                    print("Early stopping triggered due to parameter testing limit.")
-                    POOR_PARAM_FOUND = True
-                    break
-            if POOR_PARAM_FOUND:
-                break
-        if POOR_PARAM_FOUND:
-            break
-
     if best_params is None:
         print("Optimization failed. Using default parameters.")
         best_params = {'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 1, 'holidays_prior_scale': 10}
         best_rmse_values = {}
-    
     # Record feedback for Prophet
     prophet_feedback[asin] = {
         'best_params': best_params,
@@ -1194,6 +868,7 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16, asin
         'total_tests': PARAM_COUNTER
     }
     return best_params, best_rmse_values
+
 
 def calculate_rmse(forecast, forecast_data, horizon):
     """Calculate RMSE comparing our 'MyForecast' vs. Amazon forecast streams."""
@@ -1666,10 +1341,6 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
 def save_feedback_to_excel(feedback_dict, filename):
     """
     Save feedback information from models into an Excel file.
-    
-    Args:
-        feedback_dict (dict): Dictionary containing feedback for each ASIN.
-        filename (str): Path to the output Excel file.
     """
     records = []
     for asin, info in feedback_dict.items():
@@ -1687,7 +1358,6 @@ def save_feedback_to_excel(feedback_dict, filename):
     with pd.ExcelWriter(filename, engine='openpyxl') as writer:
         df_feedback.to_excel(writer, index=False, sheet_name='Model Feedback')
     print(f"Feedback saved to {filename}")
-
 
 def generate_4_week_report(consolidated_forecasts):
     """
@@ -1839,7 +1509,7 @@ def save_consolidated_forecasts(output_path, consolidated_data, base_year=2025):
 # Additional Prophet Cross-Validation
 ##############################
 
-def cross_validate_prophet_model(ts_data, initial='365 days', period='180 days', horizon='180 days'):
+def cross_validate_prophet_model(ts_data, initial='180 days', period='90 days', horizon='90 days'):
     """Run Prophet's built-in cross-validation and performance metrics."""
     model = Prophet(
         yearly_seasonality=True,
@@ -2083,29 +1753,43 @@ def adjust_forecast_if_out_of_range(
     comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
 ):
     """
-    Adjust 'MyForecast' if it is too far from Amazon mean forecasts.
+    Adjust 'MyForecast' if it is too far from Amazon Mean Forecasts.
+
+    Parameters:
+        comparison (pd.DataFrame): DataFrame containing forecast data with columns:
+                                   ['ds', 'MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast',
+                                    'Amazon P80 Forecast', 'Amazon P90 Forecast', 'ASIN', 'Product Title', 'is_holiday_week']
+        asin (str): The ASIN being processed.
+        forecast_col_name (str): The column name for the model's forecast. Default is 'MyForecast'.
+        adjustment_threshold (float): The allowable deviation threshold (e.g., 0.3 for ±30%).
+
+    Returns:
+        pd.DataFrame: The adjusted comparison DataFrame.
     """
     global out_of_range_counter
     global out_of_range_stats
 
-    for col in ['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']:
+    # Ensure required Amazon forecast columns are present
+    required_amazon_cols = ['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']
+    for col in required_amazon_cols:
         if col not in comparison.columns:
-            print(f"Warning: Missing column {col}. Initializing it with zeros.")
+            print(f"Warning: Missing column '{col}'. Initializing it with zeros.")
             comparison[col] = 0
 
+    # Debugging: Print Amazon forecast statistics
     print("\nAmazon Forecast Statistics for Debugging:")
-    print(comparison[['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']].head())
+    print(comparison[required_amazon_cols].head())
 
-    if 'y' in comparison.columns:
-        historical_median = comparison['y'].median()
-    else:
-        historical_median = 0
+    # Determine the historical median sales if available
+    historical_median = comparison['y'].median() if 'y' in comparison.columns else 0
 
+    # Adjust threshold based on historical sales
     low_sales_threshold = 20
     local_threshold = 0.6 if historical_median < low_sales_threshold else adjustment_threshold
     if historical_median < low_sales_threshold:
-        print(f"Low historical sales detected (median: {historical_median}). Using higher threshold: {local_threshold}")
+        print(f"Low historical sales detected (median: {historical_median}). Using higher threshold: {local_threshold*100}%")
 
+    # Identify forecasts that are out of the acceptable range
     comparison['is_out_of_range'] = (
         (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
         (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
@@ -2116,20 +1800,26 @@ def adjust_forecast_if_out_of_range(
 
     if adjustment_mask.any():
         num_adjustments = adjustment_mask.sum()
-        print(f"\nAdjusting {num_adjustments} out-of-range forecasts for ASIN {asin} using Amazon data.")
+        print(f"\nAdjusting {num_adjustments} out-of-range forecasts for ASIN {asin} using Amazon Mean Forecast.")
 
+        # Update global counters for reporting
         out_of_range_counter[asin] += num_adjustments
         if asin not in out_of_range_stats:
             out_of_range_stats[asin] = {'total': 0, 'adjusted': 0}
         out_of_range_stats[asin]['total'] += total_forecasts
         out_of_range_stats[asin]['adjusted'] += num_adjustments
 
+        # Adjust 'MyForecast' to be within the ±30% range of 'Amazon Mean Forecast'
         comparison.loc[adjustment_mask, forecast_col_name] = (
-            0.7 * comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] +
-            0.2 * comparison.loc[adjustment_mask, 'Amazon P70 Forecast'] +
-            0.1 * comparison.loc[adjustment_mask, 'Amazon P80 Forecast']
-        ).clip(lower=0)
+            comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] * 
+            comparison.loc[adjustment_mask, forecast_col_name] / 
+            comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
+        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) * comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
 
+        # Ensure 'MyForecast' is non-negative after adjustment
+        comparison[forecast_col_name] = comparison[forecast_col_name].clip(lower=0)
+
+        # Recheck if any forecasts are still out of range after adjustment
         comparison['is_still_out_of_range'] = (
             (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
             (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
@@ -2142,25 +1832,33 @@ def adjust_forecast_if_out_of_range(
                 'Amazon P80 Forecast', 'Amazon P90 Forecast'
             ]])
 
-    print("\nAdjusted forecasts for out-of-range rows:")
-    print(comparison.loc[adjustment_mask, [
-        'ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast'
-    ]])
+    # Display adjusted forecasts for out-of-range rows
+    if adjustment_mask.any():
+        print("\nAdjusted forecasts for out-of-range rows:")
+        print(comparison.loc[adjustment_mask, [
+            'ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast'
+        ]])
 
+    # Final adjusted forecast data overview
     available_columns = [
-        col for col in [
-            'Week', 'ASIN', forecast_col_name,
-            'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'
-        ]
-        if col in comparison.columns
+        'Week', 'ASIN', forecast_col_name,
+        'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'
     ]
-    if available_columns:
+    existing_columns = [col for col in available_columns if col in comparison.columns]
+    if existing_columns:
         print("\nFinal adjusted forecast data:")
-        print(comparison[available_columns].head())
+        print(comparison[existing_columns].head())
     else:
         print("Warning: None of the specified columns ('Week', 'ASIN') are in the DataFrame.")
 
+    # Clean up helper columns
+    if 'is_still_out_of_range' in comparison.columns:
+        comparison.drop(columns=['is_still_out_of_range'], inplace=True)
+    if 'is_out_of_range' in comparison.columns:
+        comparison.drop(columns=['is_out_of_range'], inplace=True)
+
     return comparison
+
 
 
 def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallback_triggers.csv"):
@@ -2225,7 +1923,7 @@ def update_prophet_model_with_feedback(asin, ts_data, forecast_data, param_grid,
         best_params['holidays_prior_scale'],
         horizon=horizon
     )
-    save_cached_model(updated_model, "Prophet", asin, ts_data)
+    save_model(updated_model, "Prophet", asin, ts_data)
     print(f"Prophet model for ASIN {asin} updated.")
     return forecast, updated_model
 
@@ -2497,7 +2195,6 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
 ##############################
 
 def main():
-    load_param_scores()
     sales_file = 'weekly_sales_data.xlsx'
     forecasts_folder = 'forecasts_folder'
     asins_to_forecast_file = 'ASINs to Forecast.xlsx'
@@ -2530,10 +2227,10 @@ def main():
     # Optional cross-validation test on the first ASIN in the list
     if len(asin_list) > 0:
         test_asin = asin_list[0]
-        test_ts_data = prepare_time_series_with_lags(valid_data, test_asin, max_lag=4)
+        test_ts_data = prepare_time_series_with_lags(valid_data, test_asin, lag_weeks=1)
         if not test_ts_data.empty and len(test_ts_data.dropna()) >= 2:
             print(f"Performing cross-validation on ASIN {test_asin} Prophet model...")
-            cross_validate_prophet_model(test_ts_data, initial='365 days', period='180 days', horizon='90 days')
+            cross_validate_prophet_model(test_ts_data, initial='180 days', period='90 days', horizon='90 days')
         else:
             print(f"Not enough data for {test_asin} to perform cross-validation test.")
 
@@ -2548,12 +2245,12 @@ def main():
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
-        ts_data = prepare_time_series_with_lags(valid_data, asin, forecast_data, max_lag=4)
         if not forecast_data:
             print(f"No forecast data found for ASIN {asin}, skipping.")
             continue
 
         # Prepare data
+        ts_data = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
         non_nan_count = len(ts_data.dropna())
         if non_nan_count < 2:
             print(f"Not enough data for ASIN {asin} (only {non_nan_count} data points), skipping.")
@@ -2566,19 +2263,8 @@ def main():
         model, model_type = choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=holidays)
 
         # Train XGBoost
-        xgb_model, xgb_features, xgb_shap_values = train_xgboost_with_grid_search(ts_data, asin, target='y')
+        xgb_model, xgb_features, xgb_shap_values = train_xgboost(ts_data, target='y')
         # (xgb_model is optional; if None, code below just won't do XGBoost blending)
-        if xgb_model is not None:
-            xgb_future_df = xgboost_forecast(
-                xgb_model,
-                ts_data,
-                forecast_steps=horizon,
-                target='y',
-                features=xgb_features
-            )
-            # Proceed with using xgb_future_df
-        else:
-            print(f"Skipping XGBoost forecast for ASIN {asin} due to insufficient data.")
 
         # =========================
         # If model_type == SARIMA
@@ -2632,20 +2318,26 @@ def main():
                 # 4) Optionally blend with Amazon forecasts
                 if forecast_data:
                     for ftype, values in forecast_data.items():
+                        # Load each forecast type
                         horizon_values = values[:horizon] if len(values) >= horizon else values
                         if len(horizon_values) < horizon and len(horizon_values) > 0:
-                            horizon_values = np.pad(horizon_values,
-                                                    (0, horizon - len(horizon_values)),
-                                                    'constant',
-                                                    constant_values=horizon_values[-1])
+                            horizon_values = np.pad(horizon_values, (0, horizon - len(horizon_values)),
+                                                    'constant', constant_values=horizon_values[-1])
                         elif len(horizon_values) == 0:
                             horizon_values = np.zeros(horizon, dtype=int)
-                        comparison[f'Amazon {ftype} Forecast'] = horizon_values
-
-                    # If you have multiple Amazon columns, compute an average
-                    a_cols = [c for c in comparison.columns if c.startswith('Amazon ')]
-                    if a_cols:
-                        comparison['Amazon Mean Forecast'] = comparison[a_cols].mean(axis=1)
+                        
+                        # Assign forecasts based on their type
+                        ftype_lower = ftype.lower()
+                        if 'mean' in ftype_lower:
+                            comparison['Amazon Mean Forecast'] = horizon_values
+                        elif 'p70' in ftype_lower:
+                            comparison['Amazon P70 Forecast'] = horizon_values
+                        elif 'p80' in ftype_lower:
+                            comparison['Amazon P80 Forecast'] = horizon_values
+                        elif 'p90' in ftype_lower:
+                            comparison['Amazon P90 Forecast'] = horizon_values
+                        else:
+                            print(f"Warning: Unrecognized forecast type '{ftype}'. Skipping.")
 
                         # Example: Weighted blend with the final SARIMA forecast
                         MEAN_WEIGHT = 0.7
@@ -2669,49 +2361,20 @@ def main():
 
                 # 5) Optionally incorporate XGBoost
                 if xgb_model is not None:
-                    try:
-                        # Generate XGBoost forecast
-                        xgb_future_df = xgboost_forecast(
-                            xgb_model, 
-                            ts_data, 
-                            forecast_steps=horizon, 
-                            target='y', 
-                            features=xgb_features
-                        )
-                        
-                        # Adjust XGBoost forecast based on past 8-week sales average
-                        past_8_weeks = ts_data.sort_values('ds').tail(8)
-                        if not past_8_weeks.empty and 'MyForecast' in xgb_future_df.columns:
-                            past8_avg = past_8_weeks['y'].mean()
-                            forecast_mean = xgb_future_df['MyForecast'].mean()
-                            if forecast_mean > 1.5 * past8_avg:
-                                print(f"Adjusting XGBoost forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
-                                xgb_future_df['MyForecast'] = (
-                                    0.8 * past8_avg + 0.2 * xgb_future_df['MyForecast']
-                                ).clip(lower=0)
-
-                        # Add additional columns for context
-                        xgb_future_df['ASIN'] = asin
-                        xgb_future_df['Product Title'] = product_title
-                        xgb_future_df['Week_Start_Date'] = xgb_future_df['ds'].dt.strftime('%Y-%m-%d')
-                        xgb_future_df['Week'] = ['W' + str(i+1) for i in range(len(xgb_future_df))]
-
-                        # Select and order desired columns
-                        cols_order = ['Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Product Title']
-                        xgb_future_df = xgb_future_df[cols_order]
-
-                        # Create XG forecast directory if it doesn't exist
-                        xg_folder = "XG forecast"
-                        os.makedirs(xg_folder, exist_ok=True)
-
-                        # Save the forecast to an Excel file
-                        file_name = f'xgb_forecast_{asin}.xlsx'
-                        file_path = os.path.join(xg_folder, file_name)
-                        xgb_future_df.to_excel(file_path, index=False)
-                        print(f"XGBoost forecast for ASIN {asin} saved to {file_path}")
-                    except Exception as e:
-                        print(f"XGBoost forecast generation failed for ASIN {asin}: {e}")
-
+                    xgb_future_df = xgboost_forecast(
+                        xgb_model, ts_data,
+                        forecast_steps=horizon,
+                        target='y',
+                        features=xgb_features
+                    )
+                    # Merge XGBoost future forecast
+                    comparison = comparison.merge(xgb_future_df, on='ds', how='left', suffixes=('', '_XGB'))
+                    comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
+                    # Example blend: 70% XGB + 30% existing MyForecast
+                    comparison['MyForecast'] = (
+                        0.7 * comparison['MyForecast_XGB']
+                        + 0.3 * comparison['MyForecast']
+                    ).clip(lower=0)
 
                 # 6) Now that we have the final MyForecast, do fallback last:
                 comparison = adjust_forecast_if_out_of_range(
@@ -2793,7 +2456,7 @@ def main():
                     horizon=horizon
                 )
                 if trained_prophet_model is not None:
-                    save_cached_model(trained_prophet_model, "Prophet", asin, ts_data)
+                    save_model(trained_prophet_model, "Prophet", asin, ts_data)
                 else:
                     print("Failed to train the Prophet model.")
                     no_data_output = os.path.join(insufficient_data_folder, f"{asin}_final_forecast_failed.txt")
@@ -2879,48 +2542,24 @@ def main():
 
             # 4) XGBoost ensemble (optional)
             if xgb_model is not None:
-                try:
-                    # Generate XGBoost forecast
-                    xgb_future_df = xgboost_forecast(
-                        xgb_model, 
-                        ts_data, 
-                        forecast_steps=horizon, 
-                        target='y', 
-                        features=xgb_features
-                    )
-                    
-                    # Adjust XGBoost forecast based on past 8-week sales average
-                    past_8_weeks = ts_data.sort_values('ds').tail(8)
-                    if not past_8_weeks.empty and 'MyForecast' in xgb_future_df.columns:
-                        past8_avg = past_8_weeks['y'].mean()
-                        forecast_mean = xgb_future_df['MyForecast'].mean()
-                        if forecast_mean > 1.5 * past8_avg:
-                            print(f"Adjusting XGBoost forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
-                            xgb_future_df['MyForecast'] = (
-                                0.8 * past8_avg + 0.2 * xgb_future_df['MyForecast']
-                            ).clip(lower=0)
+                xgb_future_df = xgboost_forecast(
+                    xgb_model, ts_data,
+                    forecast_steps=horizon, target='y',
+                    features=xgb_features
+                )
+                comparison = comparison.merge(xgb_future_df, on='ds', how='left', suffixes=('', '_XGB'))
+                comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
+                # Example: 50% MyForecast, 20% XGBoost, 30% Amazon Mean
+                if 'Amazon Mean Forecast' not in comparison.columns:
+                    comparison['Amazon Mean Forecast'] = 0
 
-                    # Add additional columns for context
-                    xgb_future_df['ASIN'] = asin
-                    xgb_future_df['Product Title'] = product_title
-                    xgb_future_df['Week_Start_Date'] = xgb_future_df['ds'].dt.strftime('%Y-%m-%d')
-                    xgb_future_df['Week'] = ['W' + str(i+1) for i in range(len(xgb_future_df))]
-
-                    # Select and order desired columns
-                    cols_order = ['Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Product Title']
-                    xgb_future_df = xgb_future_df[cols_order]
-
-                    # Create XG forecast directory if it doesn't exist
-                    xg_folder = "XG forecast"
-                    os.makedirs(xg_folder, exist_ok=True)
-
-                    # Save the forecast to an Excel file
-                    file_name = f'xgb_forecast_{asin}.xlsx'
-                    file_path = os.path.join(xg_folder, file_name)
-                    xgb_future_df.to_excel(file_path, index=False)
-                    print(f"XGBoost forecast for ASIN {asin} saved to {file_path}")
-                except Exception as e:
-                    print(f"XGBoost forecast generation failed for ASIN {asin}: {e}")
+                comparison['MyForecast'] = ensemble_forecast(
+                    comparison['MyForecast'],
+                    0,
+                    comparison['MyForecast_XGB'],
+                    comparison['Amazon Mean Forecast'],
+                    [0.5, 0, 0.2, 0.3]
+                ).clip(lower=0)
 
             # 5) Final summary & chart
             summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
@@ -2996,8 +2635,6 @@ def main():
 
         print(f"Growth Info for ASIN {asin}: {growth_info}")
         print(f"Correlation for ASIN {asin}: {correlation}")
-
-    save_param_scores()
 
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
     if POOR_PARAM_FOUND:
