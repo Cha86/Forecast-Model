@@ -52,44 +52,43 @@ prophet_param_history = {} # key = (asin, (changepoint, seasonality, holiday)), 
 # Reward & Penalty Functions
 ##############################
 
-def compute_reward(rmse, mape):
+def compute_reward(mae, rmse):
     """
-    Example reward function that returns higher reward for lower RMSE/MAPE.
+    Example reward function that returns higher reward for lower RMSE/MAE.
     Feel free to adjust or add more sophisticated weighting.
     """
-    # Convert MAPE and RMSE into one “badness” measure
-    # Then invert it as a reward.
-    # We add 1.0 to avoid divide-by-zero or negative.
-    # 
-    # E.g. "badness" = RMSE + MAPE*0.1
-    # smaller is better => higher reward
-    badness = rmse + 0.1*mape  # scale MAPE down if MAPE is typically large
-    reward = 1.0 / (1.0 + badness)
+    alpha = 0.7  # Weight for MAE
+    beta = 0.3   # Weight for RMSE
+    
+    # Compute a "badness" measure
+    badness = alpha * mae + beta * rmse  # Lower is better
+    
+    # Convert badness to reward (higher is better)
+    reward = 1.0 / (1.0 + badness)  # Ensures reward is between 0 and 1
     return reward
 
-def update_param_history(history_dict, asin, param_tuple, rmse, mape):
+def update_param_history(history_dict, asin, param_tuple, rmse, mae):
     """
-    Updates the global parameter-history dictionary with a new RMSE/MAPE.
+    Updates the global parameter-history dictionary with a new RMSE/MAE.
     - We compute a new reward
     - We accumulate it into 'score'
     - We track how many times this param set was tried ('count')
     """
-    reward = compute_reward(rmse, mape)
+    reward = compute_reward(mae, rmse)
     key = (asin, param_tuple)
     if key not in history_dict:
         history_dict[key] = {
             'score': reward,
             'count': 1,
             'avg_rmse': rmse,
-            'avg_mape': mape
+            'avg_mae': mae
         }
     else:
-        # Average out the performance across multiple runs
+        # Weighted average for the RMSE, MAE, and score
         prev = history_dict[key]
         new_count = prev['count'] + 1
-        # Weighted average for the RMSE, MAPE, and score
         prev['avg_rmse'] = (prev['avg_rmse'] * prev['count'] + rmse) / new_count
-        prev['avg_mape'] = (prev['avg_mape'] * prev['count'] + mape) / new_count
+        prev['avg_mae'] = (prev['avg_mae'] * prev['count'] + mae) / new_count
         prev['score'] = (prev['score'] * prev['count'] + reward) / new_count
         prev['count'] = new_count
 
@@ -333,22 +332,21 @@ def create_holiday_regressors(ts_data, holidays):
 
 def calculate_forecast_metrics(actual, predicted):
     rmse = np.sqrt(mean_squared_error(actual, predicted))
-    
-    # Handle zero actuals by excluding them from MAPE calculation
-    mask = actual != 0
-    if np.any(mask):
-        mape = mean_absolute_error(actual[mask], predicted[mask]) * 100
-    else:
-        mape = np.nan  # or set to a default value
-    
-    return rmse, mape
+    mae = mean_absolute_error(actual, predicted)
+    return rmse, mae
 
 def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
     """
     Automatically fit a SARIMA model by iterating over a set of p, d, q, P, D, Q, m values.
     We store a reward for each param set in sarima_param_history, so next time 
     we can skip or penalize poor-performing sets for the same ASIN.
+    
+    Revisions:
+    - Replaced MAPE with MAE in 'calculate_forecast_metrics'.
+    - Updated 'update_param_history' calls to use 'mae' instead of 'mape'.
+    - Printing 'MAE' in the final best-model summary.
     """
+
     exog = create_holiday_regressors(data, holidays)
     sample_size = len(data)
     if sample_size < 52:
@@ -365,6 +363,7 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
     P_values = [0, 1]
     D_values = [0, 1]
     Q_values = [0, 1]
+
     if seasonal_period is None:
         m_values = [1]
         seasonal = False
@@ -377,7 +376,7 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
     best_metrics = None
 
     # Potential threshold to skip param sets that historically perform poorly
-    skip_threshold_score = 0.001  # if average reward < 0.001, we skip
+    skip_threshold_score = 0.001  # If average reward < 0.001, we skip
 
     for p in p_values:
         for d in d_values:
@@ -387,16 +386,15 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                         for D in D_values:
                             for Q in Q_values:
                                 for m in m_values:
-                                    # Check if we have a bad param in history
+                                    # Check if we have a historically bad param
                                     param_tuple = (p, d, q, P, D, Q, m)
                                     if asin is not None:
                                         key = (asin, param_tuple)
                                         if key in sarima_param_history:
                                             if sarima_param_history[key]['score'] < skip_threshold_score:
-                                                # This param historically performed poorly, skip
-                                                # or you could keep trying but we do it less often
+                                                # This param historically performed poorly; skip
                                                 continue
-
+                                    
                                     # Train the model
                                     try:
                                         model = SARIMAX(
@@ -408,10 +406,13 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                                             enforce_invertibility=False
                                         )
                                         model_fit = model.fit(disp=False)
+
+                                        # Evaluate the fitted values
                                         forecast = model_fit.fittedvalues
                                         actual = data['y']
-                                        rmse, mape = calculate_forecast_metrics(actual, forecast)
-
+                                        
+                                        # Calculate RMSE and MAE (no longer MAE)
+                                        rmse, mae = calculate_forecast_metrics(actual, forecast)
                                         # Update param history with reward
                                         if asin is not None:
                                             update_param_history(
@@ -419,15 +420,16 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                                                 asin, 
                                                 param_tuple, 
                                                 rmse, 
-                                                mape
+                                                mae
                                             )
 
+                                        # Update best model if this one is better
                                         if rmse < best_rmse:
                                             best_rmse = rmse
                                             best_model = model_fit
                                             best_metrics = {
                                                 'RMSE': rmse,
-                                                'MAPE': mape,
+                                                'MAE': mae,
                                                 'p': p, 'd': d, 'q': q,
                                                 'P': P, 'D': D, 'Q': Q, 'm': m
                                             }
@@ -452,17 +454,19 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                             enforce_invertibility=False
                         )
                         model_fit = model.fit(disp=False)
+
                         forecast = model_fit.fittedvalues
                         actual = data['y']
-                        rmse, mape = calculate_forecast_metrics(actual, forecast)
+                        rmse, mae = calculate_forecast_metrics(actual, forecast)
 
+                        # Update param history
                         if asin is not None:
                             update_param_history(
                                 sarima_param_history, 
                                 asin, 
                                 param_tuple, 
                                 rmse, 
-                                mape
+                                mae
                             )
 
                         if rmse < best_rmse:
@@ -470,7 +474,7 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                             best_model = model_fit
                             best_metrics = {
                                 'RMSE': rmse,
-                                'MAPE': mape,
+                                'MAE': mae,
                                 'p': p, 'd': d, 'q': q,
                                 'P': 0, 'D': 0, 'Q': 0, 'm': 1
                             }
@@ -479,15 +483,22 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
 
     if best_model is None:
         print("No suitable SARIMA model found.")
-        return None
+        return None, None
     else:
         if best_metrics is not None:
             print(
                 f"Best SARIMA Model for {asin}: (p,d,q)=({best_metrics['p']},{best_metrics['d']},{best_metrics['q']}), "
                 f"(P,D,Q,m)=({best_metrics['P']},{best_metrics['D']},{best_metrics['Q']},{best_metrics['m']}), "
-                f"RMSE={best_metrics['RMSE']:.2f}, MAPE={best_metrics['MAPE']:.2f}%"
+                f"RMSE={best_metrics['RMSE']:.2f}, MAE={best_metrics['MAE']:.2f}"
             )
-        return best_model
+        return best_model, (best_metrics['p'], 
+                            best_metrics['d'], 
+                            best_metrics['q'], 
+                            best_metrics['P'], 
+                            best_metrics['D'], 
+                            best_metrics['Q'], 
+                            best_metrics['m'])
+
 
 
 def sarima_forecast(model_fit, steps, last_date, exog=None):
@@ -521,10 +532,17 @@ def choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=None):
     """
     if len(ts_data) <= threshold:
         print(f"Dataset size ({len(ts_data)}) is <= threshold ({threshold}). Using SARIMA.")
-        sarima_model = fit_sarima_model(ts_data, holidays, seasonal_period=52)
-        if sarima_model is not None:
-            save_model(sarima_model, "SARIMA", ts_data['asin'].iloc[0], ts_data)
-        return sarima_model, "SARIMA"
+        
+        # Unpack the tuple returned by fit_sarima_model
+        fitted_model, best_params = fit_sarima_model(ts_data, holidays, seasonal_period=52)
+
+        # fitted_model will be the actual SARIMA model object
+        # best_params is the tuple of SARIMA hyperparameters
+        if fitted_model is not None:
+            save_model(fitted_model, "SARIMA", ts_data['asin'].iloc[0], ts_data)
+        
+        # Return the fitted_model, not the tuple
+        return fitted_model, "SARIMA"
     else:
         print(f"Dataset size ({len(ts_data)}) is > threshold ({threshold}). Using Prophet.")
         return None, "Prophet"
@@ -909,9 +927,9 @@ def forecast_with_custom_params(ts_data, forecast_data,
         test_eval = test_forecast[test_forecast['ds'].isin(test_actual['ds'])]
         # We'll do a rough integer rounding for this test evaluation:
         test_eval['MyForecast'] = test_eval['yhat'].round().astype(int)
-        mape = mean_absolute_error(test_actual['y'], test_eval['MyForecast'])
+        mae = mean_absolute_error(test_actual['y'], test_eval['MyForecast'])
         rmse_val = sqrt(mean_squared_error(test_actual['y'], test_eval['MyForecast']))
-        print(f"Prophet Test MAPE: {mape:.4f}, RMSE: {rmse_val:.4f}")
+        print(f"Prophet Test MAE: {mae:.4f}, RMSE: {rmse_val:.4f}")
 
     future_df = combined_df[combined_df['y'].isna()].drop(columns='y').copy()
     forecast = model.predict(future_df)
@@ -974,10 +992,7 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16, asin
                     rmse_values = calculate_rmse(forecast, forecast_data, horizon)
                     avg_rmse = np.mean(list(rmse_values.values()))
 
-                    # (Optional) Derive a single MAPE from an internal check 
-                    # or just use the average of the rmse_values
-                    # For simplicity, let's define MAPE = avg_rmse here
-                    mape_val = avg_rmse
+                    mae_val = avg_rmse
 
                     # Update the param history with reward
                     if asin is not None:
@@ -986,7 +1001,7 @@ def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16, asin
                             asin,
                             param_tuple,
                             avg_rmse,
-                            mape_val
+                            mae_val
                         )
 
                     if avg_rmse < best_rmse:
@@ -1715,10 +1730,10 @@ def analyze_amazon_buying_habits(comparison, holidays):
             if len(valid_data) == 0:
                 continue
             current_rmse = np.sqrt(mean_squared_error(comparison['y'], comparison[forecast_col]))
-            current_mape = mean_absolute_error(comparison['y'], comparison[forecast_col]) * 100
+            current_mae = mean_absolute_error(comparison['y'], comparison[forecast_col]) * 100
             errors[forecast_type] = {
                 'RMSE': current_rmse,
-                'MAPE': current_mape
+                'MAE': current_mae
             }
 
     if errors:
@@ -1777,7 +1792,7 @@ def analyze_amazon_buying_habits(comparison, holidays):
 
 def calculate_extended_metrics(actual, predicted):
     """
-    Calculate extended metrics (RMSE, wQL, MASE, MAPE, WAPE, etc.) for demonstration.
+    Calculate extended metrics (RMSE, wQL, MASE, MAE, WAPE, etc.) for demonstration.
     """
     actual = np.array(actual)
     predicted = np.array(predicted)
@@ -1901,7 +1916,7 @@ def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
                           optimized_weights[1] * prophet_preds +
                           optimized_weights[2] * xgb_preds)
         rmse = np.sqrt(mean_squared_error(actual, ensemble_preds))
-        mape = mean_absolute_error(actual, ensemble_preds)
+        mae = mean_absolute_error(actual, ensemble_preds)
         return {
             'weights': {
                 'SARIMA': optimized_weights[0],
@@ -1910,7 +1925,7 @@ def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
             },
             'metrics': {
                 'RMSE': rmse,
-                'MAPE': mape,
+                'MAE': mae,
             },
             'ensemble_preds': ensemble_preds
         }
@@ -2473,7 +2488,7 @@ def main():
                 # =========================
                 # 1. Fit SARIMA Model (R/P system inside)
                 # =========================
-                best_sarima_model = fit_sarima_model(
+                best_sarima_model, best_params = fit_sarima_model(
                     data=ts_data,
                     holidays=holidays,
                     seasonal_period=52,
@@ -2486,6 +2501,9 @@ def main():
                     with open(no_data_output, 'w') as f:
                         f.write("Model fitting failed.\n")
                     continue
+
+                # Extract SARIMA parameters for history
+                param_tuple = best_params  # Assuming best_params is a tuple like (p,d,q,P,D,Q,m)
 
                 # =========================
                 # 2. Forecast on Test Set (Evaluation)
@@ -2505,13 +2523,24 @@ def main():
                 print(f"SARIMA Test MAE: {sarima_mae:.4f}, RMSE: {sarima_rmse:.4f}")
 
                 # =========================
-                # 3. Generate Final Future Forecast
+                # 3. Update SARIMA Parameter History
+                # =========================
+                update_param_history(
+                    history_dict=sarima_param_history,
+                    asin=asin,
+                    param_tuple=param_tuple,
+                    rmse=sarima_rmse,
+                    mae=sarima_mae
+                )
+
+                # =========================
+                # 4. Generate Final Future Forecast
                 # =========================
                 last_date_full = ts_data['ds'].iloc[-1]
                 exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
                 final_forecast_df = sarima_forecast(
                     model_fit=best_sarima_model,
-                    steps=steps,
+                    steps=horizon,
                     last_date=train_sarima['ds'].iloc[-1],
                     exog=exog_future
                 )
@@ -2524,7 +2553,7 @@ def main():
                     continue
 
                 # =========================
-                # 4. Create Comparison DataFrame
+                # 5. Create Comparison DataFrame
                 # =========================
                 comparison = final_forecast_df.copy()
                 comparison['ASIN'] = asin
@@ -2534,7 +2563,7 @@ def main():
                 comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
 
                 # =========================
-                # 5. Blend with Amazon Forecasts Only
+                # 6. Blend with Amazon Forecasts Only
                 # =========================
                 if forecast_data:
                     for ftype, values in forecast_data.items():
@@ -2579,7 +2608,7 @@ def main():
                     ).clip(lower=0)
 
                 # =========================
-                # 6. Generate XGBoost Forecast Separately (No Blending)
+                # 7. Generate XGBoost Forecast Separately (No Blending)
                 # =========================
                 if xgb_model is not None:
                     xgb_future_df = xgboost_forecast(
@@ -2592,14 +2621,14 @@ def main():
                     print(f"XGBoost forecasts generated for ASIN {asin} and saved separately (not blended).")
 
                 # =========================
-                # 7. Adjust Forecasts if Out of Range
+                # 8. Adjust Forecasts if Out of Range
                 # =========================
                 comparison = adjust_forecast_if_out_of_range(
                     comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
                 )
 
                 # =========================
-                # 8. Adjust Forecast Based on Past 8-Week Sales
+                # 9. Adjust Forecast Based on Past 8-Week Sales
                 # =========================
                 past_8_weeks = ts_data.sort_values('ds').tail(8)
                 if not past_8_weeks.empty and 'MyForecast' in comparison.columns:
@@ -2612,7 +2641,7 @@ def main():
                         ).clip(lower=0)
 
                 # =========================
-                # 9. Summaries and Visualization
+                # 10. Summaries and Visualization
                 # =========================
                 summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
                 max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
@@ -2626,12 +2655,12 @@ def main():
                 )
 
                 # =========================
-                # 10. Log Fallback Triggers
+                # 11. Log Fallback Triggers
                 # =========================
                 log_fallback_triggers(comparison, asin, product_title)
 
                 # =========================
-                # 11. Save Final Forecast and Summary
+                # 12. Save Final Forecast and Summary
                 # =========================
                 output_file_name = f'forecast_summary_{asin}.xlsx'
                 output_file_path = os.path.join(sufficient_data_folder, output_file_name)
@@ -2714,7 +2743,7 @@ def main():
             comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
             best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05)
             print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
-
+    
             forecast = adjust_forecast_weights(forecast.copy(), *best_weights)
             comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
 
@@ -2739,7 +2768,9 @@ def main():
                         0.8 * past8_avg + 0.2 * comparison['MyForecast']
                     ).clip(lower=0)
 
-            # Summaries, visuals, etc.
+            # =========================
+            # Summaries and Visualization
+            # =========================
             summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
             max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
                 ts_data, comparison, horizon=horizon
@@ -2751,10 +2782,14 @@ def main():
                 asin, product_title, sufficient_data_folder
             )
 
-            # Log fallback triggers again
+            # =========================
+            # Log Fallback Triggers Again
+            # =========================
             log_fallback_triggers(comparison, asin, product_title)
 
-            # Ensure 'y' is in comparison for completeness
+            # =========================
+            # Ensure 'y' is in comparison
+            # =========================
             if 'ds' in comparison.columns and 'y' not in comparison.columns:
                 comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
 
@@ -2786,10 +2821,12 @@ def main():
                     "Mean Absolute Error (MAE)": np.round(MAE, 2),
                     "Median Absolute Error (MedAE)": np.round(MEDAE, 2),
                     "Mean Squared Error (MSE)": np.round(MSE, 2),
-                    "Root Mean Squared Error (RMSE)": np.round(RMSE, 2),
+                    "Root Mean Squared Error (RMSE)": np.round(RMSE, 2)
                 }
 
-            # Generate XGBoost forecasts separately (no blending)
+            # =========================
+            # Generate XGBoost Forecasts Separately (No Blending)
+            # =========================
             if xgb_model is not None:
                 xgb_future_df = xgboost_forecast(
                     xgb_model, ts_data,
@@ -2800,7 +2837,9 @@ def main():
                 comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
                 print(f"XGBoost forecasts generated for ASIN {asin} and saved separately (not blended).")
 
-            # Final summary & chart
+            # =========================
+            # Final Summary & Chart
+            # =========================
             summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
             max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
                 ts_data, comparison, horizon=horizon
@@ -2815,6 +2854,9 @@ def main():
             comparison['ASIN'] = asin
             comparison['Product Title'] = product_title
 
+            # =========================
+            # Save Final Forecast and Summary
+            # =========================
             output_file_name = f'forecast_summary_{asin}.xlsx'
             output_file_path = os.path.join(sufficient_data_folder, output_file_name)
             with pd.ExcelWriter(output_file_path, mode='w') as writer:
@@ -2831,11 +2873,13 @@ def main():
                 max_week,
                 min_week,
                 output_file_path,
-                metrics=metrics
+                metrics=metrics 
             )
             consolidated_forecasts[asin] = comparison
 
-    # After processing all ASINs
+    # =========================
+    # After Processing All ASINs
+    # =========================
     final_output_path = output_file
     save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data, base_year=2025)
 
@@ -2880,6 +2924,7 @@ def main():
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
+
 
 ##############################
 # Run the Main Script
