@@ -16,8 +16,9 @@ import joblib
 from sklearn.metrics import (
     mean_absolute_error,
     median_absolute_error,
-    mean_absolute_percentage_error,
-    mean_squared_error
+    mean_absolute_error,
+    mean_squared_error,
+    mean_absolute_percentage_error
 )
 from math import sqrt
 from pykalman import KalmanFilter
@@ -336,7 +337,7 @@ def calculate_forecast_metrics(actual, predicted):
     # Handle zero actuals by excluding them from MAPE calculation
     mask = actual != 0
     if np.any(mask):
-        mape = mean_absolute_percentage_error(actual[mask], predicted[mask]) * 100
+        mape = mean_absolute_error(actual[mask], predicted[mask]) * 100
     else:
         mape = np.nan  # or set to a default value
     
@@ -908,7 +909,7 @@ def forecast_with_custom_params(ts_data, forecast_data,
         test_eval = test_forecast[test_forecast['ds'].isin(test_actual['ds'])]
         # We'll do a rough integer rounding for this test evaluation:
         test_eval['MyForecast'] = test_eval['yhat'].round().astype(int)
-        mape = mean_absolute_percentage_error(test_actual['y'], test_eval['MyForecast'])
+        mape = mean_absolute_error(test_actual['y'], test_eval['MyForecast'])
         rmse_val = sqrt(mean_squared_error(test_actual['y'], test_eval['MyForecast']))
         print(f"Prophet Test MAPE: {mape:.4f}, RMSE: {rmse_val:.4f}")
 
@@ -1714,7 +1715,7 @@ def analyze_amazon_buying_habits(comparison, holidays):
             if len(valid_data) == 0:
                 continue
             current_rmse = np.sqrt(mean_squared_error(comparison['y'], comparison[forecast_col]))
-            current_mape = mean_absolute_percentage_error(comparison['y'], comparison[forecast_col]) * 100
+            current_mape = mean_absolute_error(comparison['y'], comparison[forecast_col]) * 100
             errors[forecast_type] = {
                 'RMSE': current_rmse,
                 'MAPE': current_mape
@@ -1778,32 +1779,48 @@ def calculate_extended_metrics(actual, predicted):
     """
     Calculate extended metrics (RMSE, wQL, MASE, MAPE, WAPE, etc.) for demonstration.
     """
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    
+    # 1. Root Mean Squared Error (RMSE)
     rmse = np.sqrt(mean_squared_error(actual, predicted))
-    alpha = 0.5  # for simplistic quantile approach
+    
+    # 2. Mean Absolute Error (MAE)
+    mae = mean_absolute_error(actual, predicted)
+    
+    # 3. Weighted Quantile Loss (wQL) and Average wQL
+    alpha = 0.5  # For simplistic quantile approach; adjust as needed
     residuals = actual - predicted
     quantile_loss = np.where(residuals >= 0, alpha * residuals, (1 - alpha) * -residuals)
-    wql = np.sum(np.abs(quantile_loss))  
+    wql = np.sum(np.abs(quantile_loss))
     avg_wql = np.mean(np.abs(quantile_loss)) if len(quantile_loss) > 0 else 0
-
-    mape = mean_absolute_percentage_error(actual, predicted) * 100
-
-    if np.sum(actual) != 0:
-        wape = np.sum(np.abs(actual - predicted)) / np.sum(actual) * 100
+    
+    # 4. Weighted Absolute Percentage Error (WAPE)
+    total_actual = np.sum(np.abs(actual))
+    if total_actual != 0:
+        wape = np.sum(np.abs(actual - predicted)) / total_actual * 100
     else:
         wape = 0
-
-    naive = actual.shift(1)
-    naive_error = np.abs(actual[1:] - naive[1:])
-    mae_naive = np.mean(naive_error) if len(naive_error) > 0 else 1
-    mae_model = mean_absolute_error(actual, predicted)
-    mase = mae_model / mae_naive if mae_naive != 0 else np.nan
-
+    
+    # 5. Mean Absolute Scaled Error (MASE)
+    # Naive forecast: using the previous period's actual value
+    # Shift actual by one period to get naive forecast
+    if len(actual) > 1:
+        naive_forecast = actual[:-1]
+        actual_shifted = actual[1:]
+        naive_error = np.abs(actual_shifted - naive_forecast)
+        mae_naive = np.mean(naive_error) if len(naive_error) > 0 else 1
+    else:
+        mae_naive = 1  # Avoid division by zero
+    
+    mase = mae / mae_naive if mae_naive != 0 else np.nan
+    
     return {
         "RMSE": rmse,
+        "MAE": mae,
         "wQL": wql,
         "Average wQL": avg_wql,
         "MASE": mase,
-        "MAPE": mape,
         "WAPE": wape
     }
 
@@ -1874,7 +1891,7 @@ def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
                           weights[1] * prophet_preds +
                           weights[2] * xgb_preds)
         rmse = np.sqrt(mean_squared_error(actual, ensemble_preds))
-        mape = mean_absolute_percentage_error(actual, ensemble_preds)
+        mape = mean_absolute_error(actual, ensemble_preds)
         return rmse + mape
 
     result = minimize(objective, initial_weights, constraints=constraints, bounds=bounds, method='SLSQP')
@@ -1884,7 +1901,7 @@ def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
                           optimized_weights[1] * prophet_preds +
                           optimized_weights[2] * xgb_preds)
         rmse = np.sqrt(mean_squared_error(actual, ensemble_preds))
-        mape = mean_absolute_percentage_error(actual, ensemble_preds)
+        mape = mean_absolute_error(actual, ensemble_preds)
         return {
             'weights': {
                 'SARIMA': optimized_weights[0],
@@ -2061,7 +2078,7 @@ def record_forecast_errors(asin, forecast_df, actual_df):
         print(f"No actual data available yet to compare for ASIN {asin}.")
         return
     mae = mean_absolute_error(merged['y'], merged['MyForecast'])
-    mape = mean_absolute_percentage_error(merged['y'], merged['MyForecast']) * 100
+    mape = mean_absolute_error(merged['y'], merged['MyForecast']) * 100
     forecast_errors.setdefault(asin, []).append({'mae': mae, 'mape': mape})
     print(f"Recorded forecast errors for ASIN {asin}: MAE={mae}, MAPE={mape}%")
 
@@ -2483,9 +2500,9 @@ def main():
 
                 # Evaluate forecast on the test portion
                 sarima_preds = sarima_test_forecast_df['MyForecast'].values
-                sarima_mape = mean_absolute_percentage_error(test_sarima['y'], sarima_preds)
+                sarima_mae = mean_absolute_error(test_sarima['y'], sarima_preds)
                 sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], sarima_preds))
-                print(f"SARIMA Test MAPE: {sarima_mape:.4f}, RMSE: {sarima_rmse:.4f}")
+                print(f"SARIMA Test MAE: {sarima_mae:.4f}, RMSE: {sarima_rmse:.4f}")
 
                 # =========================
                 # 3. Generate Final Future Forecast
@@ -2759,20 +2776,17 @@ def main():
                 MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['MyForecast'])
                 MSE = mean_squared_error(comparison_historical['y'], comparison_historical['MyForecast'])
                 RMSE = sqrt(MSE)
-                MAPE = mean_absolute_percentage_error(comparison_historical['y'], comparison_historical['MyForecast'])
 
                 print('Mean Absolute Error (MAE): ' + str(np.round(MAE, 2)))
                 print('Median Absolute Error (MedAE): ' + str(np.round(MEDAE, 2)))
                 print('Mean Squared Error (MSE): ' + str(np.round(MSE, 2)))
                 print('Root Mean Squared Error (RMSE): ' + str(np.round(RMSE, 2)))
-                print('Mean Absolute Percentage Error (MAPE): ' + str(np.round(MAPE, 2)) + ' %')
 
                 metrics = {
                     "Mean Absolute Error (MAE)": np.round(MAE, 2),
                     "Median Absolute Error (MedAE)": np.round(MEDAE, 2),
                     "Mean Squared Error (MSE)": np.round(MSE, 2),
                     "Root Mean Squared Error (RMSE)": np.round(RMSE, 2),
-                    "Mean Absolute Percentage Error (MAPE)": str(np.round(MAPE, 2)) + " %"
                 }
 
             # Generate XGBoost forecasts separately (no blending)
