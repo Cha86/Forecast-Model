@@ -164,9 +164,15 @@ def save_model(model, model_type, asin, ts_data):
     model_cache_folder = "model_cache"
     os.makedirs(model_cache_folder, exist_ok=True)
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
-    # Store the last training date in the model object
-    model.last_train_date = ts_data['ds'].max()
+    
+    # Safely set the attribute if the model object supports it
+    try:
+        model.last_train_date = ts_data['ds'].max()
+    except AttributeError:
+        print(f"Warning: Model object does not support 'last_train_date' attribute.")
+    
     joblib.dump(model, model_path)
+    print(f"Model saved to {model_path}")
 
 def load_model(model_type, asin):
     model_cache_folder = "model_cache"
@@ -341,12 +347,9 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
     We store a reward for each param set in sarima_param_history, so next time 
     we can skip or penalize poor-performing sets for the same ASIN.
     
-    Revisions:
-    - Replaced MAPE with MAE in 'calculate_forecast_metrics'.
-    - Updated 'update_param_history' calls to use 'mae' instead of 'mape'.
-    - Printing 'MAE' in the final best-model summary.
+    Returns:
+        (best_model, best_params)
     """
-
     exog = create_holiday_regressors(data, holidays)
     sample_size = len(data)
     if sample_size < 52:
@@ -375,8 +378,7 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
     best_model = None
     best_metrics = None
 
-    # Potential threshold to skip param sets that historically perform poorly
-    skip_threshold_score = 0.001  # If average reward < 0.001, we skip
+    skip_threshold_score = 0.001  # skip param sets with < 0.001 historical score
 
     for p in p_values:
         for d in d_values:
@@ -386,16 +388,12 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                         for D in D_values:
                             for Q in Q_values:
                                 for m in m_values:
-                                    # Check if we have a historically bad param
                                     param_tuple = (p, d, q, P, D, Q, m)
                                     if asin is not None:
                                         key = (asin, param_tuple)
                                         if key in sarima_param_history:
                                             if sarima_param_history[key]['score'] < skip_threshold_score:
-                                                # This param historically performed poorly; skip
                                                 continue
-                                    
-                                    # Train the model
                                     try:
                                         model = SARIMAX(
                                             data['y'],
@@ -406,14 +404,10 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                                             enforce_invertibility=False
                                         )
                                         model_fit = model.fit(disp=False)
-
-                                        # Evaluate the fitted values
                                         forecast = model_fit.fittedvalues
                                         actual = data['y']
-                                        
-                                        # Calculate RMSE and MAE (no longer MAE)
                                         rmse, mae = calculate_forecast_metrics(actual, forecast)
-                                        # Update param history with reward
+
                                         if asin is not None:
                                             update_param_history(
                                                 sarima_param_history, 
@@ -422,8 +416,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                                                 rmse, 
                                                 mae
                                             )
-
-                                        # Update best model if this one is better
                                         if rmse < best_rmse:
                                             best_rmse = rmse
                                             best_model = model_fit
@@ -444,7 +436,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                                 if sarima_param_history[key]['score'] < skip_threshold_score:
                                     print(f"Skipping SARIMA params {param_tuple} for ASIN {asin} due to low historical score.")
                                     continue
-
                         model = SARIMAX(
                             data['y'],
                             order=(p, d, q),
@@ -454,12 +445,10 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                             enforce_invertibility=False
                         )
                         model_fit = model.fit(disp=False)
-
                         forecast = model_fit.fittedvalues
                         actual = data['y']
                         rmse, mae = calculate_forecast_metrics(actual, forecast)
 
-                        # Update param history
                         if asin is not None:
                             update_param_history(
                                 sarima_param_history, 
@@ -468,7 +457,6 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
                                 rmse, 
                                 mae
                             )
-
                         if rmse < best_rmse:
                             best_rmse = rmse
                             best_model = model_fit
@@ -487,7 +475,8 @@ def fit_sarima_model(data, holidays, seasonal_period=52, asin=None):
     else:
         if best_metrics is not None:
             print(
-                f"Best SARIMA Model for {asin}: (p,d,q)=({best_metrics['p']},{best_metrics['d']},{best_metrics['q']}), "
+                f"Best SARIMA Model for {asin}: "
+                f"(p,d,q)=({best_metrics['p']},{best_metrics['d']},{best_metrics['q']}), "
                 f"(P,D,Q,m)=({best_metrics['P']},{best_metrics['D']},{best_metrics['Q']},{best_metrics['m']}), "
                 f"RMSE={best_metrics['RMSE']:.2f}, MAE={best_metrics['MAE']:.2f}"
             )
@@ -527,22 +516,24 @@ def generate_future_exog(holidays, steps, last_date):
 def choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=None):
     """
     Basic decision for model selection:
-    - If dataset smaller than 'threshold', use SARIMA.
-    - Else default to Prophet.
+    - If dataset size <= threshold, use SARIMA.
+    - Else, default to Prophet.
     """
+    # Extract ASIN before fitting the model
+    asin = ts_data['asin'].iloc[0]
+
     if len(ts_data) <= threshold:
         print(f"Dataset size ({len(ts_data)}) is <= threshold ({threshold}). Using SARIMA.")
         
         # Unpack the tuple returned by fit_sarima_model
-        fitted_model, best_params = fit_sarima_model(ts_data, holidays, seasonal_period=52)
+        fitted_model, best_params = fit_sarima_model(ts_data, holidays, seasonal_period=52, asin=asin)
 
-        # fitted_model will be the actual SARIMA model object
-        # best_params is the tuple of SARIMA hyperparameters
         if fitted_model is not None:
-            save_model(fitted_model, "SARIMA", ts_data['asin'].iloc[0], ts_data)
-        
-        # Return the fitted_model, not the tuple
-        return fitted_model, "SARIMA"
+            save_model(fitted_model, "SARIMA", asin, ts_data)
+            return fitted_model, "SARIMA"
+        else:
+            print(f"SARIMA model fitting failed for {asin}, skipping.")
+            return None, "SARIMA_Failed"
     else:
         print(f"Dataset size ({len(ts_data)}) is > threshold ({threshold}). Using Prophet.")
         return None, "Prophet"
@@ -2452,12 +2443,71 @@ def main():
         print(f"Time series data for ASIN {asin} prepared. Dataset size: {len(ts_data)}")
 
         non_nan_count = len(ts_data.dropna())
-        if non_nan_count < 2:
-            print(f"Not enough data for ASIN {asin} (only {non_nan_count} data points), skipping.")
-            no_data_output = os.path.join(insufficient_data_folder, f"{asin}_no_data.txt")
-            with open(no_data_output, 'w') as f:
-                f.write("Insufficient data for training/forecasting.\n")
-            continue
+        if non_nan_count < 10:
+            print(f"ASIN {asin} has only {non_nan_count} data points. "
+                f"Using fallback: 90% Amazon Mean + 10% 'naive SARIMA'.")
+
+            # Step A: Create a naive SARIMA fallback forecast
+            if not ts_data.empty:
+                last_y_value = ts_data['y'].iloc[-1]
+                last_date = ts_data['ds'].iloc[-1]
+            else:
+                last_y_value = 0
+                last_date = pd.to_datetime("today")
+
+            horizon = 16  # or whatever your default horizon is
+            future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1),
+                                        periods=horizon, freq='W')
+            fallback_sarima_vals = [last_y_value]*horizon
+
+            # Step B: Put these into a temporary DataFrame
+            fallback_df = pd.DataFrame({
+                'ds': future_dates,
+                'Fallback_SARIMA': fallback_sarima_vals
+            })
+
+            # Step C: Retrieve (or pad) Amazon Mean Forecast from `forecast_data`
+            #         Typically your code merges Amazon forecasts later,
+            #         but we can do it inline here since we’re skipping main flow.
+
+            # 1) Identify which key in forecast_data holds the "Mean" forecast
+            amz_mean_key = None
+            for ftype in forecast_data.keys():
+                if 'mean' in ftype.lower():
+                    amz_mean_key = ftype
+                    break
+
+            if amz_mean_key is None:
+                print("Warning: No 'Mean' forecast found in Amazon data. Using 0.")
+                amazon_mean = [0]*horizon
+            else:
+                raw_arr = forecast_data[amz_mean_key]
+                # If raw_arr is shorter than horizon, pad; if longer, truncate
+                if len(raw_arr) >= horizon:
+                    amazon_mean = raw_arr[:horizon]
+                else:
+                    pad_needed = horizon - len(raw_arr)
+                    amazon_mean = list(raw_arr) + [raw_arr[-1]]*pad_needed
+
+            fallback_df['Amazon Mean Forecast'] = amazon_mean
+
+            # Step D: Compute final weighted forecast (90% Amazon Mean, 10% fallback)
+            weight_amz = 0.9
+            weight_sarima = 0.1
+            final_vals = []
+            for i in range(horizon):
+                mean_val = fallback_df['Amazon Mean Forecast'].iloc[i]
+                sarima_val = fallback_df['Fallback_SARIMA'].iloc[i]
+                combined = (weight_amz * mean_val) + (weight_sarima * sarima_val)
+                final_vals.append(int(round(max(combined, 0))))
+
+            fallback_df['MyForecast'] = final_vals
+            fallback_df['ASIN'] = asin
+            fallback_df['Product Title'] = product_title
+
+            # Step E: Store in consolidated_forecasts & skip the usual pipeline
+            consolidated_forecasts[asin] = fallback_df
+            continue  # Important: skip the Prophet/SARIMA logic below
 
         # Decide model type (SARIMA or Prophet)
         model, model_type = choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=holidays)
