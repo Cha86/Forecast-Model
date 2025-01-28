@@ -1929,46 +1929,47 @@ def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
 ##############################
 
 def adjust_forecast_if_out_of_range(
-    comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
+    comparison,
+    asin,
+    forecast_col_name='MyForecast',
+    adjustment_threshold=0.3
 ):
     """
-    Adjust 'MyForecast' if it is too far from Amazon Mean Forecasts.
-
-    Parameters:
-        comparison (pd.DataFrame): DataFrame containing forecast data with columns:
-                                   ['ds', 'MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast',
-                                    'Amazon P80 Forecast', 'Amazon P90 Forecast', 'ASIN', 'Product Title', 'is_holiday_week']
-        asin (str): The ASIN being processed.
-        forecast_col_name (str): The column name for the model's forecast. Default is 'MyForecast'.
-        adjustment_threshold (float): The allowable deviation threshold (e.g., 0.3 for ±30%).
-
-    Returns:
-        pd.DataFrame: The adjusted comparison DataFrame.
+    Adjust 'MyForecast' if it is too far from Amazon Mean Forecast.
+    Uses a higher threshold (0.6) ONLY if the last 5 sales data points
+    average is lower than the overall average.
     """
     global out_of_range_counter
     global out_of_range_stats
 
-    # Ensure required Amazon forecast columns are present
-    required_amazon_cols = ['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']
-    for col in required_amazon_cols:
-        if col not in comparison.columns:
-            print(f"Warning: Missing column '{col}'. Initializing it with zeros.")
-            comparison[col] = 0
-
-    # Debugging: Print Amazon forecast statistics
+    # 1) Debugging: Print a small sample of columns
     print("\nAmazon Forecast Statistics for Debugging:")
-    print(comparison[required_amazon_cols].head())
+    required_amazon_cols = ['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']
+    existing_cols = [col for col in required_amazon_cols if col in comparison.columns]
+    print(comparison[existing_cols].head())
 
-    # Determine the historical median sales if available
-    historical_median = comparison['y'].median() if 'y' in comparison.columns else 0
+    # 2) Compute average sales of the last 5 data points
+    #    Make sure we have 'y' in the DataFrame
+    if 'y' in comparison.columns:
+        recent_5 = comparison.dropna(subset=['y']).sort_values('ds').tail(5)
+        last_5_avg = recent_5['y'].mean() if len(recent_5) > 0 else 0
+        overall_avg = comparison['y'].mean()
+    else:
+        # Fallback if there's no 'y' column at all
+        last_5_avg = 0
+        overall_avg = 0
 
-    # Adjust threshold based on historical sales
-    low_sales_threshold = 20
-    local_threshold = 0.6 if historical_median < low_sales_threshold else adjustment_threshold
-    if historical_median < low_sales_threshold:
-        print(f"Low historical sales detected (median: {historical_median}). Using higher threshold: {local_threshold*100}%")
+    # 3) Decide local threshold
+    if last_5_avg < overall_avg:
+        # Use a higher threshold if recent sales are below overall average
+        local_threshold = 0.6
+        print(f"Recent 5-wk avg {last_5_avg:.2f} is below overall avg {overall_avg:.2f}. "
+              f"Using threshold={int(local_threshold*100)}%.")
+    else:
+        local_threshold = adjustment_threshold
 
-    # Identify forecasts that are out of the acceptable range
+    # 4) Identify rows "out of range" based on local_threshold
+    #    (±30% or ±60%, depending on local_threshold)
     comparison['is_out_of_range'] = (
         (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
         (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
@@ -1977,68 +1978,62 @@ def adjust_forecast_if_out_of_range(
     adjustment_mask = comparison['is_out_of_range']
     total_forecasts = len(comparison)
 
+    # 5) If any rows are out of range, adjust the forecast
     if adjustment_mask.any():
         num_adjustments = adjustment_mask.sum()
         print(f"\nAdjusting {num_adjustments} out-of-range forecasts for ASIN {asin} using Amazon Mean Forecast.")
-
-        # Update global counters for reporting
         out_of_range_counter[asin] += num_adjustments
+
         if asin not in out_of_range_stats:
             out_of_range_stats[asin] = {'total': 0, 'adjusted': 0}
         out_of_range_stats[asin]['total'] += total_forecasts
         out_of_range_stats[asin]['adjusted'] += num_adjustments
 
-        # Adjust 'MyForecast' to be within the ±30% range of 'Amazon Mean Forecast'
+        # Adjust MyForecast to be within ±local_threshold of Amazon Mean
         comparison.loc[adjustment_mask, forecast_col_name] = (
-            comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] * 
-            comparison.loc[adjustment_mask, forecast_col_name] / 
+            comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] *
+            comparison.loc[adjustment_mask, forecast_col_name] /
             comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
-        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) * comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
+        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) * \
+          comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
 
-        # Ensure 'MyForecast' is non-negative after adjustment
+        # Ensure non-negative after adjustment
         comparison[forecast_col_name] = comparison[forecast_col_name].clip(lower=0)
 
-        # Recheck if any forecasts are still out of range after adjustment
+        # Debug: see if anything is still out of range
         comparison['is_still_out_of_range'] = (
             (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
             (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
         )
-
         if comparison['is_still_out_of_range'].any():
             print("\nRows still out of range after primary adjustment:")
-            print(comparison.loc[comparison['is_still_out_of_range'], [
-                'ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast',
-                'Amazon P80 Forecast', 'Amazon P90 Forecast'
-            ]])
+            print(
+                comparison.loc[comparison['is_still_out_of_range'],
+                               ['ds', forecast_col_name, 'Amazon Mean Forecast',
+                                'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']]
+            )
 
-    # Display adjusted forecasts for out-of-range rows
+    # Debug: show adjusted rows
     if adjustment_mask.any():
         print("\nAdjusted forecasts for out-of-range rows:")
-        print(comparison.loc[adjustment_mask, [
-            'ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast'
-        ]])
+        print(
+            comparison.loc[adjustment_mask,
+                           ['ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast']]
+        )
 
-    # Final adjusted forecast data overview
-    available_columns = [
-        'Week', 'ASIN', forecast_col_name,
-        'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'
-    ]
-    existing_columns = [col for col in available_columns if col in comparison.columns]
-    if existing_columns:
-        print("\nFinal adjusted forecast data:")
-        print(comparison[existing_columns].head())
+    # Final check or summary
+    if existing_cols:
+        print("\nFinal adjusted forecast data (head):")
+        print(comparison[['ds', forecast_col_name] + existing_cols].head())
     else:
-        print("Warning: None of the specified columns ('Week', 'ASIN') are in the DataFrame.")
+        print("Warning: No Amazon forecast columns were found. No adjustments applied.")
 
-    # Clean up helper columns
+    # Clean up temporary columns, if desired
     if 'is_still_out_of_range' in comparison.columns:
         comparison.drop(columns=['is_still_out_of_range'], inplace=True)
-    if 'is_out_of_range' in comparison.columns:
-        comparison.drop(columns=['is_out_of_range'], inplace=True)
+    comparison.drop(columns=['is_out_of_range'], inplace=True)
 
     return comparison
-
-
 
 def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallback_triggers.csv"):
     """
