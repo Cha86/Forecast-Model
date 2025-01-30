@@ -106,6 +106,14 @@ def load_param_histories():
         prophet_param_history = joblib.load("prophet_param_history.pkl")
     except:
         prophet_param_history = {}
+
+    # PATCH any missing keys (avg_mae, avg_rmse) in old records
+    for d in [sarima_param_history, prophet_param_history]:
+        for (asin, param_tuple), entry in d.items():
+            if 'avg_mae' not in entry:
+                entry['avg_mae'] = None
+            if 'avg_rmse' not in entry:
+                entry['avg_rmse'] = None
     
 
 
