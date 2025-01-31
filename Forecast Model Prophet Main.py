@@ -1426,6 +1426,12 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
     """
     Save multiple ASIN forecasts (with "MyForecast") and any missing ASIN data into one Excel file,
     each ASIN in a separate sheet.
+
+    Parameters:
+    - output_path (str): Path to save the consolidated Excel file.
+    - consolidated_data (dict): Dictionary where keys are ASINs and values are DataFrames containing forecast data.
+    - missing_asin_data (DataFrame): DataFrame containing data for ASINs that are missing.
+    - base_year (int): The base year for week label to date conversion.
     """
 
     desired_columns = [
@@ -1435,11 +1441,23 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
     ]
 
     def week_label_to_date(week_label, base_year):
-        week_num = int(week_label[1:])
-        start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num-1)
-        return start_date.strftime('%Y-%m-%d')
+        """
+        Convert a week label like 'W01' to a date string representing the week's start date.
+        """
+        try:
+            week_num = int(week_label[1:])
+            # Assuming 'W01' corresponds to the first week starting from base_year-01-01
+            start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num-1)
+            return start_date.strftime('%Y-%m-%d')
+        except Exception as e:
+            print(f"Error converting week label '{week_label}': {e}")
+            return 'Invalid Date'
 
     wb = Workbook()
+
+    # Define forecast columns to process
+    forecast_cols = ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 
+                    'Amazon P80 Forecast', 'Amazon P90 Forecast']
 
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
@@ -1454,13 +1472,25 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
                 df_for_excel['Week'] = ['W' + str(i+1).zfill(2) for i in range(len(df_for_excel))]
         elif 'Week' in df_for_excel.columns:
             df_for_excel['Week_Start_Date'] = df_for_excel['Week'].apply(lambda w: week_label_to_date(w, base_year))
+        else:
+            # If neither 'ds' nor 'Week' exists, create placeholder columns
+            df_for_excel['Week_Start_Date'] = pd.NaT
+            df_for_excel['Week'] = 'W00'
 
-        # Round forecast columns to integers
-        forecast_cols = ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 
-                         'Amazon P80 Forecast', 'Amazon P90 Forecast']
+        # **Revised Section: Handle Non-Finite Values Before Rounding and Casting**
         for col in forecast_cols:
             if col in df_for_excel.columns:
-                df_for_excel[col] = df_for_excel[col].round().astype(int)
+                # Replace inf and -inf with 0
+                df_for_excel[col] = df_for_excel[col].replace([np.inf, -np.inf], 0)
+                # Replace NaN with 0
+                df_for_excel[col] = df_for_excel[col].fillna(0)
+                # Round to nearest integer and cast to int
+                try:
+                    df_for_excel[col] = df_for_excel[col].round().astype(int)
+                except Exception as e:
+                    print(f"Error casting column '{col}' to int for ASIN {asin}: {e}")
+                    # As a fallback, replace problematic values with 0 and cast
+                    df_for_excel[col] = df_for_excel[col].round().fillna(0).astype(int)
 
         # Ensure all desired columns exist
         for col in desired_columns:
@@ -1469,11 +1499,15 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
 
         # Fill 'ASIN' and 'Product Title' if missing
         df_for_excel['ASIN'] = asin
-        df_for_excel['Product Title'] = forecast_df['Product Title'].iloc[0] if 'Product Title' in forecast_df.columns else ''
+        if 'Product Title' in forecast_df.columns and not forecast_df['Product Title'].empty:
+            df_for_excel['Product Title'] = forecast_df['Product Title'].iloc[0]
+        else:
+            df_for_excel['Product Title'] = ''
 
         # Select desired columns only
         df_for_excel = df_for_excel[desired_columns]
 
+        # Append the ASIN data to the workbook
         ws = wb.create_sheet(title=str(asin)[:31])  # Excel sheet names limited to 31 characters
 
         for r in dataframe_to_rows(df_for_excel, index=False, header=True):
@@ -1485,8 +1519,8 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
         for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(r)
 
-    # Remove default 'Sheet' if it exists
-    if 'Sheet' in wb.sheetnames:
+    # Remove default 'Sheet' if it exists and is empty
+    if 'Sheet' in wb.sheetnames and len(wb['Sheet']['A']) == 0:
         del wb['Sheet']
 
     # Add a Summary Sheet
@@ -1505,8 +1539,12 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
 
         ws_summary.append([asin, product_title, four_wk_val, eight_wk_val, sixteen_wk_val])
 
-    wb.save(output_path)
-    print(f"All forecasts saved to '{output_path}'")
+    # Save the workbook
+    try:
+        wb.save(output_path)
+        print(f"All forecasts saved to '{output_path}'")
+    except Exception as e:
+        print(f"Failed to save Excel file '{output_path}': {e}")
 
 
 def save_feedback_to_excel(feedback_dict, filename):
@@ -2116,21 +2154,11 @@ def update_prophet_model_with_feedback(asin, ts_data, forecast_data, param_grid,
 def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, output_folder="po_analysis_by_asin"):
     """
     Analyze PO orders by each ASIN to understand buying habits based on requested quantities.
-    Generates weekly and monthly requested quantity trend graphs and creates an Excel file 
-    for each ASIN with separate sheets for weekly and monthly data.
-
-    Parameters:
-      po_file: Path to the PO Excel file.
-      product_filter: Optional ASIN or product filter to limit analysis.
-      output_folder: Folder to save individual ASIN reports and graphs.
-
-    Returns:
-      A dictionary with aggregated data and paths to generated graphs for each ASIN.
+    Generates weekly and monthly requested quantity trend graphs and (OPTIONALLY) 
+    creates a SINGLE Excel file with all ASIN PO forecasts in separate sheets.
     """
-    # Load PO data
-    po_df = pd.read_excel(po_file)
 
-    # Standardize column names (strip spaces)
+    po_df = pd.read_excel(po_file)
     po_df.columns = po_df.columns.str.strip()
 
     # Convert date columns to datetime
@@ -2142,29 +2170,34 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
     if product_filter:
         po_df = po_df[po_df['ASIN'] == product_filter]
 
-    # Ensure numeric conversion for Requested quantity
+    # Ensure numeric for Requested quantity
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
 
     # Create output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
 
+    # NEW/CHANGED: We'll gather each ASIN's forecast & data into a dictionary
     results = {}
+    all_po_forecasts = {}  # store the final forecast DataFrame for each ASIN
+
     unique_asins = po_df['ASIN'].dropna().unique()
+    
     for asin in unique_asins:
         # Filter data for the current ASIN
         asin_df = po_df[po_df['ASIN'] == asin].copy()
         if asin_df.empty:
             continue
 
+        # --- Weekly Aggregation ---
         asin_df['Order_Week_Period'] = asin_df['Order date'].dt.to_period('W-SUN')
         asin_df['Order Week'] = asin_df['Order_Week_Period'].apply(lambda p: p.end_time)
-
         weekly_agg = (
             asin_df
             .groupby('Order Week', as_index=False)
             .agg({'Requested quantity': 'sum'})
         )
 
+        # --- Monthly Aggregation ---
         asin_df['Order_Month_Period'] = asin_df['Order date'].dt.to_period('M')
         asin_df['Order Month'] = asin_df['Order_Month_Period'].apply(lambda p: p.end_time)
         monthly_trend = (
@@ -2173,7 +2206,7 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
             .agg({'Requested quantity': 'sum'})
         )
 
-        # Plot weekly trend for this ASIN
+        # --- Plot Weekly Trend ---
         plt.figure(figsize=(10, 6))
         plt.plot(weekly_agg['Order Week'], weekly_agg['Requested quantity'], marker='o')
         plt.title(f'Weekly Requested Quantities for ASIN {asin}')
@@ -2186,7 +2219,7 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(weekly_chart)
         plt.close()
 
-        # Plot monthly trend for this ASIN
+        # --- Plot Monthly Trend ---
         plt.figure(figsize=(10, 6))
         plt.plot(monthly_trend['Order Month'], monthly_trend['Requested quantity'], marker='o', color='green')
         plt.title(f'Monthly Requested Quantities for ASIN {asin}')
@@ -2199,21 +2232,70 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(monthly_chart)
         plt.close()
 
-        # Save weekly and monthly data into an Excel file for this ASIN
-        excel_path = os.path.join(output_folder, f"{asin}_po_data.xlsx")
-        with pd.ExcelWriter(excel_path) as writer:
-            weekly_agg.to_excel(writer, sheet_name='Weekly Quantity', index=False)
-            monthly_trend.to_excel(writer, sheet_name='Monthly Trend', index=False)
+        # NEW/CHANGED: We'll forecast using Prophet on the weekly data
+        forecast_weeks = 8  # how many future weeks to forecast
+        weekly_for_prophet = weekly_agg.rename(
+            columns={'Order Week': 'ds', 'Requested quantity': 'y'}
+        ).dropna(subset=['ds', 'y']).sort_values('ds')
 
-        # Store results for this ASIN
+        forecast_po = pd.DataFrame()
+        if len(weekly_for_prophet) >= 2:
+            try:
+                from prophet import Prophet
+                m = Prophet(yearly_seasonality=False, weekly_seasonality=True)
+                m.fit(weekly_for_prophet[['ds','y']])
+
+                future = m.make_future_dataframe(periods=forecast_weeks, freq='W-SUN')
+                forecast_po = m.predict(future)
+                forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round().astype(int)
+            except Exception as ex:
+                print(f"Prophet forecast failed for ASIN {asin}: {ex}")
+        else:
+            print(f"Not enough weekly data to build a Prophet model for ASIN {asin} (needs >=2 rows).")
+
+        # Store forecast_po and aggregated data in memory
+        all_po_forecasts[asin] = {
+            'weekly_agg': weekly_agg,
+            'monthly_trend': monthly_trend,
+            'forecast_po': forecast_po
+        }
+
+        # We'll also store certain references in 'results'
         results[asin] = {
             'weekly_agg': weekly_agg,
             'monthly_trend': monthly_trend,
             'weekly_chart': weekly_chart,
             'monthly_chart': monthly_chart,
-            'excel_report': excel_path
+            # No per-ASIN Excel here since we'll do a single consolidated file
         }
 
+    # NEW/CHANGED: Now write a SINGLE Excel file for ALL ASIN forecasts
+    all_po_file = os.path.join(output_folder, "all_po_forecasts.xlsx")
+    with pd.ExcelWriter(all_po_file, engine='openpyxl') as writer:
+        for asin, data_dict in all_po_forecasts.items():
+            # For each ASIN, write 2 or 3 sheets: Weekly Data, Monthly Data, Forecast Data
+            weekly_agg = data_dict['weekly_agg']
+            monthly_trend = data_dict['monthly_trend']
+            forecast_po = data_dict['forecast_po']
+
+            # Sheet 1: Weekly Aggregates
+            sheet1_name = f"{asin}_Weekly"
+            weekly_agg.to_excel(writer, sheet_name=sheet1_name, index=False)
+
+            # Sheet 2: Monthly Aggregates
+            sheet2_name = f"{asin}_Monthly"
+            monthly_trend.to_excel(writer, sheet_name=sheet2_name, index=False)
+
+            # Sheet 3: Forecast 
+            # If forecast_po is empty, we skip
+            if not forecast_po.empty:
+                sheet3_name = f"{asin}_Forecast"
+                # We'll pick relevant columns
+                forecast_po[['ds','PO_Forecast','yhat','yhat_lower','yhat_upper']].to_excel(
+                    writer, sheet_name=sheet3_name, index=False
+                )
+
+    print(f"Consolidated PO forecasts saved to '{all_po_file}'")
     print(f"Generated graphs and Excel reports for {len(unique_asins)} ASINs in folder '{output_folder}'.")
     return results
 
@@ -2469,11 +2551,6 @@ def main():
                 'Fallback_SARIMA': fallback_sarima_vals
             })
 
-            # Step C: Retrieve (or pad) Amazon Mean Forecast from `forecast_data`
-            #         Typically your code merges Amazon forecasts later,
-            #         but we can do it inline here since we’re skipping main flow.
-
-            # 1) Identify which key in forecast_data holds the "Mean" forecast
             amz_mean_key = None
             for ftype in forecast_data.keys():
                 if 'mean' in ftype.lower():
@@ -2507,6 +2584,39 @@ def main():
             fallback_df['MyForecast'] = final_vals
             fallback_df['ASIN'] = asin
             fallback_df['Product Title'] = product_title
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(fallback_df['ds'], fallback_df['MyForecast'], marker='o', label='MyForecast')
+            plt.title(f'Fallback Forecast for ASIN {asin}')
+            plt.xlabel('Date')
+            plt.ylabel('Requested Quantity')
+            plt.legend()
+            plt.grid()
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            fallback_chart = os.path.join(sufficient_data_folder, f"{asin}_fallback_forecast.png")
+            plt.savefig(fallback_chart)
+            plt.close()
+            print(f"Fallback forecast chart saved to {fallback_chart}")
+
+            fallback_df.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
+            fallback_df['Week'] = ['W' + str(i+1).zfill(2) for i in range(len(fallback_df))]
+            fallback_df['is_holiday_week'] = False  # Or determine based on dates if applicable
+
+            # Select desired columns
+            desired_columns = [
+                'Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
+                'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
+                'Product Title', 'is_holiday_week'
+            ]
+
+            # Add missing Amazon forecast columns with NaN or 0
+            for col in ['Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']:
+                if col not in fallback_df.columns:
+                    fallback_df[col] = 0  # or np.nan if preferred
+
+            fallback_df = fallback_df[desired_columns]
+
 
             # Step E: Store in consolidated_forecasts & skip the usual pipeline
             consolidated_forecasts[asin] = fallback_df
