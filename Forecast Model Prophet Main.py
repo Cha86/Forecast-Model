@@ -1278,117 +1278,103 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats,
 # Excel Output
 ##############################
 
-def save_summary_to_excel(comparison,
-                          summary_stats,
-                          total_forecast_16,
-                          total_forecast_8,
-                          total_forecast_4,
-                          max_forecast,
-                          min_forecast,
-                          max_week,
-                          min_week,
-                          output_file_path,
-                          metrics=None,
-                          base_year=2025):
+def save_summary_to_excel(
+    comparison,
+    summary_stats,
+    total_forecast_16,
+    total_forecast_8,
+    total_forecast_4,
+    max_forecast,
+    min_forecast,
+    max_week,
+    min_week,
+    output_file_path,
+    metrics=None
+):
+    """
+    Save a comparison DataFrame (with columns like 'MyForecast', 'Amazon Mean Forecast', etc.)
+    and summary statistics to an Excel file.
 
-    def week_label_to_date(week_label, base_year):
-        # Convert week label like 'W01' to a start date
-        week_num = int(week_label[1:])
-        # Assume first week of base_year starts on January 1st
-        start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num-1)
-        return start_date.strftime('%Y-%m-%d')
+    Parameters:
+      comparison (pd.DataFrame): DataFrame containing forecast columns (e.g. MyForecast, Amazon Mean Forecast).
+      summary_stats (dict): Dictionary of summary stats for the data (min, max, mean, median, etc.).
+      total_forecast_16, total_forecast_8, total_forecast_4: Summation of your forecast for 16, 8, 4 weeks.
+      max_forecast, min_forecast: Max and min forecast values.
+      max_week, min_week: The corresponding weeks for the max/min forecasts.
+      output_file_path (str): File path to save this Excel file.
+      metrics (dict): Optional dictionary of metrics like MAE, RMSE, etc.
+    """
 
-    # Create Week_Start_Date based on available information
-    if 'ds' in comparison.columns:
-        comparison['ds'] = pd.to_datetime(comparison['ds'], errors='coerce')
-        comparison['Week_Start_Date'] = comparison['ds'].dt.strftime('%Y-%m-%d')
-    elif 'Week' in comparison.columns:
-        comparison['Week_Start_Date'] = comparison['Week'].apply(lambda w: week_label_to_date(w, base_year))
-
-    # Create Week label column if not present
-    if 'Week' not in comparison.columns:
-        # Sort by Week_Start_Date to ensure correct order
-        comparison = comparison.sort_values('Week_Start_Date').reset_index(drop=True)
-        comparison['Week'] = ['W' + str(i+1) for i in range(len(comparison))]
-
-    # Round forecast values to integers for specified columns
-    for col in ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast',
-                'Amazon P80 Forecast', 'Amazon P90 Forecast']:
-        if col in comparison.columns:
-            comparison[col] = comparison[col].round().astype(int)
-
-    # Drop 'ds' column if it exists since we now use Week and Week_Start_Date
-    if 'ds' in comparison.columns:
-        comparison.drop(columns=['ds'], inplace=True)
-
-    # Define the desired column order, including the new columns
-    columns_to_include = [
-        'Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
-        'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
-        'Product Title', 'is_holiday_week'
+    # List of columns that need to be cleaned before casting to int
+    forecast_cols = [
+        'MyForecast',
+        'Amazon Mean Forecast',
+        'Amazon P70 Forecast',
+        'Amazon P80 Forecast',
+        'Amazon P90 Forecast',
     ]
 
-    # Ensure all desired columns are present in the DataFrame
-    for col in columns_to_include:
-        if col not in comparison.columns:
-            comparison[col] = np.nan
+    # --- Clean each column to remove inf/NaN ---
+    for col in forecast_cols:
+        if col in comparison.columns:
+            # Replace inf/-inf with 0
+            comparison[col] = comparison[col].replace([np.inf, -np.inf], 0)
+            # Replace NaN with 0
+            comparison[col] = comparison[col].fillna(0)
+            # Round and cast to integer
+            comparison[col] = comparison[col].round().astype(int, errors='ignore')
 
-    comparison = comparison[columns_to_include]
+    # If your original code separately calls .round().astype(int) for each column, you can remove it 
+    # or wrap it in the logic above. The key is we do the replacements first.
 
-    wb = Workbook()
-    ws1 = wb.active
-    ws1.title = "Forecast Comparison"
+    # Create an Excel writer
+    with pd.ExcelWriter(output_file_path, mode='w') as writer:
+        # 1) Write the main comparison DataFrame
+        comparison.to_excel(writer, index=False, sheet_name='Forecast Data')
 
-    from openpyxl.utils.dataframe import dataframe_to_rows
-    for r in dataframe_to_rows(comparison, index=False, header=True):
-        ws1.append(r)
+        # 2) Optionally create a summary sheet with the stats
+        summary_data = {
+            "Metric": [
+                "Historical Range",
+                "Min Sales",
+                "Max Sales",
+                "Mean Sales",
+                "Median Sales",
+                "Std Dev Sales",
+                "Total Historical Sales",
+                "Total Forecast (16 Weeks)",
+                "Total Forecast (8 Weeks)",
+                "Total Forecast (4 Weeks)",
+                "Max Forecast",
+                "Max Forecast Week",
+                "Min Forecast",
+                "Min Forecast Week"
+            ],
+            "Value": [
+                f"{summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}",
+                f"{summary_stats['min']:.0f}",
+                f"{summary_stats['max']:.0f}",
+                f"{summary_stats['mean']:.0f}",
+                f"{summary_stats['median']:.0f}",
+                f"{summary_stats['std_dev']:.0f}",
+                f"{summary_stats['total_sales']:.0f} units",
+                f"{total_forecast_16:.0f}",
+                f"{total_forecast_8:.0f}",
+                f"{total_forecast_4:.0f}",
+                f"{max_forecast:.0f}",
+                f"{max_week.strftime('%Y-%m-%d') if max_week else 'N/A'}",
+                f"{min_forecast:.0f}",
+                f"{min_week.strftime('%Y-%m-%d') if min_week else 'N/A'}"
+            ]
+        }
+        if metrics is not None:
+            for k, v in metrics.items():
+                summary_data["Metric"].append(k)
+                summary_data["Value"].append(str(v))
 
-    # Prepare summary sheet as before
-    ws2 = wb.create_sheet(title="Summary")
-    summary_data = {
-        "Metric": [
-            "Historical Range",
-            "Min Sales",
-            "Max Sales",
-            "Mean Sales",
-            "Median Sales",
-            "Std Dev Sales",
-            "Total Historical Sales",
-            "Total Forecast (16 Weeks)",
-            "Total Forecast (8 Weeks)",
-            "Total Forecast (4 Weeks)",
-            "Max Forecast",
-            "Max Forecast Week",
-            "Min Forecast",
-            "Min Forecast Week"
-        ],
-        "Value": [
-            f"{summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}",
-            f"{summary_stats['min']:.0f}",
-            f"{summary_stats['max']:.0f}",
-            f"{summary_stats['mean']:.0f}",
-            f"{summary_stats['median']:.0f}",
-            f"{summary_stats['std_dev']:.0f}",
-            f"{summary_stats['total_sales']:.0f} units",
-            f"{total_forecast_16:.0f}",
-            f"{total_forecast_8:.0f}",
-            f"{total_forecast_4:.0f}",
-            f"{max_forecast:.0f}",
-            f"{max_week.strftime('%Y-%m-%d') if max_week else 'N/A'}",
-            f"{min_forecast:.0f}",
-            f"{min_week.strftime('%Y-%m-%d') if min_week else 'N/A'}"
-        ]
-    }
-    if metrics is not None:
-        for k, v in metrics.items():
-            summary_data["Metric"].append(k)
-            summary_data["Value"].append(str(v))
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, index=False, sheet_name='Summary')
 
-    summary_df = pd.DataFrame(summary_data)
-    for r in dataframe_to_rows(summary_df, index=False, header=True):
-        ws2.append(r)
-
-    wb.save(output_file_path)
     print(f"Comparison and summary saved to '{output_file_path}'")
 
 
@@ -1446,8 +1432,8 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
         """
         try:
             week_num = int(week_label[1:])
-            # Assuming 'W01' corresponds to the first week starting from base_year-01-01
-            start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num-1)
+            # 'W01' => first week of the year, i.e. base_year-01-01 + 0 weeks
+            start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num - 1)
             return start_date.strftime('%Y-%m-%d')
         except Exception as e:
             print(f"Error converting week label '{week_label}': {e}")
@@ -1455,91 +1441,90 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
 
     wb = Workbook()
 
-    # Define forecast columns to process
-    forecast_cols = ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast', 
-                    'Amazon P80 Forecast', 'Amazon P90 Forecast']
+    # Columns we need to ensure are finite before casting to int
+    forecast_cols = ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast',
+                     'Amazon P80 Forecast', 'Amazon P90 Forecast']
 
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
 
-        # Calculate Week_Start_Date
+        # Convert ds -> Week_Start_Date if ds column exists
         if 'ds' in df_for_excel.columns:
             df_for_excel['ds'] = pd.to_datetime(df_for_excel['ds'], errors='coerce')
             df_for_excel['Week_Start_Date'] = df_for_excel['ds'].dt.strftime('%Y-%m-%d')
-            # Create Week labels if missing
+            # If 'Week' is missing, create it
             if 'Week' not in df_for_excel.columns:
                 df_for_excel = df_for_excel.sort_values('Week_Start_Date').reset_index(drop=True)
-                df_for_excel['Week'] = ['W' + str(i+1).zfill(2) for i in range(len(df_for_excel))]
+                df_for_excel['Week'] = ['W' + str(i + 1).zfill(2) for i in range(len(df_for_excel))]
         elif 'Week' in df_for_excel.columns:
+            # Convert from Week -> Week_Start_Date
             df_for_excel['Week_Start_Date'] = df_for_excel['Week'].apply(lambda w: week_label_to_date(w, base_year))
         else:
-            # If neither 'ds' nor 'Week' exists, create placeholder columns
+            # If neither 'ds' nor 'Week', default them
             df_for_excel['Week_Start_Date'] = pd.NaT
             df_for_excel['Week'] = 'W00'
 
-        # **Revised Section: Handle Non-Finite Values Before Rounding and Casting**
+        # --- Ensure forecast columns have no inf/NaN before rounding & casting ---
         for col in forecast_cols:
             if col in df_for_excel.columns:
-                # Replace inf and -inf with 0
+                # Replace infinities with 0
                 df_for_excel[col] = df_for_excel[col].replace([np.inf, -np.inf], 0)
-                # Replace NaN with 0
+                # Replace NaNs with 0
                 df_for_excel[col] = df_for_excel[col].fillna(0)
-                # Round to nearest integer and cast to int
-                try:
-                    df_for_excel[col] = df_for_excel[col].round().astype(int)
-                except Exception as e:
-                    print(f"Error casting column '{col}' to int for ASIN {asin}: {e}")
-                    # As a fallback, replace problematic values with 0 and cast
-                    df_for_excel[col] = df_for_excel[col].round().fillna(0).astype(int)
+                # Now round and cast to int
+                df_for_excel[col] = df_for_excel[col].round().astype(int)
 
-        # Ensure all desired columns exist
+        # Make sure we have all desired columns
         for col in desired_columns:
             if col not in df_for_excel.columns:
                 df_for_excel[col] = np.nan
 
         # Fill 'ASIN' and 'Product Title' if missing
         df_for_excel['ASIN'] = asin
-        if 'Product Title' in forecast_df.columns and not forecast_df['Product Title'].empty:
-            df_for_excel['Product Title'] = forecast_df['Product Title'].iloc[0]
+        if 'Product Title' in df_for_excel.columns and not df_for_excel['Product Title'].empty:
+            df_for_excel['Product Title'] = df_for_excel['Product Title'].iloc[0]
         else:
             df_for_excel['Product Title'] = ''
 
-        # Select desired columns only
+        # Retain only desired columns
         df_for_excel = df_for_excel[desired_columns]
 
-        # Append the ASIN data to the workbook
-        ws = wb.create_sheet(title=str(asin)[:31])  # Excel sheet names limited to 31 characters
-
+        # Create a new worksheet for this ASIN
+        ws = wb.create_sheet(title=str(asin)[:31])  # Excel sheet names are limited to 31 characters
+        # Write rows
         for r in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(r)
 
-    # Handle missing ASIN data
+    # If there's missing_asin_data, add a new worksheet for it
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
         for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(r)
 
-    # Remove default 'Sheet' if it exists and is empty
+    # Remove default sheet if empty
     if 'Sheet' in wb.sheetnames and len(wb['Sheet']['A']) == 0:
         del wb['Sheet']
 
-    # Add a Summary Sheet
+    # Summary Sheet
     ws_summary = wb.create_sheet(title="Summary")
     ws_summary.append(["ASIN", "Product Title", "4 Week Forecast", "8 Week Forecast", "16 Week Forecast"])
 
+    # Create summary rows (4-, 8-, 16-week sums)
     for asin, df in consolidated_data.items():
         if df.empty:
             ws_summary.append([asin, "No data", None, None, None])
             continue
 
         product_title = df['Product Title'].iloc[0] if 'Product Title' in df.columns else ''
+        # Handle any NaN or infinite in 'MyForecast' before sum
+        df['MyForecast'] = df['MyForecast'].replace([np.inf, -np.inf], 0).fillna(0)
         four_wk_val = df['MyForecast'].iloc[:4].sum() if len(df) >= 4 else df['MyForecast'].sum()
         eight_wk_val = df['MyForecast'].iloc[:8].sum() if len(df) >= 8 else df['MyForecast'].sum()
         sixteen_wk_val = df['MyForecast'].iloc[:16].sum() if len(df) >= 16 else df['MyForecast'].sum()
 
         ws_summary.append([asin, product_title, four_wk_val, eight_wk_val, sixteen_wk_val])
 
-    # Save the workbook
+    # Save the final workbook
     try:
         wb.save(output_path)
         print(f"All forecasts saved to '{output_path}'")
@@ -2153,62 +2138,46 @@ def update_prophet_model_with_feedback(asin, ts_data, forecast_data, param_grid,
 
 def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, output_folder="po_analysis_by_asin"):
     """
-    Analyze PO orders by each ASIN to understand buying habits based on requested quantities.
-    Generates weekly and monthly requested quantity trend graphs and (OPTIONALLY) 
-    creates a SINGLE Excel file with all ASIN PO forecasts in separate sheets.
+    Analyze PO orders by each ASIN, generating weekly/monthly requested quantity charts,
+    and fit a Prophet model to forecast future PO volume.
+    Writes an Excel file for each ASIN (with sheets for Weekly Quantity, Monthly Trend, and PO Forecast),
+    and returns a dictionary (po_forecasts_dict) containing each ASIN's PO forecast (columns: [ds, PO_Forecast]).
     """
-
     po_df = pd.read_excel(po_file)
     po_df.columns = po_df.columns.str.strip()
 
-    # Convert date columns to datetime
     for date_col in ['Order date', 'Expected date']:
         if date_col in po_df.columns:
             po_df[date_col] = pd.to_datetime(po_df[date_col], errors='coerce')
 
-    # Filter by product if specified
     if product_filter:
         po_df = po_df[po_df['ASIN'] == product_filter]
 
-    # Ensure numeric for Requested quantity
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
-
-    # Create output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
 
-    # NEW/CHANGED: We'll gather each ASIN's forecast & data into a dictionary
-    results = {}
-    all_po_forecasts = {}  # store the final forecast DataFrame for each ASIN
-
+    po_forecasts_dict = {}
     unique_asins = po_df['ASIN'].dropna().unique()
-    
+
     for asin in unique_asins:
-        # Filter data for the current ASIN
         asin_df = po_df[po_df['ASIN'] == asin].copy()
         if asin_df.empty:
             continue
 
-        # --- Weekly Aggregation ---
+        # Weekly aggregation
         asin_df['Order_Week_Period'] = asin_df['Order date'].dt.to_period('W-SUN')
         asin_df['Order Week'] = asin_df['Order_Week_Period'].apply(lambda p: p.end_time)
-        weekly_agg = (
-            asin_df
-            .groupby('Order Week', as_index=False)
-            .agg({'Requested quantity': 'sum'})
-        )
-
-        # --- Monthly Aggregation ---
+        weekly_agg = (asin_df.groupby('Order Week', as_index=False)['Requested quantity']
+                      .sum().rename(columns={'Requested quantity': 'Weekly_PO_Qty'}))
+        # Monthly aggregation (if needed)
         asin_df['Order_Month_Period'] = asin_df['Order date'].dt.to_period('M')
         asin_df['Order Month'] = asin_df['Order_Month_Period'].apply(lambda p: p.end_time)
-        monthly_trend = (
-            asin_df
-            .groupby('Order Month', as_index=False)
-            .agg({'Requested quantity': 'sum'})
-        )
+        monthly_trend = (asin_df.groupby('Order Month', as_index=False)['Requested quantity']
+                         .sum().rename(columns={'Requested quantity': 'Monthly_PO_Qty'}))
 
-        # --- Plot Weekly Trend ---
-        plt.figure(figsize=(10, 6))
-        plt.plot(weekly_agg['Order Week'], weekly_agg['Requested quantity'], marker='o')
+        # Plot weekly and monthly charts (unchanged)
+        plt.figure(figsize=(10,6))
+        plt.plot(weekly_agg['Order Week'], weekly_agg['Weekly_PO_Qty'], marker='o')
         plt.title(f'Weekly Requested Quantities for ASIN {asin}')
         plt.xlabel('Week')
         plt.ylabel('Total Requested Quantity')
@@ -2219,9 +2188,8 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(weekly_chart)
         plt.close()
 
-        # --- Plot Monthly Trend ---
-        plt.figure(figsize=(10, 6))
-        plt.plot(monthly_trend['Order Month'], monthly_trend['Requested quantity'], marker='o', color='green')
+        plt.figure(figsize=(10,6))
+        plt.plot(monthly_trend['Order Month'], monthly_trend['Monthly_PO_Qty'], marker='o', color='green')
         plt.title(f'Monthly Requested Quantities for ASIN {asin}')
         plt.xlabel('Month')
         plt.ylabel('Total Requested Quantity')
@@ -2232,72 +2200,40 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(monthly_chart)
         plt.close()
 
-        # NEW/CHANGED: We'll forecast using Prophet on the weekly data
-        forecast_weeks = 8  # how many future weeks to forecast
-        weekly_for_prophet = weekly_agg.rename(
-            columns={'Order Week': 'ds', 'Requested quantity': 'y'}
-        ).dropna(subset=['ds', 'y']).sort_values('ds')
-
+        # Prophet forecast on weekly data
         forecast_po = pd.DataFrame()
-        if len(weekly_for_prophet) >= 2:
+        if len(weekly_agg) >= 2:
             try:
-                from prophet import Prophet
-                m = Prophet(yearly_seasonality=False, weekly_seasonality=True)
+                weekly_for_prophet = weekly_agg.rename(columns={'Order Week': 'ds', 'Weekly_PO_Qty': 'y'}).copy()
+                weekly_for_prophet['ds'] = pd.to_datetime(weekly_for_prophet['ds'], errors='coerce')
+                weekly_for_prophet = weekly_for_prophet.dropna(subset=['ds','y']).sort_values('ds')
+                m = Prophet(weekly_seasonality=True)
                 m.fit(weekly_for_prophet[['ds','y']])
-
-                future = m.make_future_dataframe(periods=forecast_weeks, freq='W-SUN')
+                future = m.make_future_dataframe(periods=8, freq='W-SUN')
                 forecast_po = m.predict(future)
                 forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round().astype(int)
+                # Optionally plot forecast
+                fig = m.plot(forecast_po, xlabel='Date', ylabel='PO Qty')
+                plt.title(f'Prophet Forecast - PO Qty for ASIN {asin}')
+                forecast_chart = os.path.join(output_folder, f"{asin}_po_forecast.png")
+                fig.savefig(forecast_chart)
+                plt.close(fig)
             except Exception as ex:
                 print(f"Prophet forecast failed for ASIN {asin}: {ex}")
-        else:
-            print(f"Not enough weekly data to build a Prophet model for ASIN {asin} (needs >=2 rows).")
+        po_forecasts_dict[asin] = forecast_po[['ds','PO_Forecast']].copy() if not forecast_po.empty else pd.DataFrame()
 
-        # Store forecast_po and aggregated data in memory
-        all_po_forecasts[asin] = {
-            'weekly_agg': weekly_agg,
-            'monthly_trend': monthly_trend,
-            'forecast_po': forecast_po
-        }
-
-        # We'll also store certain references in 'results'
-        results[asin] = {
-            'weekly_agg': weekly_agg,
-            'monthly_trend': monthly_trend,
-            'weekly_chart': weekly_chart,
-            'monthly_chart': monthly_chart,
-            # No per-ASIN Excel here since we'll do a single consolidated file
-        }
-
-    # NEW/CHANGED: Now write a SINGLE Excel file for ALL ASIN forecasts
-    all_po_file = os.path.join(output_folder, "all_po_forecasts.xlsx")
-    with pd.ExcelWriter(all_po_file, engine='openpyxl') as writer:
-        for asin, data_dict in all_po_forecasts.items():
-            # For each ASIN, write 2 or 3 sheets: Weekly Data, Monthly Data, Forecast Data
-            weekly_agg = data_dict['weekly_agg']
-            monthly_trend = data_dict['monthly_trend']
-            forecast_po = data_dict['forecast_po']
-
-            # Sheet 1: Weekly Aggregates
-            sheet1_name = f"{asin}_Weekly"
-            weekly_agg.to_excel(writer, sheet_name=sheet1_name, index=False)
-
-            # Sheet 2: Monthly Aggregates
-            sheet2_name = f"{asin}_Monthly"
-            monthly_trend.to_excel(writer, sheet_name=sheet2_name, index=False)
-
-            # Sheet 3: Forecast 
-            # If forecast_po is empty, we skip
+        # Write an Excel file for this ASIN (optional)
+        excel_path = os.path.join(output_folder, f"{asin}_po_data.xlsx")
+        with pd.ExcelWriter(excel_path) as writer:
+            weekly_agg.to_excel(writer, sheet_name='Weekly Quantity', index=False)
+            monthly_trend.to_excel(writer, sheet_name='Monthly Trend', index=False)
             if not forecast_po.empty:
-                sheet3_name = f"{asin}_Forecast"
-                # We'll pick relevant columns
-                forecast_po[['ds','PO_Forecast','yhat','yhat_lower','yhat_upper']].to_excel(
-                    writer, sheet_name=sheet3_name, index=False
-                )
+                cols = ['ds','PO_Forecast']
+                forecast_po[cols].to_excel(writer, sheet_name='PO Forecast', index=False)
 
-    print(f"Consolidated PO forecasts saved to '{all_po_file}'")
-    print(f"Generated graphs and Excel reports for {len(unique_asins)} ASINs in folder '{output_folder}'.")
-    return results
+    print(f"Generated PO analysis Excel reports for {len(unique_asins)} ASINs in folder '{output_folder}'.")
+    print("Returning po_forecasts_dict for in-memory usage.")
+    return po_forecasts_dict
 
 ##############################
 # Compare PO Orders with Forecasts
@@ -2600,7 +2536,9 @@ def main():
             print(f"Fallback forecast chart saved to {fallback_chart}")
 
             fallback_df.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
-            fallback_df['Week'] = ['W' + str(i+1).zfill(2) for i in range(len(fallback_df))]
+            fallback_df['Week'] = pd.to_datetime(fallback_df['Week_Start_Date']).dt.isocalendar().week.apply(
+                lambda w: 'W' + str(w).zfill(2)
+            )
             fallback_df['is_holiday_week'] = False  # Or determine based on dates if applicable
 
             # Select desired columns
@@ -2621,6 +2559,8 @@ def main():
             # Step E: Store in consolidated_forecasts & skip the usual pipeline
             consolidated_forecasts[asin] = fallback_df
             continue  # Important: skip the Prophet/SARIMA logic below
+
+        holidays = get_shifted_holidays()
 
         # Decide model type (SARIMA or Prophet)
         model, model_type = choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=holidays)
@@ -2652,10 +2592,10 @@ def main():
                 # 1. Fit SARIMA Model (R/P system inside)
                 # =========================
                 best_sarima_model, best_params = fit_sarima_model(
-                    data=ts_data,
-                    holidays=holidays,
-                    seasonal_period=52,
-                    asin=asin  # For R/P tracking
+                data=ts_data,
+                holidays=holidays,            
+                seasonal_period=52,
+                asin=asin
                 )
 
                 if best_sarima_model is None:
@@ -3050,41 +2990,115 @@ def main():
     generate_4_week_report(consolidated_forecasts)
     generate_combined_weekly_report(consolidated_forecasts)
 
+    # NEW/CHANGED: Analyze PO data & store in memory
     print("\n--- Analyzing Purchase Order Data ---")
-    analyze_po_data_by_asin(po_file="po database.xlsx", output_folder="po_analysis_by_asin")
+    po_forecasts_dict = analyze_po_data_by_asin(
+        po_file="po database.xlsx",
+        output_folder="po_analysis_by_asin"
+    )
 
-    # Load PO data for comparison
-    po_data = pd.read_excel("po database.xlsx")
-    po_data.columns = po_data.columns.str.strip()  # Standardize column names
+    # Now we do correlation checks, ratio, cross-correlation, big-sales checks
+    print("\n--- Merging Sales & PO Forecasts for Relationship Analysis ---")
+    relationship_excel_path = "po_sales_relationship.xlsx"
+    writer = pd.ExcelWriter(relationship_excel_path, engine='openpyxl')
 
-    print("\n--- Comparing Historical Sales with PO Data ---")
-    comparison_output_folder = "po forecast comparison"
-    os.makedirs(comparison_output_folder, exist_ok=True)
+    relationship_summaries = []
 
-    # Loop through each ASIN for which forecasts were generated
-    for asin, comp_df in consolidated_forecasts.items():
-        print(f"\nComparing sales and PO for ASIN {asin}")
-        # Filter historical sales data for the current ASIN and aggregate weekly
-        sales_subset = valid_data[valid_data['asin'] == asin][['ds', 'y']].copy()
-        sales_subset['Week_Period'] = sales_subset['ds'].dt.to_period('W-SUN')
-        sales_subset['ds'] = sales_subset['Week_Period'].apply(lambda r: r.end_time)
-        weekly_sales = sales_subset.groupby('ds', as_index=False)['y'].sum()
+    # Example big sales windows
+    big_sales_seasons = [
+        ("Prime Day 2024", pd.Timestamp("2024-07-15"), pd.Timestamp("2024-07-22")),
+        ("Black Friday 2024", pd.Timestamp("2024-11-25"), pd.Timestamp("2024-12-02")),
+    ]
 
-        # Compare historical sales with purchase order data
-        merged_result, correlation, growth_info = compare_historical_sales_po(
-            asin=asin,
-            sales_df=weekly_sales,
-            po_df=po_data,
-            output_folder=comparison_output_folder
-        )
+    # find asins that exist in both dictionaries
+    common_asins = set(consolidated_forecasts.keys()).intersection(po_forecasts_dict.keys())
 
-        print(f"Growth Info for ASIN {asin}: {growth_info}")
-        print(f"Correlation for ASIN {asin}: {correlation}")
+    for asin in common_asins:
+        sales_df = consolidated_forecasts[asin].copy()  # columns: [ds, MyForecast, ...]
+        po_df    = po_forecasts_dict[asin].copy()       # columns: [ds, PO_Forecast] from analyze_po_data_by_asin
 
-    # Save the parameter histories at the end
+        if sales_df.empty or po_df.empty:
+            continue
+
+        merged = pd.merge(
+            sales_df[['ds','MyForecast']],
+            po_df[['ds','PO_Forecast']],
+            on='ds', how='inner'
+        ).dropna(subset=['MyForecast','PO_Forecast'])
+
+        if merged.empty:
+            continue
+
+        # 1) Pearson correlation at lag=0
+        corr_val = merged[['MyForecast','PO_Forecast']].corr().iloc[0,1]
+
+        # 2) ratio & difference
+        merged['ratio'] = merged['PO_Forecast'] / (merged['MyForecast'] + 1e-9)
+        merged['difference'] = merged['PO_Forecast'] - merged['MyForecast']
+        avg_ratio = merged['ratio'].mean()
+        avg_diff  = merged['difference'].mean()
+
+        # 3) cross-correlation - lags -4..+4
+        lag_results = []
+        best_lag = 0
+        max_corr_abs = -999
+        for lag in range(-4,5):
+            merged['PO_shifted'] = merged['PO_Forecast'].shift(lag)
+            lag_corr = merged[['MyForecast','PO_shifted']].corr().iloc[0,1]
+            lag_results.append((lag, lag_corr))
+            if abs(lag_corr) > abs(max_corr_abs):
+                max_corr_abs = lag_corr
+                best_lag = lag
+
+        # 4) big-sales analysis
+        big_sales_checks = []
+        for season_name, start_date, end_date in big_sales_seasons:
+            mask = (merged['ds']>=start_date)&(merged['ds']<=end_date)
+            po_during = merged.loc[mask,'PO_Forecast'].mean() if not merged.loc[mask].empty else 0
+            
+            prior_mask = (merged['ds']<start_date)&(merged['ds']>=(start_date-pd.Timedelta(weeks=4)))
+            po_prior = merged.loc[prior_mask,'PO_Forecast'].mean() if not merged.loc[prior_mask].empty else 0
+            
+            change_pct = ((po_during - po_prior)/(po_prior+1e-9))*100
+            big_sales_checks.append({
+                'ASIN': asin,
+                'Season': season_name,
+                'Start': start_date.date(),
+                'End': end_date.date(),
+                'Avg_PO_Prior_4wks': po_prior,
+                'Avg_PO_During': po_during,
+                'Change(%)': change_pct
+            })
+
+        summary_dict = {
+            'ASIN': asin,
+            'Corr_lag0': corr_val,
+            'AvgRatio': avg_ratio,
+            'AvgDiff': avg_diff,
+            'BestLag': best_lag,
+            'Corr@BestLag': max_corr_abs
+        }
+        relationship_summaries.append(summary_dict)
+
+        # Write detail sheets
+        lag_df = pd.DataFrame(lag_results, columns=['lag','correlation'])
+        lag_df.to_excel(writer, sheet_name=f"{asin}_CrossCorr", index=False)
+
+        big_sales_df = pd.DataFrame(big_sales_checks)
+        big_sales_df.to_excel(writer, sheet_name=f"{asin}_Seasons", index=False)
+
+        # Also write merged detail
+        merged.to_excel(writer, sheet_name=f"{asin}_Detail", index=False)
+
+    # Final summary sheet
+    summary_df = pd.DataFrame(relationship_summaries)
+    summary_df.to_excel(writer, sheet_name="Summary", index=False)
+    writer.save()
+    print(f"PO-Sales relationship analysis saved to '{relationship_excel_path}'.")
+
+    # Save param histories
     save_param_histories()
-
-    print(f"Total number of parameter sets tested: {PARAM_COUNTER}")        
+    print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
     if POOR_PARAM_FOUND:
         print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
 
