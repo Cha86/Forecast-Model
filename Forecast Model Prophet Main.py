@@ -3035,101 +3035,113 @@ def main():
     # Now we do correlation checks, ratio, cross-correlation, big-sales checks
     print("\n--- Merging Sales & PO Forecasts for Relationship Analysis ---")
     relationship_excel_path = "po_sales_relationship.xlsx"
-    writer = pd.ExcelWriter(relationship_excel_path, engine='openpyxl')
+    with pd.ExcelWriter(relationship_excel_path, engine='openpyxl') as writer:
+        relationship_summaries = []
 
-    relationship_summaries = []
+        # Example big sales windows
+        big_sales_seasons = [
+            ("Prime Day 2024", pd.Timestamp("2024-07-15"), pd.Timestamp("2024-07-22")),
+            ("Black Friday 2024", pd.Timestamp("2024-11-25"), pd.Timestamp("2024-12-02")),
+        ]
 
-    # Example big sales windows
-    big_sales_seasons = [
-        ("Prime Day 2024", pd.Timestamp("2024-07-15"), pd.Timestamp("2024-07-22")),
-        ("Black Friday 2024", pd.Timestamp("2024-11-25"), pd.Timestamp("2024-12-02")),
-    ]
+        # find asins that exist in both dictionaries
+        common_asins = set(consolidated_forecasts.keys()).intersection(po_forecasts_dict.keys())
 
-    # find asins that exist in both dictionaries
-    common_asins = set(consolidated_forecasts.keys()).intersection(po_forecasts_dict.keys())
+        for asin in common_asins:
+            sales_df = consolidated_forecasts[asin].copy()   # Expected to have forecast data (e.g., Week_Start_Date, MyForecast, etc.)
+            po_df    = po_forecasts_dict[asin].copy()         # Expected to have [ds, PO_Forecast]
+        
+            # Ensure sales_df has a common column for merging. If 'ds' is not present but 'Week_Start_Date' is, rename it.
+            if 'ds' not in sales_df.columns and 'Week_Start_Date' in sales_df.columns:
+                sales_df = sales_df.rename(columns={'Week_Start_Date': 'ds'})
+            # Similarly, ensure po_df has the column 'ds'
+            if 'ds' not in po_df.columns and 'Week_Start_Date' in po_df.columns:
+                po_df = po_df.rename(columns={'Week_Start_Date': 'ds'})
+        
+            if sales_df.empty or po_df.empty:
+                continue
 
-    for asin in common_asins:
-        sales_df = consolidated_forecasts[asin].copy()  # columns: [ds, MyForecast, ...]
-        po_df    = po_forecasts_dict[asin].copy()       # columns: [ds, PO_Forecast] from analyze_po_data_by_asin
+            # Convert 'ds' in sales_df to datetime
+            sales_df['ds'] = pd.to_datetime(sales_df['ds'], errors='coerce')
 
-        if sales_df.empty or po_df.empty:
-            continue
+            # Convert 'ds' in po_df to datetime
+            po_df['ds'] = pd.to_datetime(po_df['ds'], errors='coerce')
 
-        merged = pd.merge(
-            sales_df[['ds','MyForecast']],
-            po_df[['ds','PO_Forecast']],
-            on='ds', how='inner'
-        ).dropna(subset=['MyForecast','PO_Forecast'])
+            merged = pd.merge(
+                sales_df[['ds','MyForecast']],
+                po_df[['ds','PO_Forecast']],
+                on='ds', how='inner'
+            ).dropna(subset=['MyForecast','PO_Forecast'])
 
-        if merged.empty:
-            continue
+            if merged.empty:
+                continue
 
-        # 1) Pearson correlation at lag=0
-        corr_val = merged[['MyForecast','PO_Forecast']].corr().iloc[0,1]
+            # 1) Pearson correlation at lag=0
+            corr_val = merged[['MyForecast','PO_Forecast']].corr().iloc[0,1]
 
-        # 2) ratio & difference
-        merged['ratio'] = merged['PO_Forecast'] / (merged['MyForecast'] + 1e-9)
-        merged['difference'] = merged['PO_Forecast'] - merged['MyForecast']
-        avg_ratio = merged['ratio'].mean()
-        avg_diff  = merged['difference'].mean()
+            # 2) ratio & difference
+            merged['ratio'] = merged['PO_Forecast'] / (merged['MyForecast'] + 1e-9)
+            merged['difference'] = merged['PO_Forecast'] - merged['MyForecast']
+            avg_ratio = merged['ratio'].mean()
+            avg_diff  = merged['difference'].mean()
 
-        # 3) cross-correlation - lags -4..+4
-        lag_results = []
-        best_lag = 0
-        max_corr_abs = -999
-        for lag in range(-4,5):
-            merged['PO_shifted'] = merged['PO_Forecast'].shift(lag)
-            lag_corr = merged[['MyForecast','PO_shifted']].corr().iloc[0,1]
-            lag_results.append((lag, lag_corr))
-            if abs(lag_corr) > abs(max_corr_abs):
-                max_corr_abs = lag_corr
-                best_lag = lag
+            # 3) cross-correlation - lags -4..+4
+            lag_results = []
+            best_lag = 0
+            max_corr_abs = -999
+            for lag in range(-4,5):
+                merged['PO_shifted'] = merged['PO_Forecast'].shift(lag)
+                lag_corr = merged[['MyForecast','PO_shifted']].corr().iloc[0,1]
+                lag_results.append((lag, lag_corr))
+                if abs(lag_corr) > abs(max_corr_abs):
+                    max_corr_abs = lag_corr
+                    best_lag = lag
 
-        # 4) big-sales analysis
-        big_sales_checks = []
-        for season_name, start_date, end_date in big_sales_seasons:
-            mask = (merged['ds']>=start_date)&(merged['ds']<=end_date)
-            po_during = merged.loc[mask,'PO_Forecast'].mean() if not merged.loc[mask].empty else 0
-            
-            prior_mask = (merged['ds']<start_date)&(merged['ds']>=(start_date-pd.Timedelta(weeks=4)))
-            po_prior = merged.loc[prior_mask,'PO_Forecast'].mean() if not merged.loc[prior_mask].empty else 0
-            
-            change_pct = ((po_during - po_prior)/(po_prior+1e-9))*100
-            big_sales_checks.append({
+            # 4) big-sales analysis
+            big_sales_checks = []
+            for season_name, start_date, end_date in big_sales_seasons:
+                mask = (merged['ds']>=start_date)&(merged['ds']<=end_date)
+                po_during = merged.loc[mask,'PO_Forecast'].mean() if not merged.loc[mask].empty else 0
+                
+                prior_mask = (merged['ds']<start_date)&(merged['ds']>=(start_date-pd.Timedelta(weeks=4)))
+                po_prior = merged.loc[prior_mask,'PO_Forecast'].mean() if not merged.loc[prior_mask].empty else 0
+                
+                change_pct = ((po_during - po_prior)/(po_prior+1e-9))*100
+                big_sales_checks.append({
+                    'ASIN': asin,
+                    'Season': season_name,
+                    'Start': start_date.date(),
+                    'End': end_date.date(),
+                    'Avg_PO_Prior_4wks': po_prior,
+                    'Avg_PO_During': po_during,
+                    'Change(%)': change_pct
+                })
+
+            summary_dict = {
                 'ASIN': asin,
-                'Season': season_name,
-                'Start': start_date.date(),
-                'End': end_date.date(),
-                'Avg_PO_Prior_4wks': po_prior,
-                'Avg_PO_During': po_during,
-                'Change(%)': change_pct
-            })
+                'Corr_lag0': corr_val,
+                'AvgRatio': avg_ratio,
+                'AvgDiff': avg_diff,
+                'BestLag': best_lag,
+                'Corr@BestLag': max_corr_abs
+            }
+            relationship_summaries.append(summary_dict)
 
-        summary_dict = {
-            'ASIN': asin,
-            'Corr_lag0': corr_val,
-            'AvgRatio': avg_ratio,
-            'AvgDiff': avg_diff,
-            'BestLag': best_lag,
-            'Corr@BestLag': max_corr_abs
-        }
-        relationship_summaries.append(summary_dict)
+            # Write detail sheets
+            lag_df = pd.DataFrame(lag_results, columns=['lag','correlation'])
+            lag_df.to_excel(writer, sheet_name=f"{asin}_CrossCorr", index=False)
 
-        # Write detail sheets
-        lag_df = pd.DataFrame(lag_results, columns=['lag','correlation'])
-        lag_df.to_excel(writer, sheet_name=f"{asin}_CrossCorr", index=False)
+            big_sales_df = pd.DataFrame(big_sales_checks)
+            big_sales_df.to_excel(writer, sheet_name=f"{asin}_Seasons", index=False)
 
-        big_sales_df = pd.DataFrame(big_sales_checks)
-        big_sales_df.to_excel(writer, sheet_name=f"{asin}_Seasons", index=False)
+            # Also write merged detail
+            merged.to_excel(writer, sheet_name=f"{asin}_Detail", index=False)
 
-        # Also write merged detail
-        merged.to_excel(writer, sheet_name=f"{asin}_Detail", index=False)
-
-    # Final summary sheet
-    summary_df = pd.DataFrame(relationship_summaries)
-    summary_df.to_excel(writer, sheet_name="Summary", index=False)
-    writer.save()
-    print(f"PO-Sales relationship analysis saved to '{relationship_excel_path}'.")
+        # Final summary sheet
+        summary_df = pd.DataFrame(relationship_summaries)
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        writer.save()
+        print(f"PO-Sales relationship analysis saved to '{relationship_excel_path}'.")
 
     # Save param histories
     save_param_histories()
