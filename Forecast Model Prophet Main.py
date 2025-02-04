@@ -3140,7 +3140,6 @@ def main():
         # Final summary sheet
         summary_df = pd.DataFrame(relationship_summaries)
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        writer.save()
         print(f"PO-Sales relationship analysis saved to '{relationship_excel_path}'.")
 
     # Save param histories
