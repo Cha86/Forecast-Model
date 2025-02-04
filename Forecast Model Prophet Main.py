@@ -1291,92 +1291,96 @@ def save_summary_to_excel(
     output_file_path,
     metrics=None
 ):
-    """
-    Save a comparison DataFrame (with columns like 'MyForecast', 'Amazon Mean Forecast', etc.)
-    and summary statistics to an Excel file.
-
-    Parameters:
-      comparison (pd.DataFrame): DataFrame containing forecast columns (e.g. MyForecast, Amazon Mean Forecast).
-      summary_stats (dict): Dictionary of summary stats for the data (min, max, mean, median, etc.).
-      total_forecast_16, total_forecast_8, total_forecast_4: Summation of your forecast for 16, 8, 4 weeks.
-      max_forecast, min_forecast: Max and min forecast values.
-      max_week, min_week: The corresponding weeks for the max/min forecasts.
-      output_file_path (str): File path to save this Excel file.
-      metrics (dict): Optional dictionary of metrics like MAE, RMSE, etc.
-    """
-
-    # List of columns that need to be cleaned before casting to int
-    forecast_cols = [
-        'MyForecast',
-        'Amazon Mean Forecast',
-        'Amazon P70 Forecast',
-        'Amazon P80 Forecast',
-        'Amazon P90 Forecast',
+    # 1) Drop unwanted columns (ds, yhat, etc.) so only old columns remain
+    unwanted_cols = [
+        'yhat','yhat_upper','Diff_Mean','Diff_P70','Diff_P80','Diff_P90',
+        'Pct_Mean','Pct_P70','Pct_P80','Pct_P90','MyForecast_XGB','y'
     ]
-
-    # --- Clean each column to remove inf/NaN ---
-    for col in forecast_cols:
+    for col in unwanted_cols:
         if col in comparison.columns:
-            # Replace inf/-inf with 0
-            comparison[col] = comparison[col].replace([np.inf, -np.inf], 0)
-            # Replace NaN with 0
-            comparison[col] = comparison[col].fillna(0)
-            # Round and cast to integer
-            comparison[col] = comparison[col].round().astype(int, errors='ignore')
+            comparison.drop(columns=[col], inplace=True)
 
-    # If your original code separately calls .round().astype(int) for each column, you can remove it 
-    # or wrap it in the logic above. The key is we do the replacements first.
+    # 2) If 'ds' is present, turn it into 'Week_Start_Date'
+    if 'ds' in comparison.columns:
+        comparison['ds'] = pd.to_datetime(comparison['ds'], errors='coerce')
+        # Populate 'Week_Start_Date' from 'ds'
+        comparison['Week_Start_Date'] = comparison['ds'].dt.strftime('%Y-%m-%d')
+        comparison.drop(columns=['ds'], inplace=True)  # remove ds
 
-    # Create an Excel writer
-    with pd.ExcelWriter(output_file_path, mode='w') as writer:
-        # 1) Write the main comparison DataFrame
-        comparison.to_excel(writer, index=False, sheet_name='Forecast Data')
+    # 3) If "Week" is missing, create it with “W1..Wn” (no zero‐padding!)
+    if 'Week' not in comparison.columns:
+        comparison = comparison.sort_values('Week_Start_Date', na_position='last').reset_index(drop=True)
+        comparison['Week'] = ['W' + str(i+1) for i in range(len(comparison))]  # e.g. W1, W2, ...
 
-        # 2) Optionally create a summary sheet with the stats
-        summary_data = {
-            "Metric": [
-                "Historical Range",
-                "Min Sales",
-                "Max Sales",
-                "Mean Sales",
-                "Median Sales",
-                "Std Dev Sales",
-                "Total Historical Sales",
-                "Total Forecast (16 Weeks)",
-                "Total Forecast (8 Weeks)",
-                "Total Forecast (4 Weeks)",
-                "Max Forecast",
-                "Max Forecast Week",
-                "Min Forecast",
-                "Min Forecast Week"
-            ],
-            "Value": [
-                f"{summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}",
-                f"{summary_stats['min']:.0f}",
-                f"{summary_stats['max']:.0f}",
-                f"{summary_stats['mean']:.0f}",
-                f"{summary_stats['median']:.0f}",
-                f"{summary_stats['std_dev']:.0f}",
-                f"{summary_stats['total_sales']:.0f} units",
-                f"{total_forecast_16:.0f}",
-                f"{total_forecast_8:.0f}",
-                f"{total_forecast_4:.0f}",
-                f"{max_forecast:.0f}",
-                f"{max_week.strftime('%Y-%m-%d') if max_week else 'N/A'}",
-                f"{min_forecast:.0f}",
-                f"{min_week.strftime('%Y-%m-%d') if min_week else 'N/A'}"
-            ]
-        }
-        if metrics is not None:
-            for k, v in metrics.items():
-                summary_data["Metric"].append(k)
-                summary_data["Value"].append(str(v))
+    # 4) Clean numeric columns (MyForecast, Amazon Mean Forecast, etc.) so no inf or NaN
+    forecast_cols = [
+        'MyForecast','Amazon Mean Forecast','Amazon P70 Forecast',
+        'Amazon P80 Forecast','Amazon P90 Forecast'
+    ]
+    for fc in forecast_cols:
+        if fc in comparison.columns:
+            comparison[fc] = comparison[fc].replace([np.inf, -np.inf], 0).fillna(0)
+            comparison[fc] = comparison[fc].round().astype(int)
 
-        summary_df = pd.DataFrame(summary_data)
-        summary_df.to_excel(writer, index=False, sheet_name='Summary')
+    # 5) Reorder final columns to your old format
+    desired_cols = [
+        'Week', 'Week_Start_Date', 'ASIN', 'MyForecast','Amazon Mean Forecast',
+        'Amazon P70 Forecast','Amazon P80 Forecast','Amazon P90 Forecast',
+        'Product Title','is_holiday_week'
+    ]
+    # Make sure all exist
+    for col in desired_cols:
+        if col not in comparison.columns:
+            comparison[col] = ''
 
+    comparison = comparison[desired_cols]
+
+    # === Write to Excel (summary + main sheet) ===
+    wb = Workbook()
+    ws_main = wb.active
+    ws_main.title = "Forecast Comparison"
+
+    # Write main data
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    for row in dataframe_to_rows(comparison, index=False, header=True):
+        ws_main.append(row)
+
+    # Create summary sheet
+    ws_summary = wb.create_sheet("Summary")
+    summary_data = {
+        "Metric": [
+            "Historical Range","Min Sales","Max Sales","Mean Sales",
+            "Median Sales","Std Dev Sales","Total Historical Sales",
+            "Total Forecast (16 Weeks)","Total Forecast (8 Weeks)",
+            "Total Forecast (4 Weeks)","Max Forecast","Max Forecast Week",
+            "Min Forecast","Min Forecast Week"
+        ],
+        "Value": [
+            f"{summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}",
+            f"{summary_stats['min']:.0f}",
+            f"{summary_stats['max']:.0f}",
+            f"{summary_stats['mean']:.0f}",
+            f"{summary_stats['median']:.0f}",
+            f"{summary_stats['std_dev']:.0f}",
+            f"{summary_stats['total_sales']:.0f} units",
+            f"{total_forecast_16:.0f}", f"{total_forecast_8:.0f}", f"{total_forecast_4:.0f}",
+            f"{max_forecast:.0f}",
+            f"{max_week.strftime('%Y-%m-%d') if max_week else 'N/A'}",
+            f"{min_forecast:.0f}",
+            f"{min_week.strftime('%Y-%m-%d') if min_week else 'N/A'}"
+        ]
+    }
+    if metrics is not None:
+        for k, v in metrics.items():
+            summary_data["Metric"].append(k)
+            summary_data["Value"].append(str(v))
+
+    summary_df = pd.DataFrame(summary_data)
+    for row in dataframe_to_rows(summary_df, index=False, header=True):
+        ws_summary.append(row)
+
+    wb.save(output_file_path)
     print(f"Comparison and summary saved to '{output_file_path}'")
-
 
 def save_4_8_16_forecast_summary(consolidated_data, output_folder):
     """
@@ -1412,119 +1416,150 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
     """
     Save multiple ASIN forecasts (with "MyForecast") and any missing ASIN data into one Excel file,
     each ASIN in a separate sheet.
-
+    
+    The final output uses the forecast dates (in 'Week_Start_Date') to compute the week labels
+    relative to the first forecast date. For example, if the first forecast date is 2025-01-26,
+    then that row is labeled "W1", the next (if exactly 7 days later) as "W2", etc.
+    
     Parameters:
-    - output_path (str): Path to save the consolidated Excel file.
-    - consolidated_data (dict): Dictionary where keys are ASINs and values are DataFrames containing forecast data.
-    - missing_asin_data (DataFrame): DataFrame containing data for ASINs that are missing.
-    - base_year (int): The base year for week label to date conversion.
+      output_path (str): File path for the consolidated Excel file.
+      consolidated_data (dict): Keys are ASINs; values are DataFrames with forecast data.
+      missing_asin_data (DataFrame): DataFrame for missing ASINs.
+      base_year (int): Base year used in fallback week label conversion.
     """
-
+    # Desired final column order.
     desired_columns = [
-        'Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
-        'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
-        'Product Title', 'is_holiday_week'
+        "Week",
+        "Week_Start_Date",
+        "ASIN",
+        "MyForecast",
+        "Amazon Mean Forecast",
+        "Amazon P70 Forecast",
+        "Amazon P80 Forecast",
+        "Amazon P90 Forecast",
+        "Product Title",
+        "is_holiday_week"
     ]
 
-    def week_label_to_date(week_label, base_year):
-        """
-        Convert a week label like 'W01' to a date string representing the week's start date.
-        """
-        try:
-            week_num = int(week_label[1:])
-            # 'W01' => first week of the year, i.e. base_year-01-01 + 0 weeks
-            start_date = pd.Timestamp(f'{base_year}-01-01') + pd.Timedelta(weeks=week_num - 1)
-            return start_date.strftime('%Y-%m-%d')
-        except Exception as e:
-            print(f"Error converting week label '{week_label}': {e}")
-            return 'Invalid Date'
+    # List columns we want to remove from the final output.
+    unwanted_cols = [
+        "ds", "yhat", "yhat_upper", "Diff_Mean", "Diff_P70", "Diff_P80", "Diff_P90",
+        "Pct_Mean", "Pct_P70", "Pct_P80", "Pct_P90", "MyForecast_XGB", "y"
+    ]
+
+    # We'll also work on numeric forecast columns to avoid casting errors.
+    forecast_cols = [
+        "MyForecast",
+        "Amazon Mean Forecast",
+        "Amazon P70 Forecast",
+        "Amazon P80 Forecast",
+        "Amazon P90 Forecast"
+    ]
 
     wb = Workbook()
-
-    # Columns we need to ensure are finite before casting to int
-    forecast_cols = ['MyForecast', 'Amazon Mean Forecast', 'Amazon P70 Forecast',
-                     'Amazon P80 Forecast', 'Amazon P90 Forecast']
 
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
 
-        # Convert ds -> Week_Start_Date if ds column exists
-        if 'ds' in df_for_excel.columns:
-            df_for_excel['ds'] = pd.to_datetime(df_for_excel['ds'], errors='coerce')
-            df_for_excel['Week_Start_Date'] = df_for_excel['ds'].dt.strftime('%Y-%m-%d')
-            # If 'Week' is missing, create it
-            if 'Week' not in df_for_excel.columns:
-                df_for_excel = df_for_excel.sort_values('Week_Start_Date').reset_index(drop=True)
-                df_for_excel['Week'] = ['W' + str(i + 1).zfill(2) for i in range(len(df_for_excel))]
-        elif 'Week' in df_for_excel.columns:
-            # Convert from Week -> Week_Start_Date
-            df_for_excel['Week_Start_Date'] = df_for_excel['Week'].apply(lambda w: week_label_to_date(w, base_year))
-        else:
-            # If neither 'ds' nor 'Week', default them
-            df_for_excel['Week_Start_Date'] = pd.NaT
-            df_for_excel['Week'] = 'W00'
+        # --- Step 1: Drop unwanted columns if present ---
+        for col in unwanted_cols:
+            if col in df_for_excel.columns:
+                df_for_excel.drop(columns=[col], inplace=True)
 
-        # --- Ensure forecast columns have no inf/NaN before rounding & casting ---
+        # --- Step 2: If there is a column "ds", rename it to "Week_Start_Date" ---
+        if "ds" in df_for_excel.columns:
+            # Convert to datetime and format as string
+            df_for_excel["ds"] = pd.to_datetime(df_for_excel["ds"], errors="coerce")
+            df_for_excel["Week_Start_Date"] = df_for_excel["ds"].dt.strftime("%Y-%m-%d")
+            df_for_excel.drop(columns=["ds"], inplace=True)
+
+        # --- Step 3: If "Week_Start_Date" is missing, try to create it from "Week" using a fallback ---
+        if "Week_Start_Date" not in df_for_excel.columns and "Week" in df_for_excel.columns:
+            # Use your fallback conversion function:
+            def week_label_to_date(week_label, base_year):
+                try:
+                    week_num = int(week_label[1:])
+                    start_date = pd.Timestamp(f"{base_year}-01-01") + pd.Timedelta(weeks=week_num - 1)
+                    return start_date.strftime("%Y-%m-%d")
+                except Exception as e:
+                    print(f"Error converting week label '{week_label}': {e}")
+                    return "Invalid Date"
+            df_for_excel["Week_Start_Date"] = df_for_excel["Week"].apply(lambda w: week_label_to_date(w, base_year))
+
+        # --- Step 4: Create Week labels relative to the forecast start date ---
+        # If "Week_Start_Date" exists and is nonempty, compute week numbers relative to the first forecast date.
+        if "Week_Start_Date" in df_for_excel.columns and df_for_excel["Week_Start_Date"].notna().all():
+            # Convert to datetime so we can compute differences.
+            df_for_excel["Week_Start_Date"] = pd.to_datetime(df_for_excel["Week_Start_Date"], errors="coerce")
+            first_date = df_for_excel["Week_Start_Date"].min()
+            # Calculate the week difference (in integer weeks) and add 1 for label
+            df_for_excel["Week"] = df_for_excel["Week_Start_Date"].apply(
+                lambda d: "W" + str(((d - first_date).days // 7) + 1)
+            )
+            # Finally, format Week_Start_Date back as a string if desired
+            df_for_excel["Week_Start_Date"] = df_for_excel["Week_Start_Date"].dt.strftime("%Y-%m-%d")
+        else:
+            # Fallback: simply number rows in order
+            df_for_excel = df_for_excel.sort_index().reset_index(drop=True)
+            df_for_excel["Week"] = ["W" + str(i+1) for i in range(len(df_for_excel))]
+
+        # --- Step 5: Clean forecast columns (replace inf/NaN, round and cast to int) ---
         for col in forecast_cols:
             if col in df_for_excel.columns:
-                # Replace infinities with 0
-                df_for_excel[col] = df_for_excel[col].replace([np.inf, -np.inf], 0)
-                # Replace NaNs with 0
-                df_for_excel[col] = df_for_excel[col].fillna(0)
-                # Now round and cast to int
+                df_for_excel[col] = df_for_excel[col].replace([np.inf, -np.inf], 0).fillna(0)
                 df_for_excel[col] = df_for_excel[col].round().astype(int)
 
-        # Make sure we have all desired columns
+        # --- Step 6: Ensure all desired columns exist ---
         for col in desired_columns:
             if col not in df_for_excel.columns:
                 df_for_excel[col] = np.nan
 
-        # Fill 'ASIN' and 'Product Title' if missing
-        df_for_excel['ASIN'] = asin
-        if 'Product Title' in df_for_excel.columns and not df_for_excel['Product Title'].empty:
-            df_for_excel['Product Title'] = df_for_excel['Product Title'].iloc[0]
+        # --- Step 7: Fill 'ASIN' and 'Product Title' if missing ---
+        df_for_excel["ASIN"] = asin
+        if "Product Title" in forecast_df.columns and not forecast_df["Product Title"].empty:
+            df_for_excel["Product Title"] = forecast_df["Product Title"].iloc[0]
         else:
-            df_for_excel['Product Title'] = ''
+            df_for_excel["Product Title"] = ""
 
-        # Retain only desired columns
+        # --- Step 8: Reorder columns ---
         df_for_excel = df_for_excel[desired_columns]
 
-        # Create a new worksheet for this ASIN
-        ws = wb.create_sheet(title=str(asin)[:31])  # Excel sheet names are limited to 31 characters
-        # Write rows
-        for r in dataframe_to_rows(df_for_excel, index=False, header=True):
-            ws.append(r)
+        # --- Step 9: Write this ASIN's data to a new worksheet ---
+        ws = wb.create_sheet(title=str(asin)[:31])
+        from openpyxl.utils.dataframe import dataframe_to_rows
+        for row in dataframe_to_rows(df_for_excel, index=False, header=True):
+            ws.append(row)
 
-    # If there's missing_asin_data, add a new worksheet for it
+    # --- Step 10: If missing ASIN data exists, add it as a separate sheet ---
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
-        for r in dataframe_to_rows(missing_asin_data, index=False, header=True):
-            ws_missing.append(r)
+        from openpyxl.utils.dataframe import dataframe_to_rows
+        for row in dataframe_to_rows(missing_asin_data, index=False, header=True):
+            ws_missing.append(row)
 
-    # Remove default sheet if empty
-    if 'Sheet' in wb.sheetnames and len(wb['Sheet']['A']) == 0:
-        del wb['Sheet']
+    # --- Step 11: Remove default sheet if empty ---
+    if "Sheet" in wb.sheetnames and len(wb["Sheet"]["A"]) == 0:
+        del wb["Sheet"]
 
-    # Summary Sheet
+    # --- Step 12: Create a Summary Sheet ---
     ws_summary = wb.create_sheet(title="Summary")
     ws_summary.append(["ASIN", "Product Title", "4 Week Forecast", "8 Week Forecast", "16 Week Forecast"])
 
-    # Create summary rows (4-, 8-, 16-week sums)
     for asin, df in consolidated_data.items():
         if df.empty:
             ws_summary.append([asin, "No data", None, None, None])
             continue
-
-        product_title = df['Product Title'].iloc[0] if 'Product Title' in df.columns else ''
-        # Handle any NaN or infinite in 'MyForecast' before sum
-        df['MyForecast'] = df['MyForecast'].replace([np.inf, -np.inf], 0).fillna(0)
-        four_wk_val = df['MyForecast'].iloc[:4].sum() if len(df) >= 4 else df['MyForecast'].sum()
-        eight_wk_val = df['MyForecast'].iloc[:8].sum() if len(df) >= 8 else df['MyForecast'].sum()
-        sixteen_wk_val = df['MyForecast'].iloc[:16].sum() if len(df) >= 16 else df['MyForecast'].sum()
-
+        product_title = df["Product Title"].iloc[0] if "Product Title" in df.columns else ""
+        # Make sure MyForecast is cleaned
+        if "MyForecast" in df.columns:
+            df["MyForecast"] = df["MyForecast"].replace([np.inf, -np.inf], 0).fillna(0)
+            four_wk_val = df["MyForecast"].iloc[:4].sum() if len(df) >= 4 else df["MyForecast"].sum()
+            eight_wk_val = df["MyForecast"].iloc[:8].sum() if len(df) >= 8 else df["MyForecast"].sum()
+            sixteen_wk_val = df["MyForecast"].iloc[:16].sum() if len(df) >= 16 else df["MyForecast"].sum()
+        else:
+            four_wk_val = eight_wk_val = sixteen_wk_val = 0
         ws_summary.append([asin, product_title, four_wk_val, eight_wk_val, sixteen_wk_val])
 
-    # Save the final workbook
     try:
         wb.save(output_path)
         print(f"All forecasts saved to '{output_path}'")
