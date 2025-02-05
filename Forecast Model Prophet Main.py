@@ -27,6 +27,8 @@ import time
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from scipy.optimize import minimize
+from statsmodels.tsa.seasonal import STL
+from sklearn.cluster import KMeans
 
 warnings.filterwarnings("ignore")
 
@@ -507,13 +509,13 @@ def sarima_forecast(model_fit, steps, last_date, exog=None):
 
     forecast_values = model_fit.forecast(steps=steps, exog=exog)
     forecast_values = forecast_values.round().astype(int)
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W-SUN')
     # Instead of "SARIMA Forecast", unify to "MyForecast":
     return pd.DataFrame({'ds': future_dates, 'MyForecast': forecast_values})
 
 def generate_future_exog(holidays, steps, last_date):
     """Generate exogenous holiday regressors for future forecasts."""
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W')
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=steps, freq='W-SUN')
     exog_future = pd.DataFrame(index=future_dates)
     holiday_names = holidays['holiday'].unique()
     for h in holiday_names:
@@ -729,7 +731,7 @@ def xgboost_forecast(model, ts_data, forecast_steps=16, target='y', features=Non
     ts_data = ts_data.sort_values('ds').copy()
     last_date = ts_data['ds'].max()
 
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=forecast_steps, freq='W')
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=forecast_steps, freq='W-SUN')
     forecasts = []
 
     current_data = ts_data.copy()
@@ -871,7 +873,7 @@ def forecast_with_custom_params(ts_data, forecast_data,
         'Amazon P80': 0.1
     }
 
-    future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W')
+    future_dates = pd.date_range(start=ts_data['ds'].max() + pd.Timedelta(days=7), periods=horizon, freq='W-SUN')
     future = pd.DataFrame({'ds': future_dates})
     combined_df = pd.concat([ts_data, future], ignore_index=True)
 
@@ -2424,6 +2426,123 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
         'prediction_info': prediction_info
     }
 
+##############################
+# Season Detect
+##############################
+
+def stl_decomposition(ts_data, period=52):
+    """Perform STL decomposition on historical data"""
+    decomposition = STL(ts_data['y'], period=period, robust=True).fit()
+    return decomposition
+
+def calculate_seasonal_strength(decomposition):
+    """Calculate normalized seasonal strength (0-1)"""
+    resid_std = decomposition.resid.std()
+    trend_std = decomposition.trend.std()
+    return max(0, min(1 - (resid_std / (trend_std + 1e-9)), 1))
+
+def detect_seasonal_periods(ts_data, n_clusters=3):
+    """Identify seasonal periods using clustering"""
+    decomposition = stl_decomposition(ts_data)
+    seasonal = decomposition.seasonal
+    
+    # Normalize seasonal component
+    seasonal_norm = (seasonal - seasonal.min()) / (seasonal.max() - seasonal.min())
+    
+    # Cluster into seasonal periods
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+    clusters = kmeans.fit_predict(seasonal_norm.values.reshape(-1, 1))
+    
+    # Create cluster labels
+    cluster_means = pd.Series(seasonal_norm).groupby(clusters).mean()
+    sorted_clusters = cluster_means.sort_values().index
+    cluster_labels = {sorted_clusters[0]: 'low', 
+                     sorted_clusters[1]: 'medium',
+                     sorted_clusters[2]: 'high'}
+    
+    ts_data['seasonal_cluster'] = [cluster_labels[c] for c in clusters]
+    return ts_data
+
+def calculate_seasonal_factors(ts_data):
+    """Calculate weekly adjustment factors"""
+    ts_data = ts_data.copy()
+    ts_data['week_of_year'] = ts_data['ds'].dt.isocalendar().week
+    
+    factors = ts_data.groupby('week_of_year').agg({
+        'y': 'mean',
+        'seasonal_cluster': lambda x: x.value_counts().index[0]
+    }).rename(columns={'y': 'historical_mean'})
+    
+    # Calculate adjustment factors relative to overall mean
+    overall_mean = factors['historical_mean'].mean()
+    factors['adjustment_factor'] = factors['historical_mean'] / overall_mean
+    
+    return factors
+
+def apply_seasonal_adjustment(forecast_df, ts_data, seasonal_factors,
+                             override_threshold=0.3, 
+                             max_override=2.0):
+    """
+    Apply seasonal adjustments to forecasts with override logic
+    """
+    # Add seasonal components to forecast
+    forecast_df = forecast_df.copy()
+    forecast_df['week_of_year'] = forecast_df['ds'].dt.isocalendar().week
+    
+    # Merge seasonal factors
+    forecast_df = forecast_df.merge(
+        seasonal_factors[['adjustment_factor', 'seasonal_cluster']],
+        left_on='week_of_year',
+        right_index=True,
+        how='left'
+    )
+    
+    # Calculate base adjusted forecast
+    forecast_df['seasonal_forecast'] = forecast_df['MyForecast'] * forecast_df['adjustment_factor']
+    
+    # Calculate override ranges
+    forecast_df['amazon_deviation'] = (
+        forecast_df['MyForecast'] - forecast_df['Amazon Mean Forecast']
+    ).abs() / forecast_df['Amazon Mean Forecast']
+    
+    # Apply conditional override
+    override_conditions = (
+        (forecast_df['amazon_deviation'] > override_threshold) &
+        (forecast_df['seasonal_cluster'].isin(['low', 'high']))
+    )
+    
+    # Limit override magnitude
+    forecast_df['final_forecast'] = np.where(
+        override_conditions,
+        np.clip(
+            forecast_df['seasonal_forecast'],
+            forecast_df['Amazon Mean Forecast'] * (1 - max_override),
+            forecast_df['Amazon Mean Forecast'] * (1 + max_override)
+        ),
+        forecast_df[['MyForecast', 'Amazon Mean Forecast']].mean(axis=1)
+    )
+    
+    return forecast_df
+
+def validate_seasonal_adjustment(historical_data, adjusted_forecast):
+    """Validate seasonal adjustment performance"""
+    merged = historical_data.merge(
+        adjusted_forecast,
+        on='ds',
+        suffixes=('_actual', '_forecast'),
+        how='inner'
+    )
+    
+    metrics = {
+        'mae_before': mean_absolute_error(merged['y_actual'], merged['MyForecast']),
+        'mae_after': mean_absolute_error(merged['y_actual'], merged['final_forecast']),
+        'seasonal_strength': calculate_seasonal_strength(stl_decomposition(historical_data))
+    }
+    
+    improvement = (metrics['mae_before'] - metrics['mae_after']) / metrics['mae_before']
+    metrics['improvement_pct'] = improvement * 100
+    
+    return metrics
 
 ##############################
 # Main
@@ -2779,6 +2898,41 @@ def main():
                         ).clip(lower=0)
 
                 # =========================
+                # Seasonal Adjustment
+                # =========================
+                try:
+                    # Detect seasonal patterns
+                    ts_data = detect_seasonal_periods(ts_data)
+                    seasonal_factors = calculate_seasonal_factors(ts_data)
+                    
+                    # Apply seasonal adjustments
+                    comparison = apply_seasonal_adjustment(
+                        comparison, 
+                        ts_data,
+                        seasonal_factors,
+                        override_threshold=0.3,  # 30% deviation allowed
+                        max_override=1.5  # Max 150% override of Amazon forecast
+                    )
+                    
+                    # Validate adjustments
+                    metrics = validate_seasonal_adjustment(ts_data, comparison)
+                    print(f"Seasonal adjustment metrics for {asin}:")
+                    print(f"MAE Improvement: {metrics['improvement_pct']:.1f}%")
+                    print(f"Seasonal Strength: {metrics['seasonal_strength']:.2f}")
+                    
+                    # Fallback if adjustment worsens performance
+                    if metrics['improvement_pct'] < -5:  # If MAE increases by >5%
+                        print("Reverting to original forecast due to poor adjustment")
+                        comparison['final_forecast'] = comparison['MyForecast']
+                        
+                except Exception as e:
+                    print(f"Seasonal adjustment failed for {asin}: {str(e)}")
+                    comparison['final_forecast'] = comparison['MyForecast']
+                
+                # Replace final forecast with adjusted version
+                comparison['MyForecast'] = comparison['final_forecast']
+
+                # =========================
                 # 10. Summaries and Visualization
                 # =========================
                 summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
@@ -2907,6 +3061,41 @@ def main():
                     ).clip(lower=0)
 
             # =========================
+            # Seasonal Adjustment
+            # =========================
+            try:
+                # Detect seasonal patterns
+                ts_data = detect_seasonal_periods(ts_data)
+                seasonal_factors = calculate_seasonal_factors(ts_data)
+                
+                # Apply seasonal adjustments
+                comparison = apply_seasonal_adjustment(
+                    comparison, 
+                    ts_data,
+                    seasonal_factors,
+                    override_threshold=0.3,  # 30% deviation allowed
+                    max_override=1.5  # Max 150% override of Amazon forecast
+                )
+                
+                # Validate adjustments
+                metrics = validate_seasonal_adjustment(ts_data, comparison)
+                print(f"Seasonal adjustment metrics for {asin}:")
+                print(f"MAE Improvement: {metrics['improvement_pct']:.1f}%")
+                print(f"Seasonal Strength: {metrics['seasonal_strength']:.2f}")
+                
+                # Fallback if adjustment worsens performance
+                if metrics['improvement_pct'] < -5:  # If MAE increases by >5%
+                    print("Reverting to original forecast due to poor adjustment")
+                    comparison['final_forecast'] = comparison['MyForecast']
+                    
+            except Exception as e:
+                print(f"Seasonal adjustment failed for {asin}: {str(e)}")
+                comparison['final_forecast'] = comparison['MyForecast']
+            
+            # Replace final forecast with adjusted version
+            comparison['MyForecast'] = comparison['final_forecast']
+
+            # =========================
             # Summaries and Visualization
             # =========================
             summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
@@ -2920,9 +3109,6 @@ def main():
                 asin, product_title, sufficient_data_folder
             )
 
-            # =========================
-            # Log Fallback Triggers Again
-            # =========================
             log_fallback_triggers(comparison, asin, product_title)
 
             # =========================
