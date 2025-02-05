@@ -1057,6 +1057,123 @@ def calculate_rmse(forecast, forecast_data, horizon):
         rmse_values[forecast_type] = rmse
     return rmse_values
 
+##############################
+# Season Detect
+##############################
+
+def stl_decomposition(ts_data, period=52):
+    """Perform STL decomposition on historical data"""
+    decomposition = STL(ts_data['y'], period=period, robust=True).fit()
+    return decomposition
+
+def calculate_seasonal_strength(decomposition):
+    """Calculate normalized seasonal strength (0-1)"""
+    resid_std = decomposition.resid.std()
+    trend_std = decomposition.trend.std()
+    return max(0, min(1 - (resid_std / (trend_std + 1e-9)), 1))
+
+def detect_seasonal_periods(ts_data, n_clusters=3):
+    """Identify seasonal periods using clustering"""
+    decomposition = stl_decomposition(ts_data)
+    seasonal = decomposition.seasonal
+    
+    # Normalize seasonal component
+    seasonal_norm = (seasonal - seasonal.min()) / (seasonal.max() - seasonal.min())
+    
+    # Cluster into seasonal periods
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+    clusters = kmeans.fit_predict(seasonal_norm.values.reshape(-1, 1))
+    
+    # Create cluster labels
+    cluster_means = pd.Series(seasonal_norm).groupby(clusters).mean()
+    sorted_clusters = cluster_means.sort_values().index
+    cluster_labels = {sorted_clusters[0]: 'low', 
+                     sorted_clusters[1]: 'medium',
+                     sorted_clusters[2]: 'high'}
+    
+    ts_data['seasonal_cluster'] = [cluster_labels[c] for c in clusters]
+    return ts_data
+
+def calculate_seasonal_factors(ts_data):
+    """Calculate weekly adjustment factors"""
+    ts_data = ts_data.copy()
+    ts_data['week_of_year'] = ts_data['ds'].dt.isocalendar().week
+    
+    factors = ts_data.groupby('week_of_year').agg({
+        'y': 'mean',
+        'seasonal_cluster': lambda x: x.value_counts().index[0]
+    }).rename(columns={'y': 'historical_mean'})
+    
+    # Calculate adjustment factors relative to overall mean
+    overall_mean = factors['historical_mean'].mean()
+    factors['adjustment_factor'] = factors['historical_mean'] / overall_mean
+    
+    return factors
+
+def apply_seasonal_adjustment(forecast_df, ts_data, seasonal_factors,
+                             override_threshold=0.3, 
+                             max_override=2.0):
+    """
+    Apply seasonal adjustments to forecasts with override logic
+    """
+    # Add seasonal components to forecast
+    forecast_df = forecast_df.copy()
+    forecast_df['week_of_year'] = forecast_df['ds'].dt.isocalendar().week
+    
+    # Merge seasonal factors
+    forecast_df = forecast_df.merge(
+        seasonal_factors[['adjustment_factor', 'seasonal_cluster']],
+        left_on='week_of_year',
+        right_index=True,
+        how='left'
+    )
+    
+    # Calculate base adjusted forecast
+    forecast_df['seasonal_forecast'] = forecast_df['MyForecast'] * forecast_df['adjustment_factor']
+    
+    # Calculate override ranges
+    forecast_df['amazon_deviation'] = (
+        forecast_df['MyForecast'] - forecast_df['Amazon Mean Forecast']
+    ).abs() / forecast_df['Amazon Mean Forecast']
+    
+    # Apply conditional override
+    override_conditions = (
+        (forecast_df['amazon_deviation'] > override_threshold) &
+        (forecast_df['seasonal_cluster'].isin(['low', 'high']))
+    )
+    
+    # Limit override magnitude
+    forecast_df['final_forecast'] = np.where(
+        override_conditions,
+        np.clip(
+            forecast_df['seasonal_forecast'],
+            forecast_df['Amazon Mean Forecast'] * (1 - max_override),
+            forecast_df['Amazon Mean Forecast'] * (1 + max_override)
+        ),
+        forecast_df[['MyForecast', 'Amazon Mean Forecast']].mean(axis=1)
+    )
+    
+    return forecast_df
+
+def validate_seasonal_adjustment(historical_data, adjusted_forecast):
+    """Validate seasonal adjustment performance"""
+    merged = historical_data.merge(
+        adjusted_forecast,
+        on='ds',
+        suffixes=('_actual', '_forecast'),
+        how='inner'
+    )
+    
+    metrics = {
+        'mae_before': mean_absolute_error(merged['y_actual'], merged['MyForecast']),
+        'mae_after': mean_absolute_error(merged['y_actual'], merged['final_forecast']),
+        'seasonal_strength': calculate_seasonal_strength(stl_decomposition(historical_data))
+    }
+    
+    improvement = (metrics['mae_before'] - metrics['mae_after']) / metrics['mae_before']
+    metrics['improvement_pct'] = improvement * 100
+    
+    return metrics
 
 ##############################
 # Forecast Formatting & Adjustments
@@ -1429,6 +1546,7 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
       missing_asin_data (DataFrame): DataFrame for missing ASINs.
       base_year (int): Base year used in fallback week label conversion.
     """
+
     # Desired final column order.
     desired_columns = [
         "Week",
@@ -1449,7 +1567,7 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
         "Pct_Mean", "Pct_P70", "Pct_P80", "Pct_P90", "MyForecast_XGB", "y"
     ]
 
-    # We'll also work on numeric forecast columns to avoid casting errors.
+    # Columns to be cleaned (numeric forecast columns).
     forecast_cols = [
         "MyForecast",
         "Amazon Mean Forecast",
@@ -1470,14 +1588,12 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
 
         # --- Step 2: If there is a column "ds", rename it to "Week_Start_Date" ---
         if "ds" in df_for_excel.columns:
-            # Convert to datetime and format as string
             df_for_excel["ds"] = pd.to_datetime(df_for_excel["ds"], errors="coerce")
             df_for_excel["Week_Start_Date"] = df_for_excel["ds"].dt.strftime("%Y-%m-%d")
             df_for_excel.drop(columns=["ds"], inplace=True)
 
         # --- Step 3: If "Week_Start_Date" is missing, try to create it from "Week" using a fallback ---
         if "Week_Start_Date" not in df_for_excel.columns and "Week" in df_for_excel.columns:
-            # Use your fallback conversion function:
             def week_label_to_date(week_label, base_year):
                 try:
                     week_num = int(week_label[1:])
@@ -1489,19 +1605,14 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
             df_for_excel["Week_Start_Date"] = df_for_excel["Week"].apply(lambda w: week_label_to_date(w, base_year))
 
         # --- Step 4: Create Week labels relative to the forecast start date ---
-        # If "Week_Start_Date" exists and is nonempty, compute week numbers relative to the first forecast date.
         if "Week_Start_Date" in df_for_excel.columns and df_for_excel["Week_Start_Date"].notna().all():
-            # Convert to datetime so we can compute differences.
             df_for_excel["Week_Start_Date"] = pd.to_datetime(df_for_excel["Week_Start_Date"], errors="coerce")
             first_date = df_for_excel["Week_Start_Date"].min()
-            # Calculate the week difference (in integer weeks) and add 1 for label
             df_for_excel["Week"] = df_for_excel["Week_Start_Date"].apply(
                 lambda d: "W" + str(((d - first_date).days // 7) + 1)
             )
-            # Finally, format Week_Start_Date back as a string if desired
             df_for_excel["Week_Start_Date"] = df_for_excel["Week_Start_Date"].dt.strftime("%Y-%m-%d")
         else:
-            # Fallback: simply number rows in order
             df_for_excel = df_for_excel.sort_index().reset_index(drop=True)
             df_for_excel["Week"] = ["W" + str(i+1) for i in range(len(df_for_excel))]
 
@@ -1528,19 +1639,17 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
 
         # --- Step 9: Write this ASIN's data to a new worksheet ---
         ws = wb.create_sheet(title=str(asin)[:31])
-        from openpyxl.utils.dataframe import dataframe_to_rows
         for row in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(row)
 
     # --- Step 10: If missing ASIN data exists, add it as a separate sheet ---
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
-        from openpyxl.utils.dataframe import dataframe_to_rows
         for row in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(row)
 
-    # --- Step 11: Remove default sheet if empty ---
-    if "Sheet" in wb.sheetnames and len(wb["Sheet"]["A"]) == 0:
+    # --- Step 11: Remove default sheet if there is more than one sheet ---
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
         del wb["Sheet"]
 
     # --- Step 12: Create a Summary Sheet ---
@@ -1552,7 +1661,6 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
             ws_summary.append([asin, "No data", None, None, None])
             continue
         product_title = df["Product Title"].iloc[0] if "Product Title" in df.columns else ""
-        # Make sure MyForecast is cleaned
         if "MyForecast" in df.columns:
             df["MyForecast"] = df["MyForecast"].replace([np.inf, -np.inf], 0).fillna(0)
             four_wk_val = df["MyForecast"].iloc[:4].sum() if len(df) >= 4 else df["MyForecast"].sum()
@@ -2427,122 +2535,131 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
     }
 
 ##############################
-# Season Detect
+# Compare PO Orders with Forecasts
 ##############################
 
-def stl_decomposition(ts_data, period=52):
-    """Perform STL decomposition on historical data"""
-    decomposition = STL(ts_data['y'], period=period, robust=True).fit()
-    return decomposition
-
-def calculate_seasonal_strength(decomposition):
-    """Calculate normalized seasonal strength (0-1)"""
-    resid_std = decomposition.resid.std()
-    trend_std = decomposition.trend.std()
-    return max(0, min(1 - (resid_std / (trend_std + 1e-9)), 1))
-
-def detect_seasonal_periods(ts_data, n_clusters=3):
-    """Identify seasonal periods using clustering"""
-    decomposition = stl_decomposition(ts_data)
-    seasonal = decomposition.seasonal
-    
-    # Normalize seasonal component
-    seasonal_norm = (seasonal - seasonal.min()) / (seasonal.max() - seasonal.min())
-    
-    # Cluster into seasonal periods
-    kmeans = KMeans(n_clusters=n_clusters, random_state=0)
-    clusters = kmeans.fit_predict(seasonal_norm.values.reshape(-1, 1))
-    
-    # Create cluster labels
-    cluster_means = pd.Series(seasonal_norm).groupby(clusters).mean()
-    sorted_clusters = cluster_means.sort_values().index
-    cluster_labels = {sorted_clusters[0]: 'low', 
-                     sorted_clusters[1]: 'medium',
-                     sorted_clusters[2]: 'high'}
-    
-    ts_data['seasonal_cluster'] = [cluster_labels[c] for c in clusters]
-    return ts_data
-
-def calculate_seasonal_factors(ts_data):
-    """Calculate weekly adjustment factors"""
-    ts_data = ts_data.copy()
-    ts_data['week_of_year'] = ts_data['ds'].dt.isocalendar().week
-    
-    factors = ts_data.groupby('week_of_year').agg({
-        'y': 'mean',
-        'seasonal_cluster': lambda x: x.value_counts().index[0]
-    }).rename(columns={'y': 'historical_mean'})
-    
-    # Calculate adjustment factors relative to overall mean
-    overall_mean = factors['historical_mean'].mean()
-    factors['adjustment_factor'] = factors['historical_mean'] / overall_mean
-    
-    return factors
-
-def apply_seasonal_adjustment(forecast_df, ts_data, seasonal_factors,
-                             override_threshold=0.3, 
-                             max_override=2.0):
+def forecast_po_orders_with_prophet(po_file='po database.xlsx',
+                                    output_folder='po_forecast_output',
+                                    output_excel='po_order_forecast.xlsx',
+                                    horizon_weeks=16):
     """
-    Apply seasonal adjustments to forecasts with override logic
-    """
-    # Add seasonal components to forecast
-    forecast_df = forecast_df.copy()
-    forecast_df['week_of_year'] = forecast_df['ds'].dt.isocalendar().week
-    
-    # Merge seasonal factors
-    forecast_df = forecast_df.merge(
-        seasonal_factors[['adjustment_factor', 'seasonal_cluster']],
-        left_on='week_of_year',
-        right_index=True,
-        how='left'
-    )
-    
-    # Calculate base adjusted forecast
-    forecast_df['seasonal_forecast'] = forecast_df['MyForecast'] * forecast_df['adjustment_factor']
-    
-    # Calculate override ranges
-    forecast_df['amazon_deviation'] = (
-        forecast_df['MyForecast'] - forecast_df['Amazon Mean Forecast']
-    ).abs() / forecast_df['Amazon Mean Forecast']
-    
-    # Apply conditional override
-    override_conditions = (
-        (forecast_df['amazon_deviation'] > override_threshold) &
-        (forecast_df['seasonal_cluster'].isin(['low', 'high']))
-    )
-    
-    # Limit override magnitude
-    forecast_df['final_forecast'] = np.where(
-        override_conditions,
-        np.clip(
-            forecast_df['seasonal_forecast'],
-            forecast_df['Amazon Mean Forecast'] * (1 - max_override),
-            forecast_df['Amazon Mean Forecast'] * (1 + max_override)
-        ),
-        forecast_df[['MyForecast', 'Amazon Mean Forecast']].mean(axis=1)
-    )
-    
-    return forecast_df
+    Forecast future PO orders for each ASIN using Prophet, and save all results
+    into one Excel file (each ASIN in a separate sheet) in the specified folder.
 
-def validate_seasonal_adjustment(historical_data, adjusted_forecast):
-    """Validate seasonal adjustment performance"""
-    merged = historical_data.merge(
-        adjusted_forecast,
-        on='ds',
-        suffixes=('_actual', '_forecast'),
-        how='inner'
-    )
-    
-    metrics = {
-        'mae_before': mean_absolute_error(merged['y_actual'], merged['MyForecast']),
-        'mae_after': mean_absolute_error(merged['y_actual'], merged['final_forecast']),
-        'seasonal_strength': calculate_seasonal_strength(stl_decomposition(historical_data))
-    }
-    
-    improvement = (metrics['mae_before'] - metrics['mae_after']) / metrics['mae_before']
-    metrics['improvement_pct'] = improvement * 100
-    
-    return metrics
+    - Ensures that the forecast weeks align with weekly sales forecasts by using freq='W-SUN' 
+      (or whatever your sales forecast uses).
+    - Generates columns like: [Week, Week_Start_Date, ASIN, POForecast].
+    - You can easily merge this data with your sales forecast.
+
+    Parameters:
+      po_file (str): Path to the Excel file containing historical PO data.
+                     Must include columns [ASIN, Order date, Requested quantity].
+      output_folder (str): Folder to store the forecast Excel file and any plots.
+      output_excel (str): The Excel filename to store all ASIN forecasts.
+      horizon_weeks (int): How many weeks ahead to forecast.
+    """
+
+    os.makedirs(output_folder, exist_ok=True)
+    output_path = os.path.join(output_folder, output_excel)
+
+    # 1) Load the PO historical data
+    df_po = pd.read_excel(po_file)
+    df_po.columns = df_po.columns.str.strip()
+
+    required_cols = {'ASIN','Order date','Requested quantity'}
+    if not required_cols.issubset(df_po.columns):
+        raise ValueError(f"PO data must have columns at least: {required_cols}")
+
+    # Convert order date to datetime
+    df_po['Order date'] = pd.to_datetime(df_po['Order date'], errors='coerce')
+    df_po = df_po.dropna(subset=['ASIN','Order date','Requested quantity'])
+
+    # 2) Get unique ASINs
+    asins = df_po['ASIN'].unique()
+    print(f"Found {len(asins)} unique ASINs. Forecasting next {horizon_weeks} weeks of PO orders.\n")
+
+    # 3) Create an Excel writer to store all ASIN forecasts in one workbook
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        for asin in asins:
+            asin_data = df_po[df_po['ASIN'] == asin].copy()
+            if asin_data.empty:
+                continue
+
+            # Aggregate if you have multiple rows per date (sum them)
+            asin_data = asin_data.groupby('Order date', as_index=False)['Requested quantity'].sum()
+
+            # Rename for Prophet
+            asin_data = asin_data.rename(columns={
+                'Order date': 'ds',
+                'Requested quantity': 'y'
+            })
+            asin_data = asin_data.sort_values('ds').reset_index(drop=True)
+
+            # 4) Initialize Prophet (weekly + yearly seasonality if needed)
+            model = Prophet(
+                yearly_seasonality=True,
+                weekly_seasonality=True,
+                daily_seasonality=False,
+                seasonality_mode='additive'
+            )
+            print(f"Fitting model for ASIN {asin}, data points: {len(asin_data)}")
+
+            try:
+                model.fit(asin_data[['ds','y']])
+            except Exception as e:
+                print(f"Prophet fitting failed for ASIN {asin}. Error: {e}")
+                continue
+
+            # 5) Create future DF for horizon_weeks. 
+            #    Use freq='W-SUN' or 'W' if your sales forecast does that.
+            future = model.make_future_dataframe(periods=horizon_weeks, freq='W-SUN')  
+            forecast = model.predict(future)
+
+            # 6) We'll store the columns we need
+            #    forecast[['ds','yhat','yhat_lower','yhat_upper']] is typical
+            df_out = forecast[['ds','yhat','yhat_lower','yhat_upper']].copy()
+            df_out = df_out.rename(columns={
+                'ds': 'Week_Start_Date',
+                'yhat': 'POForecast',
+                'yhat_lower': 'POForecast_Lower',
+                'yhat_upper': 'POForecast_Upper'
+            })
+
+            # 7) Create "Week" labels W1..Wn from earliest to latest row 
+            #    (assuming we want the same approach as your sales forecast).
+            df_out = df_out.sort_values('Week_Start_Date').reset_index(drop=True)
+            df_out['Week'] = ['W' + str(i+1) for i in range(len(df_out))]
+
+            # Ensure "Week_Start_Date" is string for final output
+            df_out['Week_Start_Date'] = df_out['Week_Start_Date'].dt.strftime('%Y-%m-%d')
+
+            # 8) Add ASIN column, reorder columns
+            df_out['ASIN'] = asin
+            df_out = df_out[[
+                'Week','Week_Start_Date','ASIN','POForecast','POForecast_Lower','POForecast_Upper'
+            ]]
+
+            # 9) Optionally merge actual historical y for rows that overlap in time
+            #    (just for reference in the same sheet).
+            merged_hist = pd.merge(
+                df_out,
+                asin_data[['ds','y']].rename(columns={'ds':'Week_Start_Date','y':'Actual_PO'}),
+                on='Week_Start_Date',
+                how='left'
+            )
+            # We'll keep columns in a final order
+            merged_hist = merged_hist[[
+                'Week','Week_Start_Date','ASIN','Actual_PO',
+                'POForecast','POForecast_Lower','POForecast_Upper'
+            ]]
+
+            # 10) Write to Excel: each ASIN in a separate sheet
+            sheet_name = (str(asin)[:28] + '..') if len(asin) > 31 else str(asin)  # Excel limit
+            merged_hist.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            print(f"PO forecast for ASIN {asin} saved to sheet: {sheet_name}")
+
+    print(f"\nAll PO forecasts stored in: {output_path}")
 
 ##############################
 # Main
@@ -3211,11 +3328,18 @@ def main():
     generate_4_week_report(consolidated_forecasts)
     generate_combined_weekly_report(consolidated_forecasts)
 
-    # NEW/CHANGED: Analyze PO data & store in memory
     print("\n--- Analyzing Purchase Order Data ---")
     po_forecasts_dict = analyze_po_data_by_asin(
         po_file="po database.xlsx",
         output_folder="po_analysis_by_asin"
+    )
+
+    print("\n--- Forecasting PO Orders with Prophet ---")
+    forecast_po_orders_with_prophet(
+        po_file="po database.xlsx", 
+        output_folder="po_forecast_output", 
+        output_excel="po_order_forecast.xlsx", 
+        horizon_weeks=16
     )
 
     # Now we do correlation checks, ratio, cross-correlation, big-sales checks
