@@ -2545,15 +2545,13 @@ def forecast_po_orders_with_prophet(po_file='po database.xlsx',
     """
     Forecast future PO orders for each ASIN using Prophet, and save all results
     into one Excel file (each ASIN in a separate sheet) in the specified folder.
-
-    - Ensures that the forecast weeks align with weekly sales forecasts by using freq='W-SUN' 
-      (or whatever your sales forecast uses).
-    - Generates columns like: [Week, Week_Start_Date, ASIN, POForecast].
-    - You can easily merge this data with your sales forecast.
-
+    
+    The forecast weeks will align with your sales forecast (using weekly dates).
+    The forecast DataFrame will include columns: [Week, Week_Start_Date, ASIN, POForecast, POForecast_Lower, POForecast_Upper].
+    
     Parameters:
       po_file (str): Path to the Excel file containing historical PO data.
-                     Must include columns [ASIN, Order date, Requested quantity].
+                     Must include columns: [ASIN, Order date, Requested quantity].
       output_folder (str): Folder to store the forecast Excel file and any plots.
       output_excel (str): The Excel filename to store all ASIN forecasts.
       horizon_weeks (int): How many weeks ahead to forecast.
@@ -2566,13 +2564,13 @@ def forecast_po_orders_with_prophet(po_file='po database.xlsx',
     df_po = pd.read_excel(po_file)
     df_po.columns = df_po.columns.str.strip()
 
-    required_cols = {'ASIN','Order date','Requested quantity'}
+    required_cols = {'ASIN', 'Order date', 'Requested quantity'}
     if not required_cols.issubset(df_po.columns):
         raise ValueError(f"PO data must have columns at least: {required_cols}")
 
     # Convert order date to datetime
     df_po['Order date'] = pd.to_datetime(df_po['Order date'], errors='coerce')
-    df_po = df_po.dropna(subset=['ASIN','Order date','Requested quantity'])
+    df_po = df_po.dropna(subset=['ASIN', 'Order date', 'Requested quantity'])
 
     # 2) Get unique ASINs
     asins = df_po['ASIN'].unique()
@@ -2585,7 +2583,7 @@ def forecast_po_orders_with_prophet(po_file='po database.xlsx',
             if asin_data.empty:
                 continue
 
-            # Aggregate if you have multiple rows per date (sum them)
+            # Aggregate if there are multiple rows per date (sum them)
             asin_data = asin_data.groupby('Order date', as_index=False)['Requested quantity'].sum()
 
             # Rename for Prophet
@@ -2593,9 +2591,11 @@ def forecast_po_orders_with_prophet(po_file='po database.xlsx',
                 'Order date': 'ds',
                 'Requested quantity': 'y'
             })
+            # Ensure 'ds' is datetime
+            asin_data['ds'] = pd.to_datetime(asin_data['ds'], errors='coerce')
             asin_data = asin_data.sort_values('ds').reset_index(drop=True)
 
-            # 4) Initialize Prophet (weekly + yearly seasonality if needed)
+            # 4) Initialize Prophet (with weekly and yearly seasonality)
             model = Prophet(
                 yearly_seasonality=True,
                 weekly_seasonality=True,
@@ -2610,13 +2610,12 @@ def forecast_po_orders_with_prophet(po_file='po database.xlsx',
                 print(f"Prophet fitting failed for ASIN {asin}. Error: {e}")
                 continue
 
-            # 5) Create future DF for horizon_weeks. 
-            #    Use freq='W-SUN' or 'W' if your sales forecast does that.
-            future = model.make_future_dataframe(periods=horizon_weeks, freq='W-SUN')  
+            # 5) Create future DF for horizon_weeks using weekly frequency.
+            #    Here we use freq='W-SUN' (ensure this aligns with your sales forecast dates)
+            future = model.make_future_dataframe(periods=horizon_weeks, freq='W-SUN')
             forecast = model.predict(future)
 
-            # 6) We'll store the columns we need
-            #    forecast[['ds','yhat','yhat_lower','yhat_upper']] is typical
+            # 6) Select and rename needed columns; keep ds as datetime
             df_out = forecast[['ds','yhat','yhat_lower','yhat_upper']].copy()
             df_out = df_out.rename(columns={
                 'ds': 'Week_Start_Date',
@@ -2625,41 +2624,43 @@ def forecast_po_orders_with_prophet(po_file='po database.xlsx',
                 'yhat_upper': 'POForecast_Upper'
             })
 
-            # 7) Create "Week" labels W1..Wn from earliest to latest row 
-            #    (assuming we want the same approach as your sales forecast).
+            # 7) Create "Week" labels relative to the first forecast date
             df_out = df_out.sort_values('Week_Start_Date').reset_index(drop=True)
-            df_out['Week'] = ['W' + str(i+1) for i in range(len(df_out))]
+            # For Option A, we keep Week_Start_Date as datetime for merging.
+            # Create Week labels as "W1", "W2", ... (no zero-padding)
+            first_date = df_out["Week_Start_Date"].min()
+            df_out["Week"] = df_out["Week_Start_Date"].apply(
+                lambda d: "W" + str(((d - first_date).days // 7) + 1)
+            )
+            # (Do not convert Week_Start_Date to string here; keep as datetime for merging.)
 
-            # Ensure "Week_Start_Date" is string for final output
-            df_out['Week_Start_Date'] = df_out['Week_Start_Date'].dt.strftime('%Y-%m-%d')
-
-            # 8) Add ASIN column, reorder columns
+            # 8) Add ASIN column and reorder columns
             df_out['ASIN'] = asin
-            df_out = df_out[[
-                'Week','Week_Start_Date','ASIN','POForecast','POForecast_Lower','POForecast_Upper'
-            ]]
+            df_out = df_out[[ "Week", "Week_Start_Date", "ASIN", 
+                               "POForecast", "POForecast_Lower", "POForecast_Upper" ]]
 
-            # 9) Optionally merge actual historical y for rows that overlap in time
-            #    (just for reference in the same sheet).
+            # 9) Optionally merge actual historical data (if you want to see overlapping actual PO)
+            #    Make sure the historical data date is also datetime.
             merged_hist = pd.merge(
                 df_out,
                 asin_data[['ds','y']].rename(columns={'ds':'Week_Start_Date','y':'Actual_PO'}),
                 on='Week_Start_Date',
                 how='left'
             )
-            # We'll keep columns in a final order
+            # Keep columns in final order:
             merged_hist = merged_hist[[
-                'Week','Week_Start_Date','ASIN','Actual_PO',
-                'POForecast','POForecast_Lower','POForecast_Upper'
+                "Week", "Week_Start_Date", "ASIN", "Actual_PO",
+                "POForecast", "POForecast_Lower", "POForecast_Upper"
             ]]
 
             # 10) Write to Excel: each ASIN in a separate sheet
-            sheet_name = (str(asin)[:28] + '..') if len(asin) > 31 else str(asin)  # Excel limit
+            # Limit sheet name to 31 characters
+            sheet_name = (str(asin)[:28] + '..') if len(str(asin)) > 31 else str(asin)
             merged_hist.to_excel(writer, sheet_name=sheet_name, index=False)
-
             print(f"PO forecast for ASIN {asin} saved to sheet: {sheet_name}")
 
     print(f"\nAll PO forecasts stored in: {output_path}")
+
 
 ##############################
 # Main
