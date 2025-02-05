@@ -2540,127 +2540,99 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
 
 def forecast_po_orders_with_prophet(po_file='po database.xlsx',
                                     output_folder='po_forecast_output',
-                                    output_excel='po_order_forecast.xlsx',
-                                    horizon_weeks=16):
+                                    horizon_weeks=16,
+                                    amazon_start_date='2025-02-02'):
     """
-    Forecast future PO orders for each ASIN using Prophet, and save all results
-    into one Excel file (each ASIN in a separate sheet) in the specified folder.
-    
-    The forecast weeks will align with your sales forecast (using weekly dates).
-    The forecast DataFrame will include columns: [Week, Week_Start_Date, ASIN, POForecast, POForecast_Lower, POForecast_Upper].
+    Forecast future PO orders for each ASIN using Prophet, based on aggregated weekly PO data.
+    The forecast will start from the given amazon_start_date and cover horizon_weeks periods.
+    Each ASIN's forecast is saved in a separate Excel file in the specified output folder.
     
     Parameters:
       po_file (str): Path to the Excel file containing historical PO data.
                      Must include columns: [ASIN, Order date, Requested quantity].
-      output_folder (str): Folder to store the forecast Excel file and any plots.
-      output_excel (str): The Excel filename to store all ASIN forecasts.
-      horizon_weeks (int): How many weeks ahead to forecast.
+      output_folder (str): Folder where each ASIN's forecast Excel file will be saved.
+      horizon_weeks (int): Number of weekly periods to forecast.
+      amazon_start_date (str or Timestamp): The starting date for the forecast period (e.g., '2025-02-02').
     """
-
+    # Ensure the output folder exists.
     os.makedirs(output_folder, exist_ok=True)
-    output_path = os.path.join(output_folder, output_excel)
-
-    # 1) Load the PO historical data
+    
+    # Load the PO data.
     df_po = pd.read_excel(po_file)
     df_po.columns = df_po.columns.str.strip()
-
+    
     required_cols = {'ASIN', 'Order date', 'Requested quantity'}
     if not required_cols.issubset(df_po.columns):
         raise ValueError(f"PO data must have columns at least: {required_cols}")
-
-    # Convert order date to datetime
+    
+    # Convert the order date to datetime and drop rows with missing data.
     df_po['Order date'] = pd.to_datetime(df_po['Order date'], errors='coerce')
-    df_po = df_po.dropna(subset=['ASIN', 'Order date', 'Requested quantity'])
-
-    # 2) Get unique ASINs
+    df_po.dropna(subset=['ASIN', 'Order date', 'Requested quantity'], inplace=True)
+    
+    # Convert amazon_start_date to datetime.
+    amazon_start_date = pd.to_datetime(amazon_start_date, errors='coerce')
+    if pd.isna(amazon_start_date):
+        raise ValueError(f"Invalid amazon_start_date: {amazon_start_date}")
+    
+    # Get unique ASINs.
     asins = df_po['ASIN'].unique()
-    print(f"Found {len(asins)} unique ASINs. Forecasting next {horizon_weeks} weeks of PO orders.\n")
-
-    # 3) Create an Excel writer to store all ASIN forecasts in one workbook
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        for asin in asins:
-            asin_data = df_po[df_po['ASIN'] == asin].copy()
-            if asin_data.empty:
-                continue
-
-            # Aggregate if there are multiple rows per date (sum them)
-            asin_data = asin_data.groupby('Order date', as_index=False)['Requested quantity'].sum()
-
-            # Rename for Prophet
-            asin_data = asin_data.rename(columns={
-                'Order date': 'ds',
-                'Requested quantity': 'y'
-            })
-            # Ensure 'ds' is datetime
-            asin_data['ds'] = pd.to_datetime(asin_data['ds'], errors='coerce')
-            asin_data = asin_data.sort_values('ds').reset_index(drop=True)
-
-            # 4) Initialize Prophet (with weekly and yearly seasonality)
-            model = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=True,
-                daily_seasonality=False,
-                seasonality_mode='additive'
-            )
-            print(f"Fitting model for ASIN {asin}, data points: {len(asin_data)}")
-
-            try:
-                model.fit(asin_data[['ds','y']])
-            except Exception as e:
-                print(f"Prophet fitting failed for ASIN {asin}. Error: {e}")
-                continue
-
-            # 5) Create future DF for horizon_weeks using weekly frequency.
-            #    Here we use freq='W-SUN' (ensure this aligns with your sales forecast dates)
-            future = model.make_future_dataframe(periods=horizon_weeks, freq='W-SUN')
-            forecast = model.predict(future)
-
-            # 6) Select and rename needed columns; keep ds as datetime
-            df_out = forecast[['ds','yhat','yhat_lower','yhat_upper']].copy()
-            df_out = df_out.rename(columns={
-                'ds': 'Week_Start_Date',
-                'yhat': 'POForecast',
-                'yhat_lower': 'POForecast_Lower',
-                'yhat_upper': 'POForecast_Upper'
-            })
-
-            # 7) Create "Week" labels relative to the first forecast date
-            df_out = df_out.sort_values('Week_Start_Date').reset_index(drop=True)
-            # For Option A, we keep Week_Start_Date as datetime for merging.
-            # Create Week labels as "W1", "W2", ... (no zero-padding)
-            first_date = df_out["Week_Start_Date"].min()
-            df_out["Week"] = df_out["Week_Start_Date"].apply(
-                lambda d: "W" + str(((d - first_date).days // 7) + 1)
-            )
-            # (Do not convert Week_Start_Date to string here; keep as datetime for merging.)
-
-            # 8) Add ASIN column and reorder columns
-            df_out['ASIN'] = asin
-            df_out = df_out[[ "Week", "Week_Start_Date", "ASIN", 
-                               "POForecast", "POForecast_Lower", "POForecast_Upper" ]]
-
-            # 9) Optionally merge actual historical data (if you want to see overlapping actual PO)
-            #    Make sure the historical data date is also datetime.
-            merged_hist = pd.merge(
-                df_out,
-                asin_data[['ds','y']].rename(columns={'ds':'Week_Start_Date','y':'Actual_PO'}),
-                on='Week_Start_Date',
-                how='left'
-            )
-            # Keep columns in final order:
-            merged_hist = merged_hist[[
-                "Week", "Week_Start_Date", "ASIN", "Actual_PO",
-                "POForecast", "POForecast_Lower", "POForecast_Upper"
-            ]]
-
-            # 10) Write to Excel: each ASIN in a separate sheet
-            # Limit sheet name to 31 characters
-            sheet_name = (str(asin)[:28] + '..') if len(str(asin)) > 31 else str(asin)
-            merged_hist.to_excel(writer, sheet_name=sheet_name, index=False)
-            print(f"PO forecast for ASIN {asin} saved to sheet: {sheet_name}")
-
-    print(f"\nAll PO forecasts stored in: {output_path}")
-
+    print(f"Found {len(asins)} unique ASINs. Forecasting {horizon_weeks} weeks from {amazon_start_date.strftime('%Y-%m-%d')}.\n")
+    
+    # Process each ASIN separately.
+    for asin in asins:
+        asin_data = df_po[df_po['ASIN'] == asin].copy()
+        if asin_data.empty:
+            continue
+        
+        # Aggregate the data to weekly totals.
+        asin_data['week_start'] = asin_data['Order date'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
+        weekly_agg = asin_data.groupby('week_start', as_index=False)['Requested quantity'].sum()
+        weekly_agg.rename(columns={'week_start': 'ds', 'Requested quantity': 'y'}, inplace=True)
+        weekly_agg = weekly_agg.sort_values('ds').reset_index(drop=True)
+        
+        if len(weekly_agg) < 2:
+            print(f"Not enough weekly data for ASIN {asin} (only {len(weekly_agg)} point(s)); skipping forecast.")
+            continue
+        
+        # Fit the Prophet model.
+        model = Prophet(
+            yearly_seasonality=True,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            seasonality_mode='additive'
+        )
+        print(f"Fitting Prophet model for ASIN {asin} with {len(weekly_agg)} weekly data points.")
+        try:
+            model.fit(weekly_agg[['ds', 'y']])
+        except Exception as e:
+            print(f"Prophet fitting failed for ASIN {asin}. Error: {e}")
+            continue
+        
+        # Create future dataframe from amazon_start_date.
+        future_dates = pd.date_range(start=amazon_start_date, periods=horizon_weeks, freq='W-SUN')
+        future_df = pd.DataFrame({'ds': future_dates})
+        
+        # Generate forecast.
+        forecast = model.predict(future_df)
+        df_forecast = forecast[['ds', 'yhat']].copy()
+        df_forecast.rename(columns={'ds': 'Week_Start_Date', 'yhat': 'POForecast'}, inplace=True)
+        
+        # Label weeks (W1, W2, ...).
+        df_forecast = df_forecast.sort_values('Week_Start_Date').reset_index(drop=True)
+        df_forecast['Week'] = [f"W{i+1}" for i in range(len(df_forecast))]
+        df_forecast['Week_Start_Date'] = pd.to_datetime(df_forecast['Week_Start_Date']).dt.strftime('%Y-%m-%d')
+        
+        # Add ASIN column and reorder.
+        df_forecast['ASIN'] = asin
+        df_forecast = df_forecast[['Week', 'Week_Start_Date', 'ASIN', 'POForecast']]
+        df_forecast['POForecast'] = df_forecast['POForecast'].round().astype(int)
+        
+        # Save each ASIN's forecast in a separate Excel file.
+        output_file_asin = os.path.join(output_folder, f"po_order_forecast_{asin}.xlsx")
+        df_forecast.to_excel(output_file_asin, index=False)
+        print(f"PO forecast for ASIN {asin} saved to {output_file_asin}.")
+    
+    print("\nAll PO forecasts completed.")
 
 ##############################
 # Main
@@ -3339,8 +3311,8 @@ def main():
     forecast_po_orders_with_prophet(
         po_file="po database.xlsx", 
         output_folder="po_forecast_output", 
-        output_excel="po_order_forecast.xlsx", 
-        horizon_weeks=16
+        horizon_weeks=16,
+        amazon_start_date='2025-02-02'
     )
 
     # Now we do correlation checks, ratio, cross-correlation, big-sales checks
