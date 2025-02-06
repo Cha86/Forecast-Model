@@ -1,9 +1,6 @@
 import pandas as pd
 import numpy as np
-import shap
-import xgboost as xgb
 from collections import Counter
-
 from prophet import Prophet
 from prophet.diagnostics import cross_validation, performance_metrics
 import matplotlib.pyplot as plt
@@ -23,12 +20,13 @@ from sklearn.metrics import (
 from math import sqrt
 from pykalman import KalmanFilter
 from statsmodels.tsa.stattools import adfuller
-import time
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from scipy.optimize import minimize
 from statsmodels.tsa.seasonal import STL
 from sklearn.cluster import KMeans
+from scipy.stats import linregress
+from math import ceil
 
 warnings.filterwarnings("ignore")
 
@@ -49,6 +47,145 @@ forecast_errors = {}
 # Global dictionaries to store the accumulated performance history
 sarima_param_history = {}  # key = (asin, (p,d,q,P,D,Q,m)), value = dict with 'score', 'count', etc.
 prophet_param_history = {} # key = (asin, (changepoint, seasonality, holiday)), value = dict with 'score', 'count', etc.
+
+##############################
+# Seasonal Trend
+##############################
+
+def determine_seasonal_trend(sales_series):
+    """
+    Determines the seasonal trend based on weekly sales data.
+    
+    Logic:
+      - Compute the week-to-week percentage change.
+      - If there exist at least two consecutive weeks where the percentage
+        increase is greater than 40%, return "High Volume Season".
+      - If there exist at least two consecutive weeks where the percentage
+        decrease is less than -40%, return "Low Volume Season".
+      - Otherwise, return "Stable".
+    
+    Parameters:
+      sales_series (list or pandas Series): Weekly sales numbers in chronological order.
+    
+    Returns:
+      str: "High Volume Season", "Low Volume Season", or "Stable".
+    """
+    sales_array = np.array(sales_series, dtype=float)
+    n = len(sales_array)
+    if n < 2:
+        return "Stable"
+    
+    pct_changes = []
+    for i in range(1, n):
+        prev = sales_array[i-1]
+        if prev == 0:
+            pct_changes.append(0.0)
+        else:
+            pct_changes.append((sales_array[i] - prev) / prev)
+    pct_changes = np.array(pct_changes)
+    
+    count_increase = 0
+    count_decrease = 0
+    for change in pct_changes:
+        if change > 0.4:
+            count_increase += 1
+            count_decrease = 0
+        elif change < -0.4:
+            count_decrease += 1
+            count_increase = 0
+        else:
+            count_increase = 0
+            count_decrease = 0
+        if count_increase >= 2:
+            return "High Volume Season"
+        if count_decrease >= 2:
+            return "Low Volume Season"
+    return "Stable"
+
+def compute_inventory_coverage(current_inventory, weekly_forecast, lead_time=4):
+    """
+    Calculate inventory coverage in weeks.
+    
+    Formula: coverage_weeks = current_inventory / average_demand_over_lead_time
+    """
+    if len(weekly_forecast) == 0:
+        return float('inf')
+    forecast_for_lead = weekly_forecast[:lead_time] if len(weekly_forecast) >= lead_time else weekly_forecast
+    avg_demand = np.mean(forecast_for_lead)
+    if avg_demand == 0:
+        return float('inf')
+    coverage = current_inventory / avg_demand
+    return round(coverage, 1)
+
+def compute_stockout_risk(coverage_weeks, lead_time=4):
+    """
+    Return 'High' if coverage is less than lead_time, else 'Low'.
+    """
+    if coverage_weeks < lead_time:
+        return "High"
+    else:
+        return "Low"
+
+def compute_reorder_urgency(stockout_risk):
+    """
+    Return 'Urgent' if stockout risk is high, otherwise 'Normal'.
+    """
+    return "Urgent" if stockout_risk == "High" else "Normal"
+
+def compute_sales_trend(historical_sales_52):
+    """
+    Perform linear regression on the provided weekly sales data.
+    
+    Returns:
+      "Increasing (▲)" if the slope > 0,
+      "Decreasing (▼)" if the slope < 0,
+      "Stable (-)" if the slope is near zero.
+    """
+    if len(historical_sales_52) < 2:
+        return "Stable (-)"
+    x = np.arange(len(historical_sales_52))
+    slope, intercept, r_val, p_val, std_err = linregress(x, historical_sales_52)
+    if slope > 0:
+        return "Increasing (▲)"
+    elif slope < 0:
+        return "Decreasing (▼)"
+    else:
+        return "Stable (-)"
+
+def compute_seasonality_index(week_number, average_annual_sales):
+    """
+    Compute a seasonality index as a placeholder.
+    
+    In practice, compare actual weekly sales to average_annual_sales.
+    Here, we return a dummy ratio between 0.8 and 1.2.
+    """
+    ratio = np.random.uniform(0.8, 1.2)
+    return round(ratio, 2)
+
+def compute_sales_volume_rank(asins_total_sales, asin):
+    """
+    Rank the given ASIN by total historical sales.
+    
+    asins_total_sales: dict {asin: total_sales, ...}
+    """
+    sorted_asins = sorted(asins_total_sales.keys(), key=lambda k: asins_total_sales[k], reverse=True)
+    rank = sorted_asins.index(asin) + 1
+    return rank
+
+def determine_lifecycle_stage(slope):
+    """
+    Label lifecycle stage based on the sales trend slope.
+    
+    If slope >= 0.1: 'Growth'
+    If slope <= -0.1: 'Decline'
+    Else: 'Mature'
+    """
+    if slope >= 0.1:
+        return "Growth"
+    elif slope <= -0.1:
+        return "Decline"
+    else:
+        return "Mature"
 
 ##############################
 # Reward & Penalty Functions
@@ -116,7 +253,29 @@ def load_param_histories():
                 entry['avg_mae'] = 0.0
             if 'avg_rmse' not in entry or entry['avg_rmse'] is None:
                 entry['avg_rmse'] = 0.0
+
+def load_runrate_inventory(runrate_file):
+    """
+    Loads the Runrate.xlsx file, which has columns:
+    'ASIN', 'UPC', 'Model Name', 'OTW', 'INV', 'Total Inventory', 'POS (Shipped)', 'Ordered Units'
     
+    Returns a dict: { asin: total_inventory }
+    """
+    runrate_df = pd.read_excel(runrate_file)
+    # Ensure the column names match exactly
+    runrate_df.columns = runrate_df.columns.str.strip()
+    
+    inventory_dict = {}
+    for _, row in runrate_df.iterrows():
+        asin = str(row['ASIN']).strip()
+        total_inv = row.get('Total Inventory', 0)
+        # Convert or coerce to int if needed
+        try:
+            total_inv = int(total_inv)
+        except:
+            total_inv = 0
+        inventory_dict[asin] = total_inv
+    return inventory_dict
 
 
 ##############################
@@ -675,110 +834,19 @@ def get_shifted_holidays():
     holidays['ds'] = pd.to_datetime(holidays['ds'])
     return holidays
 
-
-##############################
-# XGBoost Training and SHAP Feature Importance
-##############################
-
-def train_xgboost(ts_data, target='y', features=None):
-    """
-    Train an XGBoost model on the provided ts_data, using specified features for regression.
-    Returns the trained model, feature names, and SHAP values for importance.
-    """
-    if features is None:
-        # Default to just the lag feature if not specified
-        features = [col for col in ts_data.columns if col.startswith('lag_')]
-
-    # Drop rows where target or features are NaN
-    valid_data = ts_data.dropna(subset=[target] + features)
-    if valid_data.empty:
-        print("No valid data available for XGBoost training.")
-        return None, None, None
-
-    X = valid_data[features]
-    y = valid_data[target]
-
-    # Basic train/test split (can be replaced with walk-forward if needed)
-    split_idx = int(len(valid_data) * 0.8)
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-
-    model = xgb.XGBRegressor(
-        n_estimators=200,
-        learning_rate=0.05,
-        max_depth=4,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
-    )
-    model.fit(X_train, y_train, 
-              eval_set=[(X_test, y_test)], 
-              verbose=False)
-
-    explainer = shap.Explainer(model)
-    shap_values = explainer(X)
-
-    # Suppress the SHAP plot in code (no display in many environments)
-    shap.summary_plot(shap_values, X, show=False)
-
-    return model, features, shap_values
-
-def xgboost_forecast(model, ts_data, forecast_steps=16, target='y', features=None):
-    """
-    Generate XGBoost forecasts for the specified future steps using last known features as the basis.
-    We unify the forecast column to "MyForecast".
-    """
-    if features is None:
-        features = [col for col in ts_data.columns if col.startswith('lag_')]
-
-    ts_data = ts_data.sort_values('ds').copy()
-    last_date = ts_data['ds'].max()
-
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=forecast_steps, freq='W-SUN')
-    forecasts = []
-
-    current_data = ts_data.copy()
-
-    for i in range(forecast_steps):
-        X_pred = current_data.iloc[[-1]][features]
-        y_pred = model.predict(X_pred)[0]
-        y_pred = max(int(round(y_pred)), 0)
-
-        forecast_date = future_dates[i]
-        forecasts.append((forecast_date, y_pred))
-
-        for feat in features:
-            if 'lag_' in feat:
-                lag_num = int(feat.split('_')[1])
-                if lag_num == 1:
-                    current_data.loc[current_data.index[-1], feat] = y_pred
-                else:
-                    prev_feat = f'lag_{lag_num-1}_week'
-                    current_data.loc[current_data.index[-1], feat] = current_data.loc[current_data.index[-1], prev_feat]
-
-        new_row = current_data.iloc[[-1]].copy()
-        new_row['ds'] = forecast_date
-        new_row[target] = y_pred
-        current_data = pd.concat([current_data, new_row], ignore_index=True)
-
-    df_forecasts = pd.DataFrame(forecasts, columns=['ds', 'MyForecast'])
-    return df_forecasts
-
-
 ##############################
 # Ensemble Approach (SARIMA, Prophet, XGBoost)
 ##############################
 
-def ensemble_forecast(sarima_preds, prophet_preds, xgb_preds, amazon_mean_preds, weights):
+def ensemble_forecast(sarima_preds, prophet_preds, amazon_mean_preds, weights):
     """
-    Weighted ensemble of forecasts from SARIMA, Prophet, XGBoost, and Amazon Mean.
-    weights: [w_sarima, w_prophet, w_xgb, w_mean]
+    Weighted ensemble of forecasts from SARIMA, Prophet, and Amazon Mean.
+    weights: [w_sarima, w_prophet, w_mean]
     """
     return (
-        weights[0] * sarima_preds
-        + weights[1] * prophet_preds
-        + weights[2] * xgb_preds
-        + weights[3] * amazon_mean_preds
+        weights[0] * sarima_preds +
+        weights[1] * prophet_preds +
+        weights[2] * amazon_mean_preds
     )
 
 def evaluate_forecast(actual, forecast):
@@ -786,9 +854,10 @@ def evaluate_forecast(actual, forecast):
     rmse = sqrt(mean_squared_error(actual, forecast))
     return rmse
 
-def walk_forward_validation_ensemble(ts_data, n_test, model_sarima, model_prophet, model_xgb, weights):
+def walk_forward_validation_ensemble(ts_data, n_test, model_sarima, model_prophet, weights):
     """
-    Example walk-forward validation for an ensemble approach.
+    Example walk-forward validation for an ensemble approach using SARIMA and Prophet.
+    weights: [w_sarima, w_prophet]
     """
     predictions = []
     actuals = []
@@ -800,7 +869,7 @@ def walk_forward_validation_ensemble(ts_data, n_test, model_sarima, model_prophe
 
         # SARIMA forecast for next step
         if model_sarima is not None:
-            exog_test = None
+            exog_test = None  # Modify if your SARIMA requires exogenous variables
             sarima_value = model_sarima.forecast(steps=1, exog=exog_test)
             sarima_value = int(round(sarima_value.iloc[0]))
         else:
@@ -814,22 +883,14 @@ def walk_forward_validation_ensemble(ts_data, n_test, model_sarima, model_prophe
         else:
             prophet_value = 0
 
-        # XGBoost forecast for next step
-        if model_xgb is not None:
-            x_test = test_point[[c for c in ts_data.columns if c.startswith('lag_')]].values.reshape(1, -1)
-            xgb_value = model_xgb.predict(x_test)[0]
-            xgb_value = int(round(max(xgb_value, 0)))
-        else:
-            xgb_value = 0
-
-        # Simple approach: ignoring Amazon in this snippet
-        ensemble_pred = sarima_value
+        # Ensemble forecast: weighted combination of SARIMA and Prophet
+        ensemble_pred = weights[0] * sarima_value + weights[1] * prophet_value
         ensemble_pred = int(round(ensemble_pred))
         predictions.append(ensemble_pred)
         actuals.append(test_point['y'])
 
-    rmse = evaluate_forecast(actuals, predictions)
-    return rmse, predictions, actuals
+    rmse_val = evaluate_forecast(actuals, predictions)
+    return rmse_val, predictions, actuals
 
 def print_ensemble_summary(rmse, predictions, actuals):
     """Display a user-friendly summary of the ensemble results."""
@@ -837,18 +898,18 @@ def print_ensemble_summary(rmse, predictions, actuals):
     print(f"Number of Observations: {len(actuals)}")
     print(f"RMSE: {rmse:.2f}")
     mae_val = mean_absolute_error(actuals, predictions)
-    mape_val = mean_absolute_percentage_error(actuals, predictions)*100
+    mape_val = mean_absolute_percentage_error(actuals, predictions) * 100
     print(f"MAE: {mae_val:.2f}")
     print(f"MAPE: {mape_val:.2f}%")
     print("=================================\n")
 
-def create_decision_matrix(sarima_rmse, prophet_rmse, xgb_rmse, ensemble_rmse):
+def create_decision_matrix(sarima_rmse, prophet_rmse, ensemble_rmse):
     """
     Create a simple decision matrix showing which model performed best.
     """
     data = {
-        'Model': ['SARIMA', 'Prophet', 'XGBoost', 'Ensemble'],
-        'RMSE': [sarima_rmse, prophet_rmse, xgb_rmse, ensemble_rmse]
+        'Model': ['SARIMA', 'Prophet', 'Ensemble'],
+        'RMSE': [sarima_rmse, prophet_rmse, ensemble_rmse]
     }
     df = pd.DataFrame(data)
     df.sort_values(by='RMSE', inplace=True)
@@ -1413,79 +1474,127 @@ def save_summary_to_excel(
     output_file_path,
     metrics=None
 ):
-    # 1) Drop unwanted columns (ds, yhat, etc.) so only old columns remain
-    unwanted_cols = [
-        'yhat','yhat_upper','Diff_Mean','Diff_P70','Diff_P80','Diff_P90',
-        'Pct_Mean','Pct_P70','Pct_P80','Pct_P90','MyForecast_XGB','y'
-    ]
-    for col in unwanted_cols:
-        if col in comparison.columns:
-            comparison.drop(columns=[col], inplace=True)
+    """
+    Saves the 'comparison' DataFrame and a summary sheet to 'output_file_path' in Excel.
+    It ensures that 'Week_Start_Date' and 'Week' columns exist before sorting or enumerating.
 
-    # 2) If 'ds' is present, turn it into 'Week_Start_Date'
-    if 'ds' in comparison.columns:
-        comparison['ds'] = pd.to_datetime(comparison['ds'], errors='coerce')
-        # Populate 'Week_Start_Date' from 'ds'
-        comparison['Week_Start_Date'] = comparison['ds'].dt.strftime('%Y-%m-%d')
-        comparison.drop(columns=['ds'], inplace=True)  # remove ds
+    Parameters:
+      comparison (pd.DataFrame): The forecast data for a single ASIN (or multiple).
+      summary_stats (dict): Basic stats for historical data (min, max, mean, total, etc.).
+      total_forecast_16, total_forecast_8, total_forecast_4 (float): Summations of MyForecast for
+        the next 16, 8, and 4 weeks respectively.
+      max_forecast, min_forecast (float): The max/min forecast values found in the next horizon.
+      max_week, min_week (datetime or str): The week of the max/min forecast.
+      output_file_path (str): Where to write the Excel file.
+      metrics (dict or None): Optional additional model evaluation metrics (RMSE, MAE, etc.).
 
-    # 3) If "Week" is missing, create it with “W1..Wn” (no zero‐padding!)
+    """
+    # 1) Ensure we have 'Week_Start_Date' or create from 'ds' if it doesn't exist
+    if 'Week_Start_Date' not in comparison.columns:
+        if 'ds' in comparison.columns:
+            # Convert 'ds' to string date
+            comparison['Week_Start_Date'] = pd.to_datetime(
+                comparison['ds'], errors='coerce'
+            ).dt.strftime('%Y-%m-%d')
+        else:
+            # Fallback: create empty or placeholder
+            comparison['Week_Start_Date'] = ''
+
+    # 2) If "Week" is missing, create it from the sorted index (after sorting by 'Week_Start_Date').
+    #    If "Week" already exists, we can still do a sort, but be sure to handle carefully.
+    #    We'll unify the approach so everything gets sorted by 'Week_Start_Date' first.
+    comparison = comparison.sort_values(
+        'Week_Start_Date', na_position='last'
+    ).reset_index(drop=True)
+
     if 'Week' not in comparison.columns:
-        comparison = comparison.sort_values('Week_Start_Date', na_position='last').reset_index(drop=True)
-        comparison['Week'] = ['W' + str(i+1) for i in range(len(comparison))]  # e.g. W1, W2, ...
+        # Create "Week" labels as "W1", "W2", ...
+        comparison['Week'] = ['W' + str(i + 1) for i in range(len(comparison))]
 
-    # 4) Clean numeric columns (MyForecast, Amazon Mean Forecast, etc.) so no inf or NaN
+    # 3) Now that we have a sorted DataFrame with "Week_Start_Date" and "Week", we can proceed.
+
+    # 4) Clean numeric columns if needed. For example, remove inf or NaN from forecast columns.
     forecast_cols = [
-        'MyForecast','Amazon Mean Forecast','Amazon P70 Forecast',
-        'Amazon P80 Forecast','Amazon P90 Forecast'
+        "MyForecast",
+        "Amazon Mean Forecast",
+        "Amazon P70 Forecast",
+        "Amazon P80 Forecast",
+        "Amazon P90 Forecast"
     ]
     for fc in forecast_cols:
         if fc in comparison.columns:
-            comparison[fc] = comparison[fc].replace([np.inf, -np.inf], 0).fillna(0)
-            comparison[fc] = comparison[fc].round().astype(int)
+            comparison[fc] = comparison[fc].replace([float('inf'), -float('inf')], 0).fillna(0)
+            # Convert to int if you want integer forecasts
+            comparison[fc] = comparison[fc].astype(int, errors='ignore')
 
-    # 5) Reorder final columns to your old format
+    # 5) Reorder final columns to your old format or desired format:
     desired_cols = [
-        'Week', 'Week_Start_Date', 'ASIN', 'MyForecast','Amazon Mean Forecast',
-        'Amazon P70 Forecast','Amazon P80 Forecast','Amazon P90 Forecast',
-        'Product Title','is_holiday_week'
+        "Week",
+        "Week_Start_Date",
+        "ASIN",
+        "MyForecast",
+        "Amazon Mean Forecast",
+        "Amazon P70 Forecast",
+        "Amazon P80 Forecast",
+        "Amazon P90 Forecast",
+        "Product Title",
+        "is_holiday_week",
+        # Add any new columns like "Trend", "Inventory Coverage", etc. if you wish:
+        "Trend",
+        "Inventory Coverage",
+        "Stockout Risk",
+        "Reorder Urgency",
+        "Sales Trend",
+        "Seasonality Index",
+        "Lifecycle Stage"
     ]
-    # Make sure all exist
     for col in desired_cols:
         if col not in comparison.columns:
-            comparison[col] = ''
+            comparison[col] = ''  # create blank if missing
 
+    # Filter the DataFrame to just the columns we want, in the order we want
     comparison = comparison[desired_cols]
 
-    # === Write to Excel (summary + main sheet) ===
+    # 6) Write to Excel
     wb = Workbook()
     ws_main = wb.active
     ws_main.title = "Forecast Comparison"
 
-    # Write main data
+    # Write the main DataFrame
     from openpyxl.utils.dataframe import dataframe_to_rows
     for row in dataframe_to_rows(comparison, index=False, header=True):
         ws_main.append(row)
 
-    # Create summary sheet
+    # 7) Create a Summary sheet
     ws_summary = wb.create_sheet("Summary")
     summary_data = {
         "Metric": [
-            "Historical Range","Min Sales","Max Sales","Mean Sales",
-            "Median Sales","Std Dev Sales","Total Historical Sales",
-            "Total Forecast (16 Weeks)","Total Forecast (8 Weeks)",
-            "Total Forecast (4 Weeks)","Max Forecast","Max Forecast Week",
-            "Min Forecast","Min Forecast Week"
+            "Historical Range",
+            "Min Sales",
+            "Max Sales",
+            "Mean Sales",
+            "Median Sales",
+            "Std Dev Sales",
+            "Total Historical Sales",
+            "Total Forecast (16 Weeks)",
+            "Total Forecast (8 Weeks)",
+            "Total Forecast (4 Weeks)",
+            "Max Forecast",
+            "Max Forecast Week",
+            "Min Forecast",
+            "Min Forecast Week"
         ],
         "Value": [
-            f"{summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}",
-            f"{summary_stats['min']:.0f}",
-            f"{summary_stats['max']:.0f}",
-            f"{summary_stats['mean']:.0f}",
-            f"{summary_stats['median']:.0f}",
-            f"{summary_stats['std_dev']:.0f}",
-            f"{summary_stats['total_sales']:.0f} units",
-            f"{total_forecast_16:.0f}", f"{total_forecast_8:.0f}", f"{total_forecast_4:.0f}",
+            f"{summary_stats['data_range'][0].strftime('%Y-%m-%d')} to {summary_stats['data_range'][1].strftime('%Y-%m-%d')}" if 'data_range' in summary_stats else '',
+            f"{summary_stats.get('min', 0):.0f}",
+            f"{summary_stats.get('max', 0):.0f}",
+            f"{summary_stats.get('mean', 0):.0f}",
+            f"{summary_stats.get('median', 0):.0f}",
+            f"{summary_stats.get('std_dev', 0):.0f}",
+            f"{summary_stats.get('total_sales', 0):.0f} units",
+            f"{total_forecast_16:.0f}",
+            f"{total_forecast_8:.0f}",
+            f"{total_forecast_4:.0f}",
             f"{max_forecast:.0f}",
             f"{max_week.strftime('%Y-%m-%d') if max_week else 'N/A'}",
             f"{min_forecast:.0f}",
@@ -1493,6 +1602,7 @@ def save_summary_to_excel(
         ]
     }
     if metrics is not None:
+        # Append metrics to summary_data
         for k, v in metrics.items():
             summary_data["Metric"].append(k)
             summary_data["Value"].append(str(v))
@@ -1501,8 +1611,10 @@ def save_summary_to_excel(
     for row in dataframe_to_rows(summary_df, index=False, header=True):
         ws_summary.append(row)
 
+    # 8) Save workbook
     wb.save(output_file_path)
     print(f"Comparison and summary saved to '{output_file_path}'")
+
 
 def save_4_8_16_forecast_summary(consolidated_data, output_folder):
     """
@@ -2063,45 +2175,49 @@ def backtest_forecast(ts_data, model_function, horizon=16, folder_name="Training
 # Function to Optimize Ensemble Weights
 ##############################
 
-def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, xgb_preds):
+def optimize_ensemble_weights(actual, sarima_preds, prophet_preds, amazon_mean_preds):
     """
-    Example of optimizing ensemble weights for three model forecasts.
+    Optimize ensemble weights for forecasts from SARIMA, Prophet, and Amazon Mean.
+    Returns a dictionary with optimized weights and performance metrics.
     """
     initial_weights = [1/3, 1/3, 1/3]
     constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
     bounds = [(0, 1), (0, 1), (0, 1)]
 
     def objective(weights):
-        ensemble_preds = (weights[0] * sarima_preds +
-                          weights[1] * prophet_preds +
-                          weights[2] * xgb_preds)
-        rmse = np.sqrt(mean_squared_error(actual, ensemble_preds))
-        mape = mean_absolute_error(actual, ensemble_preds)
-        return rmse + mape
+        ensemble_preds = (
+            weights[0] * sarima_preds +
+            weights[1] * prophet_preds +
+            weights[2] * amazon_mean_preds
+        )
+        rmse_val = np.sqrt(mean_squared_error(actual, ensemble_preds))
+        mae_val = mean_absolute_error(actual, ensemble_preds)
+        return rmse_val + mae_val
 
     result = minimize(objective, initial_weights, constraints=constraints, bounds=bounds, method='SLSQP')
     if result.success:
         optimized_weights = result.x
-        ensemble_preds = (optimized_weights[0] * sarima_preds +
-                          optimized_weights[1] * prophet_preds +
-                          optimized_weights[2] * xgb_preds)
-        rmse = np.sqrt(mean_squared_error(actual, ensemble_preds))
-        mae = mean_absolute_error(actual, ensemble_preds)
+        ensemble_preds = (
+            optimized_weights[0] * sarima_preds +
+            optimized_weights[1] * prophet_preds +
+            optimized_weights[2] * amazon_mean_preds
+        )
+        rmse_val = np.sqrt(mean_squared_error(actual, ensemble_preds))
+        mae_val = mean_absolute_error(actual, ensemble_preds)
         return {
             'weights': {
                 'SARIMA': optimized_weights[0],
                 'Prophet': optimized_weights[1],
-                'XGBoost': optimized_weights[2],
+                'Amazon Mean': optimized_weights[2]
             },
             'metrics': {
-                'RMSE': rmse,
-                'MAE': mae,
+                'RMSE': rmse_val,
+                'MAE': mae_val
             },
             'ensemble_preds': ensemble_preds
         }
     else:
         raise ValueError("Optimization failed: " + result.message)
-
 
 ##############################
 # Adjust Forecast If Out of Range
@@ -2656,6 +2772,34 @@ def forecast_sales_with_po_regressor(sales_file='weekly_sales_data.xlsx',
 
     return forecast_out, model, cv_metrics
 
+##############################
+#life cycle functions
+##############################
+def lifecycle_stage_from_slope(slope):
+    """
+    Lifecycle Stage = 
+      - Growth   if slope > 0.1
+      - Decline  if slope < -0.1
+      - Mature   otherwise
+    """
+    if slope > 0.1:
+        return "Growth"
+    elif slope < -0.1:
+        return "Decline"
+    else:
+        return "Mature"
+
+def compute_sales_slope(historical_sales_52):
+    """
+    Returns the numeric slope from the last 52 weeks of actual sales.
+    If len < 2, returns 0.0 for slope.
+    """
+    if len(historical_sales_52) < 2:
+        return 0.0
+    x = np.arange(len(historical_sales_52))
+    slope, _, _, _, _ = linregress(x, historical_sales_52)
+    return slope
+
 
 ##############################
 # Main
@@ -2663,17 +2807,22 @@ def forecast_sales_with_po_regressor(sales_file='weekly_sales_data.xlsx',
 
 def main():
     # ----------------------------------------------------------------------------
-    # 1) Load existing parameter histories, sales data, config, etc.
+    # 1) Load existing parameter histories, runrate data, sales data, config
     # ----------------------------------------------------------------------------
     load_param_histories()
 
+    # 1A) Load runrate inventory file and store into a dictionary {asin: total_inventory}
+    runrate_file = "Runrate.xlsx"  
+    runrate_inventory = load_runrate_inventory(runrate_file)
+
+    # The usual files
     sales_file = 'weekly_sales_data.xlsx'
     forecasts_folder = 'forecasts_folder'
     asins_to_forecast_file = 'ASINs to Forecast.xlsx'
     horizon = 16
-    output_file = 'consolidated_forecast_WITH_PO.xlsx'  # Single final workbook with PO data
+    output_file = 'consolidated_forecast_WITH_PO.xlsx'
 
-    # Load weekly sales data
+    # 1B) Load weekly sales data
     data = load_weekly_sales_data(sales_file)
     valid_data = data[data['asin'].notna() & (data['asin'] != '#N/A')]
     missing_asin_data = data[data['asin'].isna() | (data['asin'] == '#N/A')]
@@ -2682,38 +2831,38 @@ def main():
         print("The following entries have no ASIN and will be noted in the forecast file:")
         print(missing_asin_data[['product title', 'week', 'year', 'y']].to_string())
 
-    # Load the ASINs to forecast
+    # 1C) Load the ASINs to forecast
     asins_to_forecast = load_asins_to_forecast(asins_to_forecast_file)
     print(f"ASINs to forecast: {asins_to_forecast}")
 
-    # Filter valid_data to only ASINs in asins_to_forecast
+    # 1D) Filter valid_data to only ASINs we actually want
     asin_list = valid_data['asin'].unique()
     asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
-    # Create a dictionary to store final forecasts for each ASIN
+    # 1E) Create dictionary to store final forecasts (WITH PO)
     consolidated_forecasts_with_po = {}
 
-    # Parameter grid for Prophet
+    # 1F) Prophet parameter grid
     param_grid = {
         'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
         'seasonality_prior_scale': [0.05, 0.1, 1, 2, 3, 4, 5],
         'holidays_prior_scale': [5, 10, 15]
     }
 
-    # Get holiday data
+    # 1G) Load holiday data
     holidays = get_shifted_holidays()
 
-    # Optional cross-validation on first ASIN in the list (just for demonstration)
+    # 1H) Optional cross-validation on the first ASIN
     if len(asin_list) > 0:
         test_asin = asin_list[0]
         test_ts_data = prepare_time_series_with_lags(valid_data, test_asin, lag_weeks=1)
         if not test_ts_data.empty and len(test_ts_data.dropna()) >= 2:
-            print(f"Performing cross-validation on ASIN {test_asin} Prophet model (without PO, just for test).")
+            print(f"Performing cross-validation on ASIN {test_asin} Prophet model (for test only).")
             cross_validate_prophet_model(test_ts_data, initial='180 days', period='90 days', horizon='90 days')
         else:
             print(f"Not enough data for {test_asin} to perform cross-validation test.")
 
-    # Create output folders
+    # 1I) Create output folders
     insufficient_data_folder = "Insufficient data"
     with_po_folder = "Sufficient data WITH_PO"
     os.makedirs(insufficient_data_folder, exist_ok=True)
@@ -2722,7 +2871,7 @@ def main():
     global PARAM_COUNTER
 
     # ----------------------------------------------------------------------------
-    # 2) Load and prepare global PO data once, for merging with each ASIN
+    # 2) Load and prepare global PO data (for merging per ASIN)
     # ----------------------------------------------------------------------------
     po_file = "po database.xlsx"
     po_df = pd.read_excel(po_file)
@@ -2739,7 +2888,7 @@ def main():
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
 
     # ----------------------------------------------------------------------------
-    # 3) For each ASIN, generate a forecast WITH PO
+    # 3) For each ASIN, generate forecast WITH PO integration
     # ----------------------------------------------------------------------------
     for asin in asin_list:
         if pd.isna(asin) or asin == '#N/A':
@@ -2749,21 +2898,17 @@ def main():
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
 
-        # Load Amazon forecasts from folder
+        # 3A) Load Amazon forecasts from folder
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
             print(f"No forecast data found for ASIN {asin}, skipping.")
             continue
 
-        # =========================
-        # 3.1) Prepare base time-series data
-        # =========================
+        # 3B) Prepare Base Time Series Data with lags
         ts_data_base = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
         print(f"Time series base data for ASIN {asin} prepared. Size: {len(ts_data_base)}")
 
-        # =========================
-        # 3.2) Merge PO data for this ASIN
-        # =========================
+        # 3C) Merge PO data for this ASIN
         asin_po_df = po_df[po_df['ASIN'] == asin].copy()
         asin_po_df['OrderWeek'] = asin_po_df['Order date'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
         weekly_po = asin_po_df.groupby('OrderWeek', as_index=False)['Requested quantity'].sum()
@@ -2775,12 +2920,9 @@ def main():
         ts_data_with_po['Weekly_PO_Qty'] = ts_data_with_po['Weekly_PO_Qty'].fillna(0)
         print(f"Time series data (WITH PO) for ASIN {asin} prepared. Size: {len(ts_data_with_po)}")
 
-        # Check how many non-NaN points remain
+        # 3D) Check if insufficient data (<10); fallback or normal pipeline
         non_nan_count_with_po = len(ts_data_with_po.dropna())
         if non_nan_count_with_po < 10:
-            # ----------------------------------------------------------------------------
-            # 4) Fallback approach if < 10 data points: 90% Amazon Mean + 10% naive SARIMA
-            # ----------------------------------------------------------------------------
             print(f"ASIN {asin} has only {non_nan_count_with_po} data points (WITH PO). Using fallback approach.")
             if not ts_data_with_po.empty:
                 last_y_value_po = ts_data_with_po['y'].iloc[-1]
@@ -2789,21 +2931,24 @@ def main():
                 last_y_value_po = 0
                 last_date_po = pd.to_datetime("today")
 
-            future_dates_po = pd.date_range(start=last_date_po + pd.Timedelta(weeks=1),
-                                            periods=horizon, freq='W')
-            fallback_sarima_vals_po = [last_y_value_po]*horizon
+            fallback_dates_with_po = pd.date_range(
+                start=last_date_po + pd.Timedelta(weeks=1),
+                periods=horizon, 
+                freq='W'
+            )
+            fallback_sarima_vals_with_po = [last_y_value_po]*horizon
 
-            fallback_df_po = pd.DataFrame({
-                'ds': future_dates_po,
-                'Fallback_SARIMA': fallback_sarima_vals_po
+            fallback_df_with_po = pd.DataFrame({
+                'ds': fallback_dates_with_po,
+                'Fallback_SARIMA': fallback_sarima_vals_with_po
             })
 
-            # Merge Amazon Mean forecast
             amz_mean_key_po = None
             for ftype in forecast_data.keys():
                 if 'mean' in ftype.lower():
                     amz_mean_key_po = ftype
                     break
+
             if amz_mean_key_po is None:
                 print("Warning: No 'Mean' forecast found in Amazon data (WITH PO). Using 0.")
                 amazon_mean_with_po = [0]*horizon
@@ -2815,25 +2960,29 @@ def main():
                     pad_needed_with_po = horizon - len(raw_arr_with_po)
                     amazon_mean_with_po = list(raw_arr_with_po) + [raw_arr_with_po[-1]]*pad_needed_with_po
 
-            fallback_df_po['Amazon Mean Forecast'] = amazon_mean_with_po
+            fallback_df_with_po['Amazon Mean Forecast'] = amazon_mean_with_po
 
-            # Weighted fallback
+            # Weighted fallback logic
             weight_amz_po = 0.9
             weight_sarima_po = 0.1
             final_vals_po = []
             for i in range(horizon):
-                mean_val_po = fallback_df_po['Amazon Mean Forecast'].iloc[i]
-                sarima_val_po = fallback_df_po['Fallback_SARIMA'].iloc[i]
+                mean_val_po = fallback_df_with_po['Amazon Mean Forecast'].iloc[i]
+                sarima_val_po = fallback_df_with_po['Fallback_SARIMA'].iloc[i]
                 combined_po = (weight_amz_po * mean_val_po) + (weight_sarima_po * sarima_val_po)
                 final_vals_po.append(int(round(max(combined_po, 0))))
-
-            fallback_df_po['MyForecast'] = final_vals_po
-            fallback_df_po['ASIN'] = asin
-            fallback_df_po['Product Title'] = product_title
+            fallback_df_with_po['MyForecast'] = final_vals_po
+            fallback_df_with_po['ASIN'] = asin
+            fallback_df_with_po['Product Title'] = product_title
 
             # Plot fallback
             plt.figure(figsize=(10,6))
-            plt.plot(fallback_df_po['ds'], fallback_df_po['MyForecast'], marker='o', label='MyForecast')
+            plt.plot(
+                fallback_df_with_po['ds'], 
+                fallback_df_with_po['MyForecast'], 
+                marker='o', 
+                label='MyForecast'
+            )
             plt.title(f'Fallback (WITH PO) Forecast for ASIN {asin}')
             plt.xlabel('Date')
             plt.ylabel('Requested Quantity')
@@ -2846,47 +2995,50 @@ def main():
             plt.close()
             print(f"Fallback (WITH PO) chart saved to {fallback_chart_with_po}")
 
-            fallback_df_po.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
-            fallback_df_po['Week'] = pd.to_datetime(fallback_df_po['Week_Start_Date']).dt.isocalendar().week.apply(
-                lambda w: 'W' + str(w).zfill(2)
-            )
-            fallback_df_po['is_holiday_week'] = False
+            fallback_df_with_po.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
+            fallback_df_with_po['Week'] = pd.to_datetime(
+                fallback_df_with_po['Week_Start_Date']
+            ).dt.isocalendar().week.apply(lambda w: 'W' + str(w).zfill(2))
+            fallback_df_with_po['is_holiday_week'] = False
 
-            desired_cols_po = [
-                'Week','Week_Start_Date','ASIN','MyForecast','Amazon Mean Forecast',
-                'Amazon P70 Forecast','Amazon P80 Forecast','Amazon P90 Forecast',
-                'Product Title','is_holiday_week'
+            desired_columns_po = [
+                'Week', 
+                'Week_Start_Date', 
+                'ASIN', 
+                'MyForecast', 
+                'Amazon Mean Forecast',
+                'Amazon P70 Forecast', 
+                'Amazon P80 Forecast', 
+                'Amazon P90 Forecast',
+                'Product Title', 
+                'is_holiday_week'
             ]
             for col in ['Amazon P70 Forecast','Amazon P80 Forecast','Amazon P90 Forecast']:
-                if col not in fallback_df_po.columns:
-                    fallback_df_po[col] = 0
-            fallback_df_po = fallback_df_po[desired_cols_po]
+                if col not in fallback_df_with_po.columns:
+                    fallback_df_with_po[col] = 0
+            fallback_df_with_po = fallback_df_with_po[desired_columns_po]
 
-            # Store fallback in consolidated_forecasts_with_po
-            consolidated_forecasts_with_po[asin] = fallback_df_po
-            # Save to Excel
+            consolidated_forecasts_with_po[asin] = fallback_df_with_po
             fallback_with_po_path = os.path.join(with_po_folder, f"{asin}_fallback_WITH_PO.xlsx")
-            fallback_df_po.to_excel(fallback_with_po_path, index=False)
+            fallback_df_with_po.to_excel(fallback_with_po_path, index=False)
             print(f"Saved fallback (WITH PO) forecast for ASIN {asin} to {fallback_with_po_path}")
 
         else:
-            # ----------------------------------------------------------------------------
-            # 5) Enough data => normal pipeline, but we pass "ts_data_with_po"
-            #    (exogenous=Weekly_PO_Qty for SARIMA, or .add_regressor('Weekly_PO_Qty') for Prophet)
-            # ----------------------------------------------------------------------------
-            model_with_po, model_type_with_po = choose_forecast_model(ts_data_with_po, threshold=FALLBACK_THRESHOLD, holidays=holidays)
+            # 5) Normal Pipeline (WITH PO)
+            model_with_po, model_type_with_po = choose_forecast_model(
+                ts_data_with_po,
+                threshold=FALLBACK_THRESHOLD,
+                holidays=holidays
+            )
 
-            # XGBoost with PO - if you want to treat 'Weekly_PO_Qty' as a feature
-            xgb_model_with_po, xgb_features_with_po, xgb_shap_values_with_po = train_xgboost(ts_data_with_po, target='y')
-
-            # (A) SARIMA with PO
+            # == SARIMA WITH PO
             if model_type_with_po == "SARIMA":
                 n_with_po = len(ts_data_with_po)
                 split_with_po = int(n_with_po * 0.8)
                 train_sarima_with_po = ts_data_with_po.iloc[:split_with_po]
                 test_sarima_with_po = ts_data_with_po.iloc[split_with_po:]
 
-                # Build exog for the test set: holiday + Weekly_PO_Qty
+                # Exogenous for test
                 exog_test_with_po = create_holiday_regressors(test_sarima_with_po, holidays)
                 if 'Weekly_PO_Qty' in test_sarima_with_po.columns:
                     exog_test_with_po['Weekly_PO_Qty'] = test_sarima_with_po['Weekly_PO_Qty'].values
@@ -2903,7 +3055,7 @@ def main():
                         asin=asin
                     )
                     if best_sarima_model_with_po is None:
-                        print(f"[WITH PO][SARIMA] No model after fit for {asin}, skipping.")
+                        print(f"[WITH PO][SARIMA] Fitting failed for {asin}, skipping.")
                         continue
 
                     steps_with_po = len(test_sarima_with_po)
@@ -2926,9 +3078,11 @@ def main():
                         mae=sarima_mae_with_po
                     )
 
-                    # Build exog for the future
                     last_date_full_with_po = ts_data_with_po['ds'].iloc[-1]
-                    exog_future_with_po = generate_future_exog(holidays, steps=horizon, last_date=last_date_full_with_po)
+                    exog_future_with_po = generate_future_exog(
+                        holidays, steps=horizon, last_date=last_date_full_with_po
+                    )
+                    # Provide future Weekly_PO_Qty if needed
                     exog_future_with_po['Weekly_PO_Qty'] = ts_data_with_po['Weekly_PO_Qty'].mean()
 
                     final_forecast_df_with_po = sarima_forecast(
@@ -2944,7 +3098,10 @@ def main():
                     comparison_with_po = final_forecast_df_with_po.copy()
                     comparison_with_po['ASIN'] = asin
                     comparison_with_po['Product Title'] = product_title
-                    comparison_with_po = comparison_with_po.merge(ts_data_with_po[['ds','y']], on='ds', how='left')
+                    # Merge actual y for reference
+                    comparison_with_po = comparison_with_po.merge(
+                        ts_data_with_po[['ds','y']], on='ds', how='left'
+                    )
 
                     # Blend with Amazon forecasts
                     if forecast_data:
@@ -2952,12 +3109,14 @@ def main():
                             horizon_vals = values[:horizon] if len(values) >= horizon else values
                             if len(horizon_vals) < horizon and len(horizon_vals) > 0:
                                 horizon_vals = np.pad(
-                                    horizon_vals, (0, horizon - len(horizon_vals)),
-                                    'constant', constant_values=horizon_vals[-1]
+                                    horizon_vals,
+                                    (0,horizon-len(horizon_vals)),
+                                    'constant',
+                                    constant_values=horizon_vals[-1]
                                 )
                             elif len(horizon_vals) == 0:
                                 horizon_vals = np.zeros(horizon, dtype=int)
-
+                            
                             ftype_lower = ftype.lower()
                             if 'mean' in ftype_lower:
                                 comparison_with_po['Amazon Mean Forecast'] = horizon_vals
@@ -2975,40 +3134,23 @@ def main():
                         P70_WEIGHT = 0.2
                         P80_WEIGHT = 0.1
                         blended_amz_with_po = (
-                            MEAN_WEIGHT * comparison_with_po['Amazon Mean Forecast']
-                            + P70_WEIGHT * comparison_with_po.get('Amazon P70 Forecast', 0)
-                            + P80_WEIGHT * comparison_with_po.get('Amazon P80 Forecast', 0)
+                            MEAN_WEIGHT * comparison_with_po['Amazon Mean Forecast'] +
+                            P70_WEIGHT * comparison_with_po.get('Amazon P70 Forecast', 0) +
+                            P80_WEIGHT * comparison_with_po.get('Amazon P80 Forecast', 0)
                         ).clip(lower=0)
 
                         FALLBACK_RATIO = 0.3
                         comparison_with_po['MyForecast'] = (
-                            (1 - FALLBACK_RATIO)*comparison_with_po['MyForecast']
-                            + FALLBACK_RATIO*blended_amz_with_po
+                            (1 - FALLBACK_RATIO) * comparison_with_po['MyForecast'] +
+                            FALLBACK_RATIO * blended_amz_with_po
                         ).clip(lower=0)
 
-                    # XGBoost
-                    if xgb_model_with_po is not None:
-                        xgb_future_df_with_po = xgboost_forecast(
-                            xgb_model_with_po,
-                            ts_data_with_po,
-                            forecast_steps=horizon,
-                            target='y',
-                            features=xgb_features_with_po
-                        )
-                        comparison_with_po = comparison_with_po.merge(
-                            xgb_future_df_with_po,
-                            on='ds',
-                            how='left',
-                            suffixes=('','_XGB')
-                        )
-                        comparison_with_po['MyForecast_XGB'] = comparison_with_po['MyForecast_XGB'].fillna(0)
-
-                    # Adjust out-of-range
+                    # Adjust out-of-range forecasts
                     comparison_with_po = adjust_forecast_if_out_of_range(
                         comparison_with_po, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
                     )
 
-                    # Adjust if past 8-week average is exceeded by >50%
+                    # Adjust if past 8-week average is exceeded by more than 50%
                     past_8_weeks_with_po = ts_data_with_po.sort_values('ds').tail(8)
                     if not past_8_weeks_with_po.empty and 'MyForecast' in comparison_with_po.columns:
                         past8_avg_with_po = past_8_weeks_with_po['y'].mean()
@@ -3016,7 +3158,8 @@ def main():
                         if fc_mean_with_po > 1.5 * past8_avg_with_po:
                             print(f"[WITH PO][SARIMA] Adjusting forecast for {asin}, 8wk avg={past8_avg_with_po}, fc mean={fc_mean_with_po}")
                             comparison_with_po['MyForecast'] = (
-                                0.8 * past8_avg_with_po + 0.2 * comparison_with_po['MyForecast']
+                                0.8 * past8_avg_with_po + 
+                                0.2 * comparison_with_po['MyForecast']
                             ).clip(lower=0)
 
                     # Seasonal adjustment
@@ -3031,7 +3174,10 @@ def main():
                             max_override=1.5
                         )
                         metrics_season_with_po = validate_seasonal_adjustment(ts_data_with_po, comparison_with_po)
-                        print(f"[WITH PO][SARIMA] Seasonal: MAE Improve={metrics_season_with_po['improvement_pct']:.1f}%, Strength={metrics_season_with_po['seasonal_strength']:.2f}")
+                        print(
+                            f"[WITH PO][SARIMA] Seasonal: MAE Improve={metrics_season_with_po['improvement_pct']:.1f}%, "
+                            f"Strength={metrics_season_with_po['seasonal_strength']:.2f}"
+                        )
                         if metrics_season_with_po['improvement_pct'] < -5:
                             print("[WITH PO][SARIMA] Reverting forecast due to poor seasonal adjustment.")
                             comparison_with_po['final_forecast'] = comparison_with_po['MyForecast']
@@ -3041,43 +3187,132 @@ def main():
 
                     comparison_with_po['MyForecast'] = comparison_with_po['final_forecast']
 
-                    # Summaries & visualization
-                    summary_stats_with_po, total_forecast_16_po, total_forecast_8_po, total_forecast_4_po, \
-                    max_forecast_po, min_forecast_po, max_week_po, min_week_po = calculate_summary_statistics(
-                        ts_data_with_po, comparison_with_po, horizon=horizon
-                    )
-                    visualize_forecast_with_comparison(
-                        ts_data_with_po,
-                        comparison_with_po,
-                        summary_stats_with_po,
-                        total_forecast_16_po,
-                        total_forecast_8_po,
-                        total_forecast_4_po,
-                        max_forecast_po,
-                        min_forecast_po,
-                        max_week_po,
-                        min_week_po,
-                        asin,
-                        product_title,
-                        with_po_folder
-                    )
+                    # -------------------------
+                    # Append Additional Inventory & Performance Columns
+                    # -------------------------
+
+                    # Ensure we have 'Week_Start_Date'
+                    if 'Week_Start_Date' not in comparison_with_po.columns:
+                        if 'ds' in comparison_with_po.columns:
+                            comparison_with_po['Week_Start_Date'] = pd.to_datetime(
+                                comparison_with_po['ds'], errors='coerce'
+                            ).dt.strftime('%Y-%m-%d')
+                        else:
+                            comparison_with_po['Week_Start_Date'] = ''
+
+                    # Create or unify "Week"
+                    if 'Week' not in comparison_with_po.columns:
+                        # We sort by 'Week_Start_Date' to keep chronological
+                        comparison_with_po = comparison_with_po.sort_values(
+                            'Week_Start_Date', na_position='last'
+                        ).reset_index(drop=True)
+                        comparison_with_po['Week'] = ['W' + str(i+1) for i in range(len(comparison_with_po))]
+
+                    # Trend
+                    comparison_with_po['Trend'] = determine_seasonal_trend(comparison_with_po['MyForecast'])
+
+                    # Row-by-row inventory coverage & reorder logic
+                    starting_inventory = runrate_inventory.get(asin, 0)
+                    coverage_list = []
+                    reorder_urg_list = []
+
+                    for irow in range(len(comparison_with_po)):
+                        fc_value = comparison_with_po.loc[irow, 'MyForecast']
+                        if fc_value <= 0:
+                            coverage_list.append(float('inf'))
+                            reorder_urg_list.append("Normal")
+                            continue
+                        
+                        coverage_this_week = starting_inventory / float(fc_value)
+                        coverage_list.append(round(coverage_this_week,2))
+
+                        if coverage_this_week < 1.0:
+                            reorder_urg_list.append("Urgent")
+                        else:
+                            reorder_urg_list.append("Normal")
+
+                        # Deplete the inventory
+                        starting_inventory = max(0, starting_inventory - fc_value)
+
+                    comparison_with_po['Inventory Coverage'] = coverage_list
+                    comparison_with_po['Reorder Urgency'] = reorder_urg_list
+
+                    # Stockout risk => e.g. if coverage < 0.5 => High, else Low
+                    stockout_risk_list = []
+                    for cov in coverage_list:
+                        if cov < 0.5:
+                            stockout_risk_list.append("High")
+                        else:
+                            stockout_risk_list.append("Low")
+                    comparison_with_po['Stockout Risk'] = stockout_risk_list
+
+                    # Sales Trend => e.g. from historical data
+                    historical_sales_52 = ts_data_with_po.sort_values('ds')['y'].tail(52).tolist()
+                    slope_val = compute_sales_slope(historical_sales_52)  # numeric slope
+                    # If you want a textual "Sales Trend" for ▲,▼, etc.:
+                    if slope_val > 0:
+                        sales_trend_label = "Increasing (▲)"
+                    elif slope_val < 0:
+                        sales_trend_label = "Decreasing (▼)"
+                    else:
+                        sales_trend_label = "Stable"
+
+                    comparison_with_po['Sales Trend'] = sales_trend_label
+
+                    # Seasonality Index => dummy
+                    comparison_with_po = comparison_with_po.sort_values('Week_Start_Date', na_position='last').reset_index(drop=True)
+                    def season_index_func(row):
+                        # parse out the week's numeric or fallback to row index
+                        # This is just an example
+                        w_num = row.name + 1  # or parse from row['Week']
+                        return compute_seasonality_index(w_num, average_annual_sales=10000.0)
+                    
+                    comparison_with_po['Seasonality Index'] = comparison_with_po.apply(season_index_func, axis=1)
+
+                    # Lifecycle stage => slope threshold
+                    if slope_val > 0.1:
+                        lifecycle_stage = "Growth"
+                    elif slope_val < -0.1:
+                        lifecycle_stage = "Decline"
+                    else:
+                        lifecycle_stage = "Mature"
+                    comparison_with_po['Lifecycle Stage'] = lifecycle_stage
+
+                    # Final column reorder
+                    desired_cols = [
+                        "Week","Week_Start_Date","ASIN","MyForecast","Amazon Mean Forecast",
+                        "Amazon P70 Forecast","Amazon P80 Forecast","Amazon P90 Forecast",
+                        "Product Title","is_holiday_week",
+                        "Trend","Inventory Coverage","Stockout Risk","Reorder Urgency",
+                        "Sales Trend","Seasonality Index","Lifecycle Stage"
+                    ]
+                    existing_cols = [c for c in desired_cols if c in comparison_with_po.columns]
+                    comparison_with_po = comparison_with_po[existing_cols].copy()
+
+                    # Log fallback triggers
                     log_fallback_triggers(comparison_with_po, asin, product_title)
 
-                    # Save final forecast & summary
+                    # Save final
                     output_file_name_with_po = f'forecast_summary_{asin}_WITH_PO.xlsx'
                     output_file_path_with_po = os.path.join(with_po_folder, output_file_name_with_po)
                     comparison_with_po.to_excel(output_file_path_with_po, index=False)
 
+                    # Summaries
+                    summary_stats_with_po, total16_with_po, total8_with_po, total4_with_po, \
+                    max_fc_with_po, min_fc_with_po, max_week_with_po, min_week_with_po = calculate_summary_statistics(
+                        ts_data_with_po, comparison_with_po, horizon=horizon
+                    )
+
                     save_summary_to_excel(
                         comparison_with_po,
                         summary_stats_with_po,
-                        total_forecast_16_po,
-                        total_forecast_8_po,
-                        total_forecast_4_po,
-                        max_forecast_po,
-                        min_forecast_po,
-                        max_week_po,
-                        min_week_po,
+                        total16_with_po,
+                        total8_with_po,
+                        total4_with_po,
+                        max_fc_with_po,
+                        min_fc_with_po,
+                        max_week_with_po,
+                        min_week_with_po,
                         output_file_path_with_po,
                         metrics=None
                     )
@@ -3089,20 +3324,13 @@ def main():
                     continue
 
             else:
-                # (B) Prophet with PO
-                # Here you do your existing Prophet code, but with model.add_regressor('Weekly_PO_Qty')
-                # or inside your forecast_with_custom_params. We'll fully expand it so no lines are skipped.
-
+                # == PROPHET WITH PO block ==
                 if model_with_po is None:
                     print(f"[WITH PO][Prophet] Model is None for {asin}, skipping.")
                     continue
-
                 if model_with_po == "Prophet_Failed":
                     print(f"[WITH PO][Prophet] No valid prophet model for {asin}, skipping.")
                     continue
-
-                # We skip caching example, or replicate it if you have a path like "model_cache/{asin}_Prophet_WITH_PO.pkl"
-                # For demonstration, let's do a fresh training approach:
 
                 print(f"[WITH PO][Prophet] Training a new model for ASIN {asin} ...")
                 best_params_po, _ = optimize_prophet_params(
@@ -3113,44 +3341,50 @@ def main():
                     asin=asin
                 )
 
-                # Now we need a version of forecast_with_custom_params that adds .add_regressor('Weekly_PO_Qty')
-                # If your function doesn't do it automatically, do it inside. For example:
                 forecast_po, trained_prophet_model_po = forecast_with_custom_params(
-                    ts_data=ts_data_with_po,  # pass the DataFrame that includes Weekly_PO_Qty
+                    ts_data=ts_data_with_po,
                     forecast_data=forecast_data,
                     changepoint_prior_scale=best_params_po['changepoint_prior_scale'],
                     seasonality_prior_scale=best_params_po['seasonality_prior_scale'],
                     holidays_prior_scale=best_params_po['holidays_prior_scale'],
                     horizon=horizon
                 )
-                if trained_prophet_model_po is None or forecast_po.empty:
-                    print(f"[WITH PO][Prophet] Forecast or model is empty for {asin}. Skipping.")
+                if trained_prophet_model_po is not None:
+                    save_model(trained_prophet_model_po, "Prophet_WITH_PO", asin, ts_data_with_po)
+                else:
+                    print(f"[WITH PO][Prophet] Failed to train new model for {asin}.")
                     continue
 
-                # Format output
+                if 'forecast_po' not in locals() or forecast_po.empty:
+                    print(f"[WITH PO][Prophet] Forecast is empty for ASIN {asin}, skipping.")
+                    continue
+
                 comparison_with_po = format_output_with_forecasts(forecast_po, forecast_data, horizon=horizon)
                 best_weights_po, best_rmse_po = auto_find_best_weights(forecast_po, comparison_with_po, step=0.05)
-                print(f"[WITH PO][Prophet] Auto weights for {asin}: {best_weights_po}, RMSE={best_rmse_po}")
+                print(f"[WITH PO][Prophet] Auto best weights for ASIN {asin}: {best_weights_po} (RMSE={best_rmse_po})")
 
-                # Adjust
                 forecast_po = adjust_forecast_weights(forecast_po.copy(), *best_weights_po)
                 comparison_with_po = format_output_with_forecasts(forecast_po, forecast_data, horizon=horizon)
 
-                comparison_with_po = adjust_forecast_if_out_of_range(comparison_with_po, asin, adjustment_threshold=0.3)
+                print("\n--- Forecast Before Out-of-Range Adjustment (WITH PO) ---")
+                print(comparison_with_po[['MyForecast']].head(10))
+                print("---------------------------------------------------------\n")
+
+                comparison_with_po = adjust_forecast_if_out_of_range(
+                    comparison_with_po, asin, adjustment_threshold=0.3
+                )
                 log_fallback_triggers(comparison_with_po, asin, product_title)
 
-                # Past 8-week adjust
                 past_8_weeks_po = ts_data_with_po.sort_values('ds').tail(8)
                 if not past_8_weeks_po.empty and 'MyForecast' in comparison_with_po.columns:
                     past8_avg_po = past_8_weeks_po['y'].mean()
                     fc_mean_po = comparison_with_po['MyForecast'].mean()
                     if fc_mean_po > 1.5 * past8_avg_po:
-                        print(f"[WITH PO][Prophet] Adjusting {asin}, 8wk avg={past8_avg_po}, fc mean={fc_mean_po}")
+                        print(f"[WITH PO][Prophet] Adjusting forecast for {asin}: 8wk avg={past8_avg_po}, fc mean={fc_mean_po}")
                         comparison_with_po['MyForecast'] = (
                             0.8 * past8_avg_po + 0.2 * comparison_with_po['MyForecast']
                         ).clip(lower=0)
 
-                # Seasonal
                 try:
                     ts_data_with_po = detect_seasonal_periods(ts_data_with_po)
                     seasonal_factors_with_po = calculate_seasonal_factors(ts_data_with_po)
@@ -3163,7 +3397,8 @@ def main():
                     )
                     metrics_season_with_po = validate_seasonal_adjustment(ts_data_with_po, comparison_with_po)
                     print(
-                        f"[WITH PO][Prophet] Seasonal: MAE Improve={metrics_season_with_po['improvement_pct']:.1f}%, Strength={metrics_season_with_po['seasonal_strength']:.2f}"
+                        f"[WITH PO][Prophet] Seasonal adjust: MAE Improve={metrics_season_with_po['improvement_pct']:.1f}%, "
+                        f"Strength={metrics_season_with_po['seasonal_strength']:.2f}"
                     )
                     if metrics_season_with_po['improvement_pct'] < -5:
                         print("[WITH PO][Prophet] Reverting forecast due to poor seasonal adjust.")
@@ -3174,49 +3409,145 @@ def main():
 
                 comparison_with_po['MyForecast'] = comparison_with_po['final_forecast']
 
-                # Summaries
                 if 'ds' in comparison_with_po.columns and 'y' not in comparison_with_po.columns:
                     comparison_with_po = comparison_with_po.merge(ts_data_with_po[['ds','y']], on='ds', how='left')
 
-                summary_stats_with_po, total_forecast_16_po, total_forecast_8_po, total_forecast_4_po, \
-                max_forecast_po, min_forecast_po, max_week_po, min_week_po = calculate_summary_statistics(
+                # Summaries & Visualization
+                summary_stats_with_po, total16_with_po, total8_with_po, total4_with_po, \
+                max_fc_with_po, min_fc_with_po, max_week_with_po, min_week_with_po = calculate_summary_statistics(
                     ts_data_with_po, comparison_with_po, horizon=horizon
                 )
                 visualize_forecast_with_comparison(
                     ts_data_with_po,
                     comparison_with_po,
                     summary_stats_with_po,
-                    total_forecast_16_po,
-                    total_forecast_8_po,
-                    total_forecast_4_po,
-                    max_forecast_po,
-                    min_forecast_po,
-                    max_week_po,
-                    min_week_po,
+                    total16_with_po,
+                    total8_with_po,
+                    total4_with_po,
+                    max_fc_with_po,
+                    min_fc_with_po,
+                    max_week_with_po,
+                    min_week_with_po,
                     asin,
                     product_title,
                     with_po_folder
                 )
                 log_fallback_triggers(comparison_with_po, asin, product_title)
 
-                # Final
+                # -------------------------
+                # Append Additional Inventory & Performance Columns
+                # -------------------------
+                if 'Week_Start_Date' not in comparison_with_po.columns:
+                    if 'ds' in comparison_with_po.columns:
+                        comparison_with_po['Week_Start_Date'] = pd.to_datetime(
+                            comparison_with_po['ds'], errors='coerce'
+                        ).dt.strftime('%Y-%m-%d')
+                    else:
+                        comparison_with_po['Week_Start_Date'] = ''
+
+                if 'Week' not in comparison_with_po.columns:
+                    comparison_with_po = comparison_with_po.sort_values('Week_Start_Date', na_position='last').reset_index(drop=True)
+                    comparison_with_po['Week'] = ['W' + str(i+1) for i in range(len(comparison_with_po))]
+
+                # Trend
+                comparison_with_po['Trend'] = determine_seasonal_trend(comparison_with_po['MyForecast'])
+
+                # Row-by-row coverage 
+                starting_inv = runrate_inventory.get(asin, 0)
+                coverage_list = []
+                reorder_urg_list = []
+                stockout_risk_list = []
+
+                for irow in range(len(comparison_with_po)):
+                    fc_val = comparison_with_po.loc[irow,'MyForecast']
+                    if fc_val <=0:
+                        coverage_list.append(float('inf'))
+                        reorder_urg_list.append("Normal")
+                        stockout_risk_list.append("Low")
+                        continue
+                    
+                    coverage = starting_inv / float(fc_val)
+                    coverage_list.append(round(coverage,2))
+                    
+                    if coverage < 1.0:
+                        reorder_urg_list.append("Urgent")
+                    else:
+                        reorder_urg_list.append("Normal")
+
+                    if coverage < 0.5:
+                        stockout_risk_list.append("High")
+                    else:
+                        stockout_risk_list.append("Low")
+
+                    starting_inv = max(0, starting_inv - fc_val)
+
+                comparison_with_po['Inventory Coverage'] = coverage_list
+                comparison_with_po['Reorder Urgency'] = reorder_urg_list
+                comparison_with_po['Stockout Risk'] = stockout_risk_list
+
+                # Sales Trend (arrow labels) + slope for lifecycle
+                hist_sales_52 = ts_data_with_po.sort_values('ds')['y'].tail(52).tolist()
+                slope_val = compute_sales_slope(hist_sales_52)
+                if slope_val > 0:
+                    comp_trend = "Increasing (▲)"
+                elif slope_val < 0:
+                    comp_trend = "Decreasing (▼)"
+                else:
+                    comp_trend = "Stable"
+                
+                comparison_with_po['Sales Trend'] = comp_trend
+
+                # Seasonality
+                comparison_with_po = comparison_with_po.sort_values('Week_Start_Date', na_position='last').reset_index(drop=True)
+                def sea_idx(row):
+                    w_i = row.name+1
+                    return compute_seasonality_index(w_i, average_annual_sales=10000.0)
+                comparison_with_po['Seasonality Index'] = comparison_with_po.apply(sea_idx, axis=1)
+
+                # Lifecycle stage (growth/decline/mature)
+                if slope_val > 0.1:
+                    lcs = "Growth"
+                elif slope_val < -0.1:
+                    lcs = "Decline"
+                else:
+                    lcs = "Mature"
+                comparison_with_po['Lifecycle Stage'] = lcs
+
+                # Reorder columns
+                desired_cols = [
+                    "Week","Week_Start_Date","ASIN","MyForecast","Amazon Mean Forecast",
+                    "Amazon P70 Forecast","Amazon P80 Forecast","Amazon P90 Forecast",
+                    "Product Title","is_holiday_week",
+                    "Trend","Inventory Coverage","Stockout Risk","Reorder Urgency",
+                    "Sales Trend","Seasonality Index","Lifecycle Stage"
+                ]
+                existing_cols = [c for c in desired_cols if c in comparison_with_po.columns]
+                comparison_with_po = comparison_with_po[existing_cols].copy()
+
                 comparison_with_po['ASIN'] = asin
                 comparison_with_po['Product Title'] = product_title
 
+                # Save 
                 output_file_name_with_po = f'forecast_summary_{asin}_WITH_PO.xlsx'
                 output_file_path_with_po = os.path.join(with_po_folder, output_file_name_with_po)
                 comparison_with_po.to_excel(output_file_path_with_po, index=False)
 
+                # Summaries
+                summary_stats_with_po, total16_with_po, total8_with_po, total4_with_po, \
+                max_fc_with_po, min_fc_with_po, max_week_with_po, min_week_with_po = calculate_summary_statistics(
+                    ts_data_with_po, comparison_with_po, horizon=horizon
+                )
+
                 save_summary_to_excel(
                     comparison_with_po,
                     summary_stats_with_po,
-                    total_forecast_16_po,
-                    total_forecast_8_po,
-                    total_forecast_4_po,
-                    max_forecast_po,
-                    min_forecast_po,
-                    max_week_po,
-                    min_week_po,
+                    total16_with_po,
+                    total8_with_po,
+                    total4_with_po,
+                    max_fc_with_po,
+                    min_fc_with_po,
+                    max_week_with_po,
+                    min_week_with_po,
                     output_file_path_with_po,
                     metrics=None
                 )
@@ -3227,15 +3558,18 @@ def main():
     # 6) After processing ALL ASINs, save consolidated data
     # ----------------------------------------------------------------------------
     final_output_path_with_po = "consolidated_forecast_WITH_PO.xlsx"
-    save_forecast_to_excel(final_output_path_with_po, consolidated_forecasts_with_po, missing_asin_data, base_year=2025)
+    save_forecast_to_excel(
+        final_output_path_with_po,
+        consolidated_forecasts_with_po,
+        missing_asin_data,
+        base_year=2025
+    )
     print(f"[WITH PO] All per-ASIN forecasts saved to {final_output_path_with_po}")
 
-    # Save feedback, generate summary reports, etc.
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
     generate_4_week_report(consolidated_forecasts_with_po)
     generate_combined_weekly_report(consolidated_forecasts_with_po)
 
-    # Save param histories
     save_param_histories()
     print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
     if POOR_PARAM_FOUND:
