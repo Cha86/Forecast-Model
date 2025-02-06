@@ -528,25 +528,28 @@ def choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=None):
     Basic decision for model selection:
     - If dataset size <= threshold, use SARIMA.
     - Else, default to Prophet.
+    
+    We now return either:
+      (fitted_sarima_model, "SARIMA")
+    or
+      ("Prophet", "Prophet")
+    so that the calling code can see if it's 'SARIMA' or 'Prophet'.
     """
-    # Extract ASIN before fitting the model
-    asin = ts_data['asin'].iloc[0]
+    asin = ts_data['asin'].iloc[0] if 'asin' in ts_data.columns else "UnknownASIN"
 
     if len(ts_data) <= threshold:
         print(f"Dataset size ({len(ts_data)}) is <= threshold ({threshold}). Using SARIMA.")
-        
-        # Unpack the tuple returned by fit_sarima_model
         fitted_model, best_params = fit_sarima_model(ts_data, holidays, seasonal_period=52, asin=asin)
-
         if fitted_model is not None:
             save_model(fitted_model, "SARIMA", asin, ts_data)
             return fitted_model, "SARIMA"
         else:
             print(f"SARIMA model fitting failed for {asin}, skipping.")
-            return None, "SARIMA_Failed"
+            # Return a placeholder so that the calling code doesn't crash
+            return (None, "SARIMA_Failed")
     else:
         print(f"Dataset size ({len(ts_data)}) is > threshold ({threshold}). Using Prophet.")
-        return None, "Prophet"
+        return ("Prophet", "Prophet")
 
 def generate_date_from_week(row):
     """Convert year-week format into a datetime object for the beginning of that week."""
@@ -2535,119 +2538,142 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
     }
 
 ##############################
-# Compare PO Orders with Forecasts
+# Forecast Sales with PO Regressor
 ##############################
 
-def forecast_po_orders_with_prophet(po_file='po database.xlsx',
-                                    output_folder='po_forecast_output',
-                                    horizon_weeks=16,
-                                    amazon_start_date='2025-02-02'):
+def forecast_sales_with_po_regressor(sales_file='weekly_sales_data.xlsx',
+                                     po_file='po database.xlsx',
+                                     horizon_weeks=16,
+                                     amazon_start_date='2025-02-02',
+                                     cv_initial='730 days',
+                                     cv_period='180 days',
+                                     cv_horizon='365 days'):
     """
-    Forecast future PO orders for each ASIN using Prophet, based on aggregated weekly PO data.
-    The forecast will start from the given amazon_start_date and cover horizon_weeks periods.
-    Each ASIN's forecast is saved in a separate Excel file in the specified output folder.
+    Forecast future sales using Prophet while incorporating historical PO orders as a regressor.
+    The idea is that the model will learn the relationship between the weekly aggregated PO orders
+    and the actual sales. Backtesting (via Prophet’s cross_validation) is run to help assess accuracy.
     
     Parameters:
-      po_file (str): Path to the Excel file containing historical PO data.
-                     Must include columns: [ASIN, Order date, Requested quantity].
-      output_folder (str): Folder where each ASIN's forecast Excel file will be saved.
-      horizon_weeks (int): Number of weekly periods to forecast.
-      amazon_start_date (str or Timestamp): The starting date for the forecast period (e.g., '2025-02-02').
+      sales_file (str): Path to Excel file containing historical sales data. Must have at least:
+                        - ds: dates (or convertable to datetime)
+                        - y: sales numbers.
+      po_file (str): Path to Excel file containing historical PO data. Must include columns:
+                     [ASIN, Order date, Requested quantity].
+      horizon_weeks (int): Number of future weeks to forecast.
+      amazon_start_date (str): A string (or Timestamp) that defines the start date for the future forecast.
+      cv_initial (str): Initial training period for cross-validation (e.g., '730 days').
+      cv_period (str): Period between CV cutoffs (e.g., '180 days').
+      cv_horizon (str): Forecast horizon for CV (e.g., '365 days').
+      
+    Returns:
+      forecast (DataFrame): Prophet forecast for the future (including the PO regressor).
+      model (Prophet object): The fitted Prophet model.
+      cv_metrics (DataFrame): Backtesting performance metrics (MAE, RMSE, etc.).
     """
-    # Ensure the output folder exists.
-    os.makedirs(output_folder, exist_ok=True)
-    
-    # Load the PO data.
-    df_po = pd.read_excel(po_file)
-    df_po.columns = df_po.columns.str.strip()
-    
+
+    # ----- STEP 1. Load and prepare sales data -----
+    sales_df = pd.read_excel(sales_file)
+    sales_df.columns = sales_df.columns.str.strip()
+    # Assume sales_df has columns 'ds' (dates) and 'y' (sales)
+    sales_df['ds'] = pd.to_datetime(sales_df['ds'], errors='coerce')
+    sales_df = sales_df.dropna(subset=['ds', 'y'])
+
+    # ----- STEP 2. Load and aggregate PO data by week -----
+    po_df = pd.read_excel(po_file)
+    po_df.columns = po_df.columns.str.strip()
+    # Ensure required columns exist:
     required_cols = {'ASIN', 'Order date', 'Requested quantity'}
-    if not required_cols.issubset(df_po.columns):
+    if not required_cols.issubset(po_df.columns):
         raise ValueError(f"PO data must have columns at least: {required_cols}")
+    po_df['Order date'] = pd.to_datetime(po_df['Order date'], errors='coerce')
+    po_df = po_df.dropna(subset=['ASIN', 'Order date', 'Requested quantity'])
+    # Here we aggregate PO orders by week.
+    # We choose a weekly period that matches your sales data frequency. For example, if your sales
+    # data is aggregated weekly with weeks starting on Sunday, do:
+    po_df['Week'] = po_df['Order date'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
+    weekly_po = po_df.groupby('Week', as_index=False)['Requested quantity'].sum()
+    weekly_po = weekly_po.rename(columns={'Requested quantity': 'Weekly_PO_Qty'})
     
-    # Convert the order date to datetime and drop rows with missing data.
-    df_po['Order date'] = pd.to_datetime(df_po['Order date'], errors='coerce')
-    df_po.dropna(subset=['ASIN', 'Order date', 'Requested quantity'], inplace=True)
+    # ----- STEP 3. Merge PO regressor into sales data -----
+    # For each sales date, determine its corresponding week (using the same rule as above).
+    sales_df['Week'] = sales_df['ds'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
+    # Merge on the "Week" column (left join so that every sales record gets a PO value)
+    sales_df = pd.merge(sales_df, weekly_po, on='Week', how='left')
+    # If a week has no PO data, fill with 0 (or you might use forward‐fill or another treatment)
+    sales_df['Weekly_PO_Qty'] = sales_df['Weekly_PO_Qty'].fillna(0)
     
-    # Convert amazon_start_date to datetime.
+    # ----- STEP 4. Initialize Prophet with PO regressor -----
+    model = Prophet(yearly_seasonality=True,
+                    weekly_seasonality=True,
+                    daily_seasonality=False,
+                    seasonality_mode='additive')
+    model.add_regressor('Weekly_PO_Qty')
+    
+    # Fit the model using the columns ds, y, and Weekly_PO_Qty
+    print(f"Training Prophet model on {len(sales_df)} data points with PO regressor...")
+    model.fit(sales_df[['ds', 'y', 'Weekly_PO_Qty']])
+    
+    # ----- STEP 5. Create future dataframe for forecasting -----
+    # Convert amazon_start_date to datetime if necessary.
     amazon_start_date = pd.to_datetime(amazon_start_date, errors='coerce')
     if pd.isna(amazon_start_date):
         raise ValueError(f"Invalid amazon_start_date: {amazon_start_date}")
     
-    # Get unique ASINs.
-    asins = df_po['ASIN'].unique()
-    print(f"Found {len(asins)} unique ASINs. Forecasting {horizon_weeks} weeks from {amazon_start_date.strftime('%Y-%m-%d')}.\n")
+    # Build future dataframe: the forecast will start on amazon_start_date and run for horizon_weeks weeks.
+    future = model.make_future_dataframe(periods=horizon_weeks, freq='W-SUN')
     
-    # Process each ASIN separately.
-    for asin in asins:
-        asin_data = df_po[df_po['ASIN'] == asin].copy()
-        if asin_data.empty:
-            continue
-        
-        # Aggregate the data to weekly totals.
-        asin_data['week_start'] = asin_data['Order date'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
-        weekly_agg = asin_data.groupby('week_start', as_index=False)['Requested quantity'].sum()
-        weekly_agg.rename(columns={'week_start': 'ds', 'Requested quantity': 'y'}, inplace=True)
-        weekly_agg = weekly_agg.sort_values('ds').reset_index(drop=True)
-        
-        if len(weekly_agg) < 2:
-            print(f"Not enough weekly data for ASIN {asin} (only {len(weekly_agg)} point(s)); skipping forecast.")
-            continue
-        
-        # Fit the Prophet model.
-        model = Prophet(
-            yearly_seasonality=True,
-            weekly_seasonality=False,
-            daily_seasonality=False,
-            seasonality_mode='additive'
-        )
-        print(f"Fitting Prophet model for ASIN {asin} with {len(weekly_agg)} weekly data points.")
-        try:
-            model.fit(weekly_agg[['ds', 'y']])
-        except Exception as e:
-            print(f"Prophet fitting failed for ASIN {asin}. Error: {e}")
-            continue
-        
-        # Create future dataframe from amazon_start_date.
-        future_dates = pd.date_range(start=amazon_start_date, periods=horizon_weeks, freq='W-SUN')
-        future_df = pd.DataFrame({'ds': future_dates})
-        
-        # Generate forecast.
-        forecast = model.predict(future_df)
-        df_forecast = forecast[['ds', 'yhat']].copy()
-        df_forecast.rename(columns={'ds': 'Week_Start_Date', 'yhat': 'POForecast'}, inplace=True)
-        
-        # Label weeks (W1, W2, ...).
-        df_forecast = df_forecast.sort_values('Week_Start_Date').reset_index(drop=True)
-        df_forecast['Week'] = [f"W{i+1}" for i in range(len(df_forecast))]
-        df_forecast['Week_Start_Date'] = pd.to_datetime(df_forecast['Week_Start_Date']).dt.strftime('%Y-%m-%d')
-        
-        # Add ASIN column and reorder.
-        df_forecast['ASIN'] = asin
-        df_forecast = df_forecast[['Week', 'Week_Start_Date', 'ASIN', 'POForecast']]
-        df_forecast['POForecast'] = df_forecast['POForecast'].round().astype(int)
-        
-        # Save each ASIN's forecast in a separate Excel file.
-        output_file_asin = os.path.join(output_folder, f"po_order_forecast_{asin}.xlsx")
-        df_forecast.to_excel(output_file_asin, index=False)
-        print(f"PO forecast for ASIN {asin} saved to {output_file_asin}.")
+    # For the regressor column in the future, you need to supply a value.
+    # One simple approach is to use the historical average of Weekly_PO_Qty.
+    future['Weekly_PO_Qty'] = sales_df['Weekly_PO_Qty'].mean()
     
-    print("\nAll PO forecasts completed.")
+    # ----- STEP 6. Generate forecast -----
+    forecast = model.predict(future)
+    
+    # For output, keep only the forecast dates from the amazon_start_date onward.
+    forecast = forecast[forecast['ds'] >= amazon_start_date].copy()
+    
+    # Create a week label: for example, if you want "W0, W1, ..." starting with amazon_start_date:
+    forecast = forecast.sort_values('ds').reset_index(drop=True)
+    forecast['Week'] = [f"W{i}" for i in range(len(forecast))]
+    forecast['Week_Start_Date'] = forecast['ds'].dt.strftime("%Y-%m-%d")
+    
+    # Keep only the columns you need; here we show the integrated forecast (for sales) that used the PO data.
+    forecast_out = forecast[['Week', 'Week_Start_Date', 'ds', 'yhat', 'Weekly_PO_Qty']].copy()
+    forecast_out = forecast_out.rename(columns={'yhat': 'Forecast_Sales'})
+    
+    # ----- STEP 7. Backtesting / Cross-validation -----
+    # (Optional but recommended) Evaluate model performance via Prophet's cross_validation.
+    try:
+        from prophet.diagnostics import cross_validation, performance_metrics
+        print("Running cross-validation to evaluate forecast accuracy...")
+        df_cv = cross_validation(model, initial=cv_initial, period=cv_period, horizon=cv_horizon)
+        cv_metrics = performance_metrics(df_cv)
+        print("Cross-validation metrics:")
+        print(cv_metrics[['mae', 'rmse']])
+    except Exception as e:
+        print(f"Cross-validation failed: {e}")
+        cv_metrics = None
+
+    return forecast_out, model, cv_metrics
+
 
 ##############################
 # Main
 ##############################
 
 def main():
-    # Load existing parameter histories
+    # ----------------------------------------------------------------------------
+    # 1) Load existing parameter histories, sales data, config, etc.
+    # ----------------------------------------------------------------------------
     load_param_histories()
 
     sales_file = 'weekly_sales_data.xlsx'
     forecasts_folder = 'forecasts_folder'
     asins_to_forecast_file = 'ASINs to Forecast.xlsx'
-    output_file = 'consolidated_forecast.xlsx'
     horizon = 16
+    output_file = 'consolidated_forecast_WITH_PO.xlsx'  # Single final workbook with PO data
 
+    # Load weekly sales data
     data = load_weekly_sales_data(sales_file)
     valid_data = data[data['asin'].notna() & (data['asin'] != '#N/A')]
     missing_asin_data = data[data['asin'].isna() | (data['asin'] == '#N/A')]
@@ -2656,39 +2682,65 @@ def main():
         print("The following entries have no ASIN and will be noted in the forecast file:")
         print(missing_asin_data[['product title', 'week', 'year', 'y']].to_string())
 
+    # Load the ASINs to forecast
     asins_to_forecast = load_asins_to_forecast(asins_to_forecast_file)
     print(f"ASINs to forecast: {asins_to_forecast}")
 
+    # Filter valid_data to only ASINs in asins_to_forecast
     asin_list = valid_data['asin'].unique()
-    # Filter to ensure only valid ASINs in the list to forecast
     asin_list = [asin for asin in asin_list if asin in asins_to_forecast]
 
-    consolidated_forecasts = {}
+    # Create a dictionary to store final forecasts for each ASIN
+    consolidated_forecasts_with_po = {}
+
+    # Parameter grid for Prophet
     param_grid = {
         'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
         'seasonality_prior_scale': [0.05, 0.1, 1, 2, 3, 4, 5],
         'holidays_prior_scale': [5, 10, 15]
     }
 
+    # Get holiday data
     holidays = get_shifted_holidays()
 
-    # Optional cross-validation test on the first ASIN in the list
+    # Optional cross-validation on first ASIN in the list (just for demonstration)
     if len(asin_list) > 0:
         test_asin = asin_list[0]
         test_ts_data = prepare_time_series_with_lags(valid_data, test_asin, lag_weeks=1)
         if not test_ts_data.empty and len(test_ts_data.dropna()) >= 2:
-            print(f"Performing cross-validation on ASIN {test_asin} Prophet model...")
+            print(f"Performing cross-validation on ASIN {test_asin} Prophet model (without PO, just for test).")
             cross_validate_prophet_model(test_ts_data, initial='180 days', period='90 days', horizon='90 days')
         else:
             print(f"Not enough data for {test_asin} to perform cross-validation test.")
 
+    # Create output folders
     insufficient_data_folder = "Insufficient data"
-    sufficient_data_folder = "Sufficient data"
+    with_po_folder = "Sufficient data WITH_PO"
     os.makedirs(insufficient_data_folder, exist_ok=True)
-    os.makedirs(sufficient_data_folder, exist_ok=True)
+    os.makedirs(with_po_folder, exist_ok=True)
 
     global PARAM_COUNTER
 
+    # ----------------------------------------------------------------------------
+    # 2) Load and prepare global PO data once, for merging with each ASIN
+    # ----------------------------------------------------------------------------
+    po_file = "po database.xlsx"
+    po_df = pd.read_excel(po_file)
+    po_df.columns = po_df.columns.str.strip()
+    po_df['Order date'] = pd.to_datetime(po_df['Order date'], errors='coerce')
+    po_df = po_df.dropna(subset=['ASIN', 'Order date', 'Requested quantity'])
+    po_df['Requested quantity'] = (
+        po_df['Requested quantity']
+        .astype(str)
+        .str.replace(',', '')
+        .str.strip()
+        .replace('', '0')
+    )
+    po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
+
+    # ----------------------------------------------------------------------------
+    # 3) For each ASIN, generate a forecast WITH PO
+    # ----------------------------------------------------------------------------
     for asin in asin_list:
         if pd.isna(asin) or asin == '#N/A':
             print(f"Skipping invalid ASIN: {asin}")
@@ -2696,734 +2748,492 @@ def main():
 
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
-        
-        # Load Amazon forecasts
+
+        # Load Amazon forecasts from folder
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
             print(f"No forecast data found for ASIN {asin}, skipping.")
             continue
 
-        # Prepare data
-        ts_data = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
-        print(f"Time series data for ASIN {asin} prepared. Dataset size: {len(ts_data)}")
+        # =========================
+        # 3.1) Prepare base time-series data
+        # =========================
+        ts_data_base = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
+        print(f"Time series base data for ASIN {asin} prepared. Size: {len(ts_data_base)}")
 
-        non_nan_count = len(ts_data.dropna())
-        if non_nan_count < 10:
-            print(f"ASIN {asin} has only {non_nan_count} data points. "
-                f"Using fallback: 90% Amazon Mean + 10% 'naive SARIMA'.")
+        # =========================
+        # 3.2) Merge PO data for this ASIN
+        # =========================
+        asin_po_df = po_df[po_df['ASIN'] == asin].copy()
+        asin_po_df['OrderWeek'] = asin_po_df['Order date'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
+        weekly_po = asin_po_df.groupby('OrderWeek', as_index=False)['Requested quantity'].sum()
+        weekly_po.rename(columns={'Requested quantity': 'Weekly_PO_Qty'}, inplace=True)
 
-            # Step A: Create a naive SARIMA fallback forecast
-            if not ts_data.empty:
-                last_y_value = ts_data['y'].iloc[-1]
-                last_date = ts_data['ds'].iloc[-1]
+        ts_data_with_po = ts_data_base.copy()
+        ts_data_with_po['OrderWeek'] = ts_data_with_po['ds'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
+        ts_data_with_po = pd.merge(ts_data_with_po, weekly_po, on='OrderWeek', how='left')
+        ts_data_with_po['Weekly_PO_Qty'] = ts_data_with_po['Weekly_PO_Qty'].fillna(0)
+        print(f"Time series data (WITH PO) for ASIN {asin} prepared. Size: {len(ts_data_with_po)}")
+
+        # Check how many non-NaN points remain
+        non_nan_count_with_po = len(ts_data_with_po.dropna())
+        if non_nan_count_with_po < 10:
+            # ----------------------------------------------------------------------------
+            # 4) Fallback approach if < 10 data points: 90% Amazon Mean + 10% naive SARIMA
+            # ----------------------------------------------------------------------------
+            print(f"ASIN {asin} has only {non_nan_count_with_po} data points (WITH PO). Using fallback approach.")
+            if not ts_data_with_po.empty:
+                last_y_value_po = ts_data_with_po['y'].iloc[-1]
+                last_date_po = ts_data_with_po['ds'].iloc[-1]
             else:
-                last_y_value = 0
-                last_date = pd.to_datetime("today")
+                last_y_value_po = 0
+                last_date_po = pd.to_datetime("today")
 
-            horizon = 16  # or whatever your default horizon is
-            future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1),
-                                        periods=horizon, freq='W')
-            fallback_sarima_vals = [last_y_value]*horizon
+            future_dates_po = pd.date_range(start=last_date_po + pd.Timedelta(weeks=1),
+                                            periods=horizon, freq='W')
+            fallback_sarima_vals_po = [last_y_value_po]*horizon
 
-            # Step B: Put these into a temporary DataFrame
-            fallback_df = pd.DataFrame({
-                'ds': future_dates,
-                'Fallback_SARIMA': fallback_sarima_vals
+            fallback_df_po = pd.DataFrame({
+                'ds': future_dates_po,
+                'Fallback_SARIMA': fallback_sarima_vals_po
             })
 
-            amz_mean_key = None
+            # Merge Amazon Mean forecast
+            amz_mean_key_po = None
             for ftype in forecast_data.keys():
                 if 'mean' in ftype.lower():
-                    amz_mean_key = ftype
+                    amz_mean_key_po = ftype
                     break
-
-            if amz_mean_key is None:
-                print("Warning: No 'Mean' forecast found in Amazon data. Using 0.")
-                amazon_mean = [0]*horizon
+            if amz_mean_key_po is None:
+                print("Warning: No 'Mean' forecast found in Amazon data (WITH PO). Using 0.")
+                amazon_mean_with_po = [0]*horizon
             else:
-                raw_arr = forecast_data[amz_mean_key]
-                # If raw_arr is shorter than horizon, pad; if longer, truncate
-                if len(raw_arr) >= horizon:
-                    amazon_mean = raw_arr[:horizon]
+                raw_arr_with_po = forecast_data[amz_mean_key_po]
+                if len(raw_arr_with_po) >= horizon:
+                    amazon_mean_with_po = raw_arr_with_po[:horizon]
                 else:
-                    pad_needed = horizon - len(raw_arr)
-                    amazon_mean = list(raw_arr) + [raw_arr[-1]]*pad_needed
+                    pad_needed_with_po = horizon - len(raw_arr_with_po)
+                    amazon_mean_with_po = list(raw_arr_with_po) + [raw_arr_with_po[-1]]*pad_needed_with_po
 
-            fallback_df['Amazon Mean Forecast'] = amazon_mean
+            fallback_df_po['Amazon Mean Forecast'] = amazon_mean_with_po
 
-            # Step D: Compute final weighted forecast (90% Amazon Mean, 10% fallback)
-            weight_amz = 0.9
-            weight_sarima = 0.1
-            final_vals = []
+            # Weighted fallback
+            weight_amz_po = 0.9
+            weight_sarima_po = 0.1
+            final_vals_po = []
             for i in range(horizon):
-                mean_val = fallback_df['Amazon Mean Forecast'].iloc[i]
-                sarima_val = fallback_df['Fallback_SARIMA'].iloc[i]
-                combined = (weight_amz * mean_val) + (weight_sarima * sarima_val)
-                final_vals.append(int(round(max(combined, 0))))
+                mean_val_po = fallback_df_po['Amazon Mean Forecast'].iloc[i]
+                sarima_val_po = fallback_df_po['Fallback_SARIMA'].iloc[i]
+                combined_po = (weight_amz_po * mean_val_po) + (weight_sarima_po * sarima_val_po)
+                final_vals_po.append(int(round(max(combined_po, 0))))
 
-            fallback_df['MyForecast'] = final_vals
-            fallback_df['ASIN'] = asin
-            fallback_df['Product Title'] = product_title
+            fallback_df_po['MyForecast'] = final_vals_po
+            fallback_df_po['ASIN'] = asin
+            fallback_df_po['Product Title'] = product_title
 
-            plt.figure(figsize=(10, 6))
-            plt.plot(fallback_df['ds'], fallback_df['MyForecast'], marker='o', label='MyForecast')
-            plt.title(f'Fallback Forecast for ASIN {asin}')
+            # Plot fallback
+            plt.figure(figsize=(10,6))
+            plt.plot(fallback_df_po['ds'], fallback_df_po['MyForecast'], marker='o', label='MyForecast')
+            plt.title(f'Fallback (WITH PO) Forecast for ASIN {asin}')
             plt.xlabel('Date')
             plt.ylabel('Requested Quantity')
             plt.legend()
             plt.grid()
             plt.xticks(rotation=45)
             plt.tight_layout()
-            fallback_chart = os.path.join(sufficient_data_folder, f"{asin}_fallback_forecast.png")
-            plt.savefig(fallback_chart)
+            fallback_chart_with_po = os.path.join(with_po_folder, f"{asin}_fallback_forecast_WITH_PO.png")
+            plt.savefig(fallback_chart_with_po)
             plt.close()
-            print(f"Fallback forecast chart saved to {fallback_chart}")
+            print(f"Fallback (WITH PO) chart saved to {fallback_chart_with_po}")
 
-            fallback_df.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
-            fallback_df['Week'] = pd.to_datetime(fallback_df['Week_Start_Date']).dt.isocalendar().week.apply(
+            fallback_df_po.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
+            fallback_df_po['Week'] = pd.to_datetime(fallback_df_po['Week_Start_Date']).dt.isocalendar().week.apply(
                 lambda w: 'W' + str(w).zfill(2)
             )
-            fallback_df['is_holiday_week'] = False  # Or determine based on dates if applicable
+            fallback_df_po['is_holiday_week'] = False
 
-            # Select desired columns
-            desired_columns = [
-                'Week', 'Week_Start_Date', 'ASIN', 'MyForecast', 'Amazon Mean Forecast',
-                'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast',
-                'Product Title', 'is_holiday_week'
+            desired_cols_po = [
+                'Week','Week_Start_Date','ASIN','MyForecast','Amazon Mean Forecast',
+                'Amazon P70 Forecast','Amazon P80 Forecast','Amazon P90 Forecast',
+                'Product Title','is_holiday_week'
             ]
+            for col in ['Amazon P70 Forecast','Amazon P80 Forecast','Amazon P90 Forecast']:
+                if col not in fallback_df_po.columns:
+                    fallback_df_po[col] = 0
+            fallback_df_po = fallback_df_po[desired_cols_po]
 
-            # Add missing Amazon forecast columns with NaN or 0
-            for col in ['Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']:
-                if col not in fallback_df.columns:
-                    fallback_df[col] = 0  # or np.nan if preferred
+            # Store fallback in consolidated_forecasts_with_po
+            consolidated_forecasts_with_po[asin] = fallback_df_po
+            # Save to Excel
+            fallback_with_po_path = os.path.join(with_po_folder, f"{asin}_fallback_WITH_PO.xlsx")
+            fallback_df_po.to_excel(fallback_with_po_path, index=False)
+            print(f"Saved fallback (WITH PO) forecast for ASIN {asin} to {fallback_with_po_path}")
 
-            fallback_df = fallback_df[desired_columns]
+        else:
+            # ----------------------------------------------------------------------------
+            # 5) Enough data => normal pipeline, but we pass "ts_data_with_po"
+            #    (exogenous=Weekly_PO_Qty for SARIMA, or .add_regressor('Weekly_PO_Qty') for Prophet)
+            # ----------------------------------------------------------------------------
+            model_with_po, model_type_with_po = choose_forecast_model(ts_data_with_po, threshold=FALLBACK_THRESHOLD, holidays=holidays)
 
+            # XGBoost with PO - if you want to treat 'Weekly_PO_Qty' as a feature
+            xgb_model_with_po, xgb_features_with_po, xgb_shap_values_with_po = train_xgboost(ts_data_with_po, target='y')
 
-            # Step E: Store in consolidated_forecasts & skip the usual pipeline
-            consolidated_forecasts[asin] = fallback_df
-            continue  # Important: skip the Prophet/SARIMA logic below
+            # (A) SARIMA with PO
+            if model_type_with_po == "SARIMA":
+                n_with_po = len(ts_data_with_po)
+                split_with_po = int(n_with_po * 0.8)
+                train_sarima_with_po = ts_data_with_po.iloc[:split_with_po]
+                test_sarima_with_po = ts_data_with_po.iloc[split_with_po:]
 
-        holidays = get_shifted_holidays()
+                # Build exog for the test set: holiday + Weekly_PO_Qty
+                exog_test_with_po = create_holiday_regressors(test_sarima_with_po, holidays)
+                if 'Weekly_PO_Qty' in test_sarima_with_po.columns:
+                    exog_test_with_po['Weekly_PO_Qty'] = test_sarima_with_po['Weekly_PO_Qty'].values
 
-        # Decide model type (SARIMA or Prophet)
-        model, model_type = choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=holidays)
-
-        # Train XGBoost, but do NOT blend with MyForecast
-        xgb_model, xgb_features, xgb_shap_values = train_xgboost(ts_data, target='y')
-
-        # =========================
-        # SARIMA Block
-        # =========================
-        if model_type == "SARIMA":
-            n = len(ts_data)
-            split = int(n * 0.8)
-            train_sarima = ts_data.iloc[:split]
-            test_sarima = ts_data.iloc[split:]
-
-            # Create exogenous variables for the test set
-            exog_test = create_holiday_regressors(test_sarima, holidays)
-
-            if model is None:
-                print(f"SARIMA model fitting failed for {asin}, skipping.")
-                no_data_output = os.path.join(insufficient_data_folder, f"{asin}_no_data.txt")
-                with open(no_data_output, 'w') as f:
-                    f.write("Insufficient data for training/forecasting.\n")
-                continue
-
-            try:
-                # =========================
-                # 1. Fit SARIMA Model (R/P system inside)
-                # =========================
-                best_sarima_model, best_params = fit_sarima_model(
-                data=ts_data,
-                holidays=holidays,            
-                seasonal_period=52,
-                asin=asin
-                )
-
-                if best_sarima_model is None:
-                    print(f"SARIMA model fitting failed for {asin}, skipping.")
-                    no_data_output = os.path.join(insufficient_data_folder, f"{asin}_model_failed.txt")
-                    with open(no_data_output, 'w') as f:
-                        f.write("Model fitting failed.\n")
+                if model_with_po is None:
+                    print(f"[WITH PO][SARIMA] Model is None for {asin}, skipping.")
                     continue
 
-                # Extract SARIMA parameters for history
-                param_tuple = best_params  # Assuming best_params is a tuple like (p,d,q,P,D,Q,m)
-
-                # =========================
-                # 2. Forecast on Test Set (Evaluation)
-                # =========================
-                steps = len(test_sarima)
-                sarima_test_forecast_df = sarima_forecast(
-                    model_fit=best_sarima_model,
-                    steps=steps,
-                    last_date=train_sarima['ds'].iloc[-1],
-                    exog=exog_test
-                )
-
-                # Evaluate forecast on the test portion
-                sarima_preds = sarima_test_forecast_df['MyForecast'].values
-                sarima_mae = mean_absolute_error(test_sarima['y'], sarima_preds)
-                sarima_rmse = sqrt(mean_squared_error(test_sarima['y'], sarima_preds))
-                print(f"SARIMA Test MAE: {sarima_mae:.4f}, RMSE: {sarima_rmse:.4f}")
-
-                # =========================
-                # 3. Update SARIMA Parameter History
-                # =========================
-                update_param_history(
-                    history_dict=sarima_param_history,
-                    asin=asin,
-                    param_tuple=param_tuple,
-                    rmse=sarima_rmse,
-                    mae=sarima_mae
-                )
-
-                # =========================
-                # 4. Generate Final Future Forecast
-                # =========================
-                last_date_full = ts_data['ds'].iloc[-1]
-                exog_future = generate_future_exog(holidays, steps=horizon, last_date=last_date_full)
-                final_forecast_df = sarima_forecast(
-                    model_fit=best_sarima_model,
-                    steps=horizon,
-                    last_date=train_sarima['ds'].iloc[-1],
-                    exog=exog_future
-                )
-
-                if final_forecast_df.empty:
-                    print(f"Forecasting failed for ASIN {asin}, skipping.")
-                    no_data_output = os.path.join(insufficient_data_folder, f'{asin}_forecast_failed.txt')
-                    with open(no_data_output, 'w') as f:
-                        f.write('Failed to forecast due to insufficient data.\n')
-                    continue
-
-                # =========================
-                # 5. Create Comparison DataFrame
-                # =========================
-                comparison = final_forecast_df.copy()
-                comparison['ASIN'] = asin
-                comparison['Product Title'] = product_title
-
-                # Merge historical 'y' for fallback detection
-                comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
-
-                # =========================
-                # 6. Blend with Amazon Forecasts Only
-                # =========================
-                if forecast_data:
-                    for ftype, values in forecast_data.items():
-                        # Load each forecast type
-                        horizon_values = values[:horizon] if len(values) >= horizon else values
-                        if len(horizon_values) < horizon and len(horizon_values) > 0:
-                            horizon_values = np.pad(
-                                horizon_values, (0, horizon - len(horizon_values)),
-                                'constant', constant_values=horizon_values[-1]
-                            )
-                        elif len(horizon_values) == 0:
-                            horizon_values = np.zeros(horizon, dtype=int)
-
-                        # Assign to DataFrame columns
-                        ftype_lower = ftype.lower()
-                        if 'mean' in ftype_lower:
-                            comparison['Amazon Mean Forecast'] = horizon_values
-                        elif 'p70' in ftype_lower:
-                            comparison['Amazon P70 Forecast'] = horizon_values
-                        elif 'p80' in ftype_lower:
-                            comparison['Amazon P80 Forecast'] = horizon_values
-                        elif 'p90' in ftype_lower:
-                            comparison['Amazon P90 Forecast'] = horizon_values
-                        else:
-                            print(f"Warning: Unrecognized forecast type '{ftype}'. Skipping.")
-
-                    # Weighted blend with Amazon
-                    MEAN_WEIGHT = 0.7
-                    P70_WEIGHT  = 0.2
-                    P80_WEIGHT  = 0.1
-
-                    blended_amz = (
-                        MEAN_WEIGHT * comparison['Amazon Mean Forecast']
-                        + P70_WEIGHT * comparison.get('Amazon P70 Forecast', 0)
-                        + P80_WEIGHT * comparison.get('Amazon P80 Forecast', 0)
-                    ).clip(lower=0)
-
-                    FALLBACK_RATIO = 0.3  # 30% Amazon, 70% SARIMA
-                    comparison['MyForecast'] = (
-                        (1 - FALLBACK_RATIO) * comparison['MyForecast']
-                        + FALLBACK_RATIO * blended_amz
-                    ).clip(lower=0)
-
-                # =========================
-                # 7. Generate XGBoost Forecast Separately (No Blending)
-                # =========================
-                if xgb_model is not None:
-                    xgb_future_df = xgboost_forecast(
-                        xgb_model, ts_data,
-                        forecast_steps=horizon, target='y',
-                        features=xgb_features
+                try:
+                    best_sarima_model_with_po, best_params_with_po = fit_sarima_model(
+                        data=ts_data_with_po,
+                        holidays=holidays,
+                        seasonal_period=52,
+                        asin=asin
                     )
-                    comparison = comparison.merge(xgb_future_df, on='ds', how='left', suffixes=('', '_XGB'))
-                    comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
-                    print(f"XGBoost forecasts generated for ASIN {asin} and saved separately (not blended).")
+                    if best_sarima_model_with_po is None:
+                        print(f"[WITH PO][SARIMA] No model after fit for {asin}, skipping.")
+                        continue
 
-                # =========================
-                # 8. Adjust Forecasts if Out of Range
-                # =========================
-                comparison = adjust_forecast_if_out_of_range(
-                    comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
-                )
+                    steps_with_po = len(test_sarima_with_po)
+                    sarima_test_forecast_df_with_po = sarima_forecast(
+                        model_fit=best_sarima_model_with_po,
+                        steps=steps_with_po,
+                        last_date=train_sarima_with_po['ds'].iloc[-1],
+                        exog=exog_test_with_po
+                    )
+                    sarima_preds_with_po = sarima_test_forecast_df_with_po['MyForecast'].values
+                    sarima_mae_with_po = mean_absolute_error(test_sarima_with_po['y'], sarima_preds_with_po)
+                    sarima_rmse_with_po = sqrt(mean_squared_error(test_sarima_with_po['y'], sarima_preds_with_po))
+                    print(f"[WITH PO][SARIMA] Test MAE={sarima_mae_with_po:.4f}, RMSE={sarima_rmse_with_po:.4f} for ASIN {asin}")
 
-                # =========================
-                # 9. Adjust Forecast Based on Past 8-Week Sales
-                # =========================
-                past_8_weeks = ts_data.sort_values('ds').tail(8)
-                if not past_8_weeks.empty and 'MyForecast' in comparison.columns:
-                    past8_avg = past_8_weeks['y'].mean()
-                    forecast_mean = comparison['MyForecast'].mean()
-                    if forecast_mean > 1.5 * past8_avg:
-                        print(f"Adjusting SARIMA forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
-                        comparison['MyForecast'] = (
-                            0.8 * past8_avg + 0.2 * comparison['MyForecast']
+                    update_param_history(
+                        history_dict=sarima_param_history,
+                        asin=asin,
+                        param_tuple=best_params_with_po,
+                        rmse=sarima_rmse_with_po,
+                        mae=sarima_mae_with_po
+                    )
+
+                    # Build exog for the future
+                    last_date_full_with_po = ts_data_with_po['ds'].iloc[-1]
+                    exog_future_with_po = generate_future_exog(holidays, steps=horizon, last_date=last_date_full_with_po)
+                    exog_future_with_po['Weekly_PO_Qty'] = ts_data_with_po['Weekly_PO_Qty'].mean()
+
+                    final_forecast_df_with_po = sarima_forecast(
+                        model_fit=best_sarima_model_with_po,
+                        steps=horizon,
+                        last_date=train_sarima_with_po['ds'].iloc[-1],
+                        exog=exog_future_with_po
+                    )
+                    if final_forecast_df_with_po.empty:
+                        print(f"[WITH PO][SARIMA] Final forecast empty for {asin}.")
+                        continue
+
+                    comparison_with_po = final_forecast_df_with_po.copy()
+                    comparison_with_po['ASIN'] = asin
+                    comparison_with_po['Product Title'] = product_title
+                    comparison_with_po = comparison_with_po.merge(ts_data_with_po[['ds','y']], on='ds', how='left')
+
+                    # Blend with Amazon forecasts
+                    if forecast_data:
+                        for ftype, values in forecast_data.items():
+                            horizon_vals = values[:horizon] if len(values) >= horizon else values
+                            if len(horizon_vals) < horizon and len(horizon_vals) > 0:
+                                horizon_vals = np.pad(
+                                    horizon_vals, (0, horizon - len(horizon_vals)),
+                                    'constant', constant_values=horizon_vals[-1]
+                                )
+                            elif len(horizon_vals) == 0:
+                                horizon_vals = np.zeros(horizon, dtype=int)
+
+                            ftype_lower = ftype.lower()
+                            if 'mean' in ftype_lower:
+                                comparison_with_po['Amazon Mean Forecast'] = horizon_vals
+                            elif 'p70' in ftype_lower:
+                                comparison_with_po['Amazon P70 Forecast'] = horizon_vals
+                            elif 'p80' in ftype_lower:
+                                comparison_with_po['Amazon P80 Forecast'] = horizon_vals
+                            elif 'p90' in ftype_lower:
+                                comparison_with_po['Amazon P90 Forecast'] = horizon_vals
+                            else:
+                                print(f"Warning: Unrecognized forecast type '{ftype}'. Skipping.")
+
+                        # Weighted blend
+                        MEAN_WEIGHT = 0.7
+                        P70_WEIGHT = 0.2
+                        P80_WEIGHT = 0.1
+                        blended_amz_with_po = (
+                            MEAN_WEIGHT * comparison_with_po['Amazon Mean Forecast']
+                            + P70_WEIGHT * comparison_with_po.get('Amazon P70 Forecast', 0)
+                            + P80_WEIGHT * comparison_with_po.get('Amazon P80 Forecast', 0)
                         ).clip(lower=0)
 
-                # =========================
-                # Seasonal Adjustment
-                # =========================
-                try:
-                    # Detect seasonal patterns
-                    ts_data = detect_seasonal_periods(ts_data)
-                    seasonal_factors = calculate_seasonal_factors(ts_data)
-                    
-                    # Apply seasonal adjustments
-                    comparison = apply_seasonal_adjustment(
-                        comparison, 
-                        ts_data,
-                        seasonal_factors,
-                        override_threshold=0.3,  # 30% deviation allowed
-                        max_override=1.5  # Max 150% override of Amazon forecast
+                        FALLBACK_RATIO = 0.3
+                        comparison_with_po['MyForecast'] = (
+                            (1 - FALLBACK_RATIO)*comparison_with_po['MyForecast']
+                            + FALLBACK_RATIO*blended_amz_with_po
+                        ).clip(lower=0)
+
+                    # XGBoost
+                    if xgb_model_with_po is not None:
+                        xgb_future_df_with_po = xgboost_forecast(
+                            xgb_model_with_po,
+                            ts_data_with_po,
+                            forecast_steps=horizon,
+                            target='y',
+                            features=xgb_features_with_po
+                        )
+                        comparison_with_po = comparison_with_po.merge(
+                            xgb_future_df_with_po,
+                            on='ds',
+                            how='left',
+                            suffixes=('','_XGB')
+                        )
+                        comparison_with_po['MyForecast_XGB'] = comparison_with_po['MyForecast_XGB'].fillna(0)
+
+                    # Adjust out-of-range
+                    comparison_with_po = adjust_forecast_if_out_of_range(
+                        comparison_with_po, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
                     )
-                    
-                    # Validate adjustments
-                    metrics = validate_seasonal_adjustment(ts_data, comparison)
-                    print(f"Seasonal adjustment metrics for {asin}:")
-                    print(f"MAE Improvement: {metrics['improvement_pct']:.1f}%")
-                    print(f"Seasonal Strength: {metrics['seasonal_strength']:.2f}")
-                    
-                    # Fallback if adjustment worsens performance
-                    if metrics['improvement_pct'] < -5:  # If MAE increases by >5%
-                        print("Reverting to original forecast due to poor adjustment")
-                        comparison['final_forecast'] = comparison['MyForecast']
-                        
-                except Exception as e:
-                    print(f"Seasonal adjustment failed for {asin}: {str(e)}")
-                    comparison['final_forecast'] = comparison['MyForecast']
-                
-                # Replace final forecast with adjusted version
-                comparison['MyForecast'] = comparison['final_forecast']
 
-                # =========================
-                # 10. Summaries and Visualization
-                # =========================
-                summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
-                max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
-                    ts_data, comparison, horizon=horizon
-                )
-                visualize_forecast_with_comparison(
-                    ts_data, comparison, summary_stats,
-                    total_forecast_16, total_forecast_8, total_forecast_4,
-                    max_forecast, min_forecast, max_week, min_week,
-                    asin, product_title, sufficient_data_folder
-                )
+                    # Adjust if past 8-week average is exceeded by >50%
+                    past_8_weeks_with_po = ts_data_with_po.sort_values('ds').tail(8)
+                    if not past_8_weeks_with_po.empty and 'MyForecast' in comparison_with_po.columns:
+                        past8_avg_with_po = past_8_weeks_with_po['y'].mean()
+                        fc_mean_with_po = comparison_with_po['MyForecast'].mean()
+                        if fc_mean_with_po > 1.5 * past8_avg_with_po:
+                            print(f"[WITH PO][SARIMA] Adjusting forecast for {asin}, 8wk avg={past8_avg_with_po}, fc mean={fc_mean_with_po}")
+                            comparison_with_po['MyForecast'] = (
+                                0.8 * past8_avg_with_po + 0.2 * comparison_with_po['MyForecast']
+                            ).clip(lower=0)
 
-                # =========================
-                # 11. Log Fallback Triggers
-                # =========================
-                log_fallback_triggers(comparison, asin, product_title)
+                    # Seasonal adjustment
+                    try:
+                        ts_data_with_po = detect_seasonal_periods(ts_data_with_po)
+                        seasonal_factors_with_po = calculate_seasonal_factors(ts_data_with_po)
+                        comparison_with_po = apply_seasonal_adjustment(
+                            comparison_with_po,
+                            ts_data_with_po,
+                            seasonal_factors_with_po,
+                            override_threshold=0.3,
+                            max_override=1.5
+                        )
+                        metrics_season_with_po = validate_seasonal_adjustment(ts_data_with_po, comparison_with_po)
+                        print(f"[WITH PO][SARIMA] Seasonal: MAE Improve={metrics_season_with_po['improvement_pct']:.1f}%, Strength={metrics_season_with_po['seasonal_strength']:.2f}")
+                        if metrics_season_with_po['improvement_pct'] < -5:
+                            print("[WITH PO][SARIMA] Reverting forecast due to poor seasonal adjustment.")
+                            comparison_with_po['final_forecast'] = comparison_with_po['MyForecast']
+                    except Exception as e:
+                        print(f"[WITH PO][SARIMA] Seasonal adjust failed for {asin}: {e}")
+                        comparison_with_po['final_forecast'] = comparison_with_po['MyForecast']
 
-                # =========================
-                # 12. Save Final Forecast and Summary
-                # =========================
-                output_file_name = f'forecast_summary_{asin}.xlsx'
-                output_file_path = os.path.join(sufficient_data_folder, output_file_name)
-                with pd.ExcelWriter(output_file_path, mode='w') as writer:
-                    comparison.to_excel(writer, index=False)
+                    comparison_with_po['MyForecast'] = comparison_with_po['final_forecast']
 
-                save_summary_to_excel(
-                    comparison,
-                    summary_stats,
-                    total_forecast_16,
-                    total_forecast_8,
-                    total_forecast_4,
-                    max_forecast,
-                    min_forecast,
-                    max_week,
-                    min_week,
-                    output_file_path,
-                    metrics=None
-                )
-                consolidated_forecasts[asin] = comparison
+                    # Summaries & visualization
+                    summary_stats_with_po, total_forecast_16_po, total_forecast_8_po, total_forecast_4_po, \
+                    max_forecast_po, min_forecast_po, max_week_po, min_week_po = calculate_summary_statistics(
+                        ts_data_with_po, comparison_with_po, horizon=horizon
+                    )
+                    visualize_forecast_with_comparison(
+                        ts_data_with_po,
+                        comparison_with_po,
+                        summary_stats_with_po,
+                        total_forecast_16_po,
+                        total_forecast_8_po,
+                        total_forecast_4_po,
+                        max_forecast_po,
+                        min_forecast_po,
+                        max_week_po,
+                        min_week_po,
+                        asin,
+                        product_title,
+                        with_po_folder
+                    )
+                    log_fallback_triggers(comparison_with_po, asin, product_title)
 
-            except ValueError as e:
-                print(f"Error during SARIMA prediction for ASIN {asin}: {e}")
-                continue
+                    # Save final forecast & summary
+                    output_file_name_with_po = f'forecast_summary_{asin}_WITH_PO.xlsx'
+                    output_file_path_with_po = os.path.join(with_po_folder, output_file_name_with_po)
+                    comparison_with_po.to_excel(output_file_path_with_po, index=False)
 
-        # =========================
-        # Prophet Block
-        # =========================
-        else:
-            # Check for a cached model
-            cached_model_path = os.path.join("model_cache", f"{asin}_Prophet.pkl")
-            if os.path.exists(cached_model_path) and is_model_up_to_date(cached_model_path, ts_data):
-                print(f"Using up-to-date cached Prophet model for ASIN {asin}.")
-                cached_prophet_model = joblib.load(cached_model_path)
-                last_train_date = ts_data['ds'].max()
-                future_dates = pd.date_range(start=last_train_date + pd.Timedelta(days=7),
-                                             periods=horizon, freq='W-SUN')
-                future = pd.DataFrame({'ds': future_dates})
-                # Add zero columns for Amazon placeholders
-                for forecast_type in forecast_data.keys():
-                    future[f"Amazon_{forecast_type} Forecast"] = 0
-                future['prime_day'] = 0
-                forecast = cached_prophet_model.predict(future)
-                forecast['MyForecast'] = forecast['yhat'].round().astype(int).clip(lower=0)
+                    save_summary_to_excel(
+                        comparison_with_po,
+                        summary_stats_with_po,
+                        total_forecast_16_po,
+                        total_forecast_8_po,
+                        total_forecast_4_po,
+                        max_forecast_po,
+                        min_forecast_po,
+                        max_week_po,
+                        min_week_po,
+                        output_file_path_with_po,
+                        metrics=None
+                    )
+
+                    consolidated_forecasts_with_po[asin] = comparison_with_po
+
+                except ValueError as e:
+                    print(f"[WITH PO][SARIMA] Error for ASIN {asin}: {e}")
+                    continue
+
             else:
-                print(f"No valid cached model or outdated cache for ASIN {asin}. Training a new Prophet model...")
-                best_params, _ = optimize_prophet_params(
-                    ts_data=ts_data,
+                # (B) Prophet with PO
+                # Here you do your existing Prophet code, but with model.add_regressor('Weekly_PO_Qty')
+                # or inside your forecast_with_custom_params. We'll fully expand it so no lines are skipped.
+
+                if model_with_po is None:
+                    print(f"[WITH PO][Prophet] Model is None for {asin}, skipping.")
+                    continue
+
+                if model_with_po == "Prophet_Failed":
+                    print(f"[WITH PO][Prophet] No valid prophet model for {asin}, skipping.")
+                    continue
+
+                # We skip caching example, or replicate it if you have a path like "model_cache/{asin}_Prophet_WITH_PO.pkl"
+                # For demonstration, let's do a fresh training approach:
+
+                print(f"[WITH PO][Prophet] Training a new model for ASIN {asin} ...")
+                best_params_po, _ = optimize_prophet_params(
+                    ts_data=ts_data_with_po,
                     forecast_data=forecast_data,
                     param_grid=param_grid,
                     horizon=horizon,
                     asin=asin
                 )
-                forecast, trained_prophet_model = forecast_with_custom_params(
-                    ts_data=ts_data,
+
+                # Now we need a version of forecast_with_custom_params that adds .add_regressor('Weekly_PO_Qty')
+                # If your function doesn't do it automatically, do it inside. For example:
+                forecast_po, trained_prophet_model_po = forecast_with_custom_params(
+                    ts_data=ts_data_with_po,  # pass the DataFrame that includes Weekly_PO_Qty
                     forecast_data=forecast_data,
-                    changepoint_prior_scale=best_params['changepoint_prior_scale'],
-                    seasonality_prior_scale=best_params['seasonality_prior_scale'],
-                    holidays_prior_scale=best_params['holidays_prior_scale'],
+                    changepoint_prior_scale=best_params_po['changepoint_prior_scale'],
+                    seasonality_prior_scale=best_params_po['seasonality_prior_scale'],
+                    holidays_prior_scale=best_params_po['holidays_prior_scale'],
                     horizon=horizon
                 )
-                if trained_prophet_model is not None:
-                    save_model(trained_prophet_model, "Prophet", asin, ts_data)
-                else:
-                    print("Failed to train the Prophet model.")
-                    no_data_output = os.path.join(insufficient_data_folder, f"{asin}_final_forecast_failed.txt")
-                    with open(no_data_output, 'w') as f:
-                        f.write("Final forecasting failed.\n")
+                if trained_prophet_model_po is None or forecast_po.empty:
+                    print(f"[WITH PO][Prophet] Forecast or model is empty for {asin}. Skipping.")
                     continue
 
-            # If forecast is empty, skip
-            if 'forecast' not in locals() or forecast.empty:
-                print(f"Forecasting failed for ASIN {asin}, skipping.")
-                no_data_output = os.path.join(insufficient_data_folder, f"{asin}_final_forecast_failed.txt")
-                with open(no_data_output, 'w') as f:
-                    f.write("Final forecasting failed.\n")
-                continue
+                # Format output
+                comparison_with_po = format_output_with_forecasts(forecast_po, forecast_data, horizon=horizon)
+                best_weights_po, best_rmse_po = auto_find_best_weights(forecast_po, comparison_with_po, step=0.05)
+                print(f"[WITH PO][Prophet] Auto weights for {asin}: {best_weights_po}, RMSE={best_rmse_po}")
 
-            # Format final Prophet forecast
-            comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
-            best_weights, best_rmse = auto_find_best_weights(forecast, comparison, step=0.05)
-            print(f"Auto best weights for ASIN {asin}: {best_weights} with RMSE={best_rmse}")
-    
-            forecast = adjust_forecast_weights(forecast.copy(), *best_weights)
-            comparison = format_output_with_forecasts(forecast, forecast_data, horizon=horizon)
+                # Adjust
+                forecast_po = adjust_forecast_weights(forecast_po.copy(), *best_weights_po)
+                comparison_with_po = format_output_with_forecasts(forecast_po, forecast_data, horizon=horizon)
 
-            print("\n--- Forecast Before Out-of-Range Adjustment ---")
-            print(comparison[['MyForecast']].head(10))
-            print("-----------------------------------------\n")
+                comparison_with_po = adjust_forecast_if_out_of_range(comparison_with_po, asin, adjustment_threshold=0.3)
+                log_fallback_triggers(comparison_with_po, asin, product_title)
 
-            # Adjust out-of-range
-            comparison = adjust_forecast_if_out_of_range(comparison, asin, adjustment_threshold=0.3)
+                # Past 8-week adjust
+                past_8_weeks_po = ts_data_with_po.sort_values('ds').tail(8)
+                if not past_8_weeks_po.empty and 'MyForecast' in comparison_with_po.columns:
+                    past8_avg_po = past_8_weeks_po['y'].mean()
+                    fc_mean_po = comparison_with_po['MyForecast'].mean()
+                    if fc_mean_po > 1.5 * past8_avg_po:
+                        print(f"[WITH PO][Prophet] Adjusting {asin}, 8wk avg={past8_avg_po}, fc mean={fc_mean_po}")
+                        comparison_with_po['MyForecast'] = (
+                            0.8 * past8_avg_po + 0.2 * comparison_with_po['MyForecast']
+                        ).clip(lower=0)
 
-            # Log fallback triggers
-            log_fallback_triggers(comparison, asin, product_title)
+                # Seasonal
+                try:
+                    ts_data_with_po = detect_seasonal_periods(ts_data_with_po)
+                    seasonal_factors_with_po = calculate_seasonal_factors(ts_data_with_po)
+                    comparison_with_po = apply_seasonal_adjustment(
+                        comparison_with_po,
+                        ts_data_with_po,
+                        seasonal_factors_with_po,
+                        override_threshold=0.3,
+                        max_override=1.5
+                    )
+                    metrics_season_with_po = validate_seasonal_adjustment(ts_data_with_po, comparison_with_po)
+                    print(
+                        f"[WITH PO][Prophet] Seasonal: MAE Improve={metrics_season_with_po['improvement_pct']:.1f}%, Strength={metrics_season_with_po['seasonal_strength']:.2f}"
+                    )
+                    if metrics_season_with_po['improvement_pct'] < -5:
+                        print("[WITH PO][Prophet] Reverting forecast due to poor seasonal adjust.")
+                        comparison_with_po['final_forecast'] = comparison_with_po['MyForecast']
+                except Exception as e:
+                    print(f"[WITH PO][Prophet] Seasonal adjust failed for {asin}: {e}")
+                    comparison_with_po['final_forecast'] = comparison_with_po['MyForecast']
 
-            # Adjust if past 8-week sales are much lower
-            past_8_weeks = ts_data.sort_values('ds').tail(8)
-            if not past_8_weeks.empty and 'MyForecast' in comparison.columns:
-                past8_avg = past_8_weeks['y'].mean()
-                forecast_mean = comparison['MyForecast'].mean()
-                if forecast_mean > 1.5 * past8_avg:
-                    print(f"Adjusting Prophet forecast: past 8-week avg={past8_avg:.2f}, forecast mean={forecast_mean:.2f}")
-                    comparison['MyForecast'] = (
-                        0.8 * past8_avg + 0.2 * comparison['MyForecast']
-                    ).clip(lower=0)
+                comparison_with_po['MyForecast'] = comparison_with_po['final_forecast']
 
-            # =========================
-            # Seasonal Adjustment
-            # =========================
-            try:
-                # Detect seasonal patterns
-                ts_data = detect_seasonal_periods(ts_data)
-                seasonal_factors = calculate_seasonal_factors(ts_data)
-                
-                # Apply seasonal adjustments
-                comparison = apply_seasonal_adjustment(
-                    comparison, 
-                    ts_data,
-                    seasonal_factors,
-                    override_threshold=0.3,  # 30% deviation allowed
-                    max_override=1.5  # Max 150% override of Amazon forecast
+                # Summaries
+                if 'ds' in comparison_with_po.columns and 'y' not in comparison_with_po.columns:
+                    comparison_with_po = comparison_with_po.merge(ts_data_with_po[['ds','y']], on='ds', how='left')
+
+                summary_stats_with_po, total_forecast_16_po, total_forecast_8_po, total_forecast_4_po, \
+                max_forecast_po, min_forecast_po, max_week_po, min_week_po = calculate_summary_statistics(
+                    ts_data_with_po, comparison_with_po, horizon=horizon
                 )
-                
-                # Validate adjustments
-                metrics = validate_seasonal_adjustment(ts_data, comparison)
-                print(f"Seasonal adjustment metrics for {asin}:")
-                print(f"MAE Improvement: {metrics['improvement_pct']:.1f}%")
-                print(f"Seasonal Strength: {metrics['seasonal_strength']:.2f}")
-                
-                # Fallback if adjustment worsens performance
-                if metrics['improvement_pct'] < -5:  # If MAE increases by >5%
-                    print("Reverting to original forecast due to poor adjustment")
-                    comparison['final_forecast'] = comparison['MyForecast']
-                    
-            except Exception as e:
-                print(f"Seasonal adjustment failed for {asin}: {str(e)}")
-                comparison['final_forecast'] = comparison['MyForecast']
-            
-            # Replace final forecast with adjusted version
-            comparison['MyForecast'] = comparison['final_forecast']
-
-            # =========================
-            # Summaries and Visualization
-            # =========================
-            summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
-            max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
-                ts_data, comparison, horizon=horizon
-            )
-            visualize_forecast_with_comparison(
-                ts_data, comparison, summary_stats, total_forecast_16,
-                total_forecast_8, total_forecast_4, max_forecast,
-                min_forecast, max_week, min_week,
-                asin, product_title, sufficient_data_folder
-            )
-
-            log_fallback_triggers(comparison, asin, product_title)
-
-            # =========================
-            # Ensure 'y' is in comparison
-            # =========================
-            if 'ds' in comparison.columns and 'y' not in comparison.columns:
-                comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
-
-            analyze_amazon_buying_habits(comparison, holidays)
-
-            if 'y' not in comparison.columns:
-                comparison = comparison.merge(ts_data[['ds', 'y']], on='ds', how='left')
-
-            if 'y' in comparison.columns:
-                comparison_historical = comparison.dropna(subset=['y'])
-            else:
-                comparison_historical = pd.DataFrame()
-
-            if comparison_historical.empty:
-                print("No overlapping historical data to calculate metrics. Skipping metrics.")
-                metrics = {}
-            else:
-                MAE = mean_absolute_error(comparison_historical['y'], comparison_historical['MyForecast'])
-                MEDAE = median_absolute_error(comparison_historical['y'], comparison_historical['MyForecast'])
-                MSE = mean_squared_error(comparison_historical['y'], comparison_historical['MyForecast'])
-                RMSE = sqrt(MSE)
-
-                print('Mean Absolute Error (MAE): ' + str(np.round(MAE, 2)))
-                print('Median Absolute Error (MedAE): ' + str(np.round(MEDAE, 2)))
-                print('Mean Squared Error (MSE): ' + str(np.round(MSE, 2)))
-                print('Root Mean Squared Error (RMSE): ' + str(np.round(RMSE, 2)))
-
-                metrics = {
-                    "Mean Absolute Error (MAE)": np.round(MAE, 2),
-                    "Median Absolute Error (MedAE)": np.round(MEDAE, 2),
-                    "Mean Squared Error (MSE)": np.round(MSE, 2),
-                    "Root Mean Squared Error (RMSE)": np.round(RMSE, 2)
-                }
-
-            # =========================
-            # Generate XGBoost Forecasts Separately (No Blending)
-            # =========================
-            if xgb_model is not None:
-                xgb_future_df = xgboost_forecast(
-                    xgb_model, ts_data,
-                    forecast_steps=horizon, target='y',
-                    features=xgb_features
+                visualize_forecast_with_comparison(
+                    ts_data_with_po,
+                    comparison_with_po,
+                    summary_stats_with_po,
+                    total_forecast_16_po,
+                    total_forecast_8_po,
+                    total_forecast_4_po,
+                    max_forecast_po,
+                    min_forecast_po,
+                    max_week_po,
+                    min_week_po,
+                    asin,
+                    product_title,
+                    with_po_folder
                 )
-                comparison = comparison.merge(xgb_future_df, on='ds', how='left', suffixes=('', '_XGB'))
-                comparison['MyForecast_XGB'] = comparison['MyForecast_XGB'].fillna(0)
-                print(f"XGBoost forecasts generated for ASIN {asin} and saved separately (not blended).")
+                log_fallback_triggers(comparison_with_po, asin, product_title)
 
-            # =========================
-            # Final Summary & Chart
-            # =========================
-            summary_stats, total_forecast_16, total_forecast_8, total_forecast_4, \
-            max_forecast, min_forecast, max_week, min_week = calculate_summary_statistics(
-                ts_data, comparison, horizon=horizon
-            )
-            visualize_forecast_with_comparison(
-                ts_data, comparison, summary_stats, total_forecast_16,
-                total_forecast_8, total_forecast_4, max_forecast,
-                min_forecast, max_week, min_week,
-                asin, product_title, sufficient_data_folder
-            )
+                # Final
+                comparison_with_po['ASIN'] = asin
+                comparison_with_po['Product Title'] = product_title
 
-            comparison['ASIN'] = asin
-            comparison['Product Title'] = product_title
+                output_file_name_with_po = f'forecast_summary_{asin}_WITH_PO.xlsx'
+                output_file_path_with_po = os.path.join(with_po_folder, output_file_name_with_po)
+                comparison_with_po.to_excel(output_file_path_with_po, index=False)
 
-            # =========================
-            # Save Final Forecast and Summary
-            # =========================
-            output_file_name = f'forecast_summary_{asin}.xlsx'
-            output_file_path = os.path.join(sufficient_data_folder, output_file_name)
-            with pd.ExcelWriter(output_file_path, mode='w') as writer:
-                comparison.to_excel(writer, index=False)
+                save_summary_to_excel(
+                    comparison_with_po,
+                    summary_stats_with_po,
+                    total_forecast_16_po,
+                    total_forecast_8_po,
+                    total_forecast_4_po,
+                    max_forecast_po,
+                    min_forecast_po,
+                    max_week_po,
+                    min_week_po,
+                    output_file_path_with_po,
+                    metrics=None
+                )
 
-            save_summary_to_excel(
-                comparison,
-                summary_stats,
-                total_forecast_16,
-                total_forecast_8,
-                total_forecast_4,
-                max_forecast,
-                min_forecast,
-                max_week,
-                min_week,
-                output_file_path,
-                metrics=metrics 
-            )
-            consolidated_forecasts[asin] = comparison
+                consolidated_forecasts_with_po[asin] = comparison_with_po
 
-    # =========================
-    # After Processing All ASINs
-    # =========================
-    final_output_path = output_file
-    save_forecast_to_excel(final_output_path, consolidated_forecasts, missing_asin_data, base_year=2025)
+    # ----------------------------------------------------------------------------
+    # 6) After processing ALL ASINs, save consolidated data
+    # ----------------------------------------------------------------------------
+    final_output_path_with_po = "consolidated_forecast_WITH_PO.xlsx"
+    save_forecast_to_excel(final_output_path_with_po, consolidated_forecasts_with_po, missing_asin_data, base_year=2025)
+    print(f"[WITH PO] All per-ASIN forecasts saved to {final_output_path_with_po}")
 
+    # Save feedback, generate summary reports, etc.
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
-    generate_4_week_report(consolidated_forecasts)
-    generate_combined_weekly_report(consolidated_forecasts)
-
-    print("\n--- Analyzing Purchase Order Data ---")
-    po_forecasts_dict = analyze_po_data_by_asin(
-        po_file="po database.xlsx",
-        output_folder="po_analysis_by_asin"
-    )
-
-    print("\n--- Forecasting PO Orders with Prophet ---")
-    forecast_po_orders_with_prophet(
-        po_file="po database.xlsx", 
-        output_folder="po_forecast_output", 
-        horizon_weeks=16,
-        amazon_start_date='2025-02-02'
-    )
-
-    # Now we do correlation checks, ratio, cross-correlation, big-sales checks
-    print("\n--- Merging Sales & PO Forecasts for Relationship Analysis ---")
-    relationship_excel_path = "po_sales_relationship.xlsx"
-    with pd.ExcelWriter(relationship_excel_path, engine='openpyxl') as writer:
-        relationship_summaries = []
-
-        # Example big sales windows
-        big_sales_seasons = [
-            ("Prime Day 2024", pd.Timestamp("2024-07-15"), pd.Timestamp("2024-07-22")),
-            ("Black Friday 2024", pd.Timestamp("2024-11-25"), pd.Timestamp("2024-12-02")),
-        ]
-
-        # find asins that exist in both dictionaries
-        common_asins = set(consolidated_forecasts.keys()).intersection(po_forecasts_dict.keys())
-
-        for asin in common_asins:
-            sales_df = consolidated_forecasts[asin].copy()   # Expected to have forecast data (e.g., Week_Start_Date, MyForecast, etc.)
-            po_df    = po_forecasts_dict[asin].copy()         # Expected to have [ds, PO_Forecast]
-        
-            # Ensure sales_df has a common column for merging. If 'ds' is not present but 'Week_Start_Date' is, rename it.
-            if 'ds' not in sales_df.columns and 'Week_Start_Date' in sales_df.columns:
-                sales_df = sales_df.rename(columns={'Week_Start_Date': 'ds'})
-            # Similarly, ensure po_df has the column 'ds'
-            if 'ds' not in po_df.columns and 'Week_Start_Date' in po_df.columns:
-                po_df = po_df.rename(columns={'Week_Start_Date': 'ds'})
-        
-            if sales_df.empty or po_df.empty:
-                continue
-
-            # Convert 'ds' in sales_df to datetime
-            sales_df['ds'] = pd.to_datetime(sales_df['ds'], errors='coerce')
-
-            # Convert 'ds' in po_df to datetime
-            po_df['ds'] = pd.to_datetime(po_df['ds'], errors='coerce')
-
-            merged = pd.merge(
-                sales_df[['ds','MyForecast']],
-                po_df[['ds','PO_Forecast']],
-                on='ds', how='inner'
-            ).dropna(subset=['MyForecast','PO_Forecast'])
-
-            if merged.empty:
-                continue
-
-            # 1) Pearson correlation at lag=0
-            corr_val = merged[['MyForecast','PO_Forecast']].corr().iloc[0,1]
-
-            # 2) ratio & difference
-            merged['ratio'] = merged['PO_Forecast'] / (merged['MyForecast'] + 1e-9)
-            merged['difference'] = merged['PO_Forecast'] - merged['MyForecast']
-            avg_ratio = merged['ratio'].mean()
-            avg_diff  = merged['difference'].mean()
-
-            # 3) cross-correlation - lags -4..+4
-            lag_results = []
-            best_lag = 0
-            max_corr_abs = -999
-            for lag in range(-4,5):
-                merged['PO_shifted'] = merged['PO_Forecast'].shift(lag)
-                lag_corr = merged[['MyForecast','PO_shifted']].corr().iloc[0,1]
-                lag_results.append((lag, lag_corr))
-                if abs(lag_corr) > abs(max_corr_abs):
-                    max_corr_abs = lag_corr
-                    best_lag = lag
-
-            # 4) big-sales analysis
-            big_sales_checks = []
-            for season_name, start_date, end_date in big_sales_seasons:
-                mask = (merged['ds']>=start_date)&(merged['ds']<=end_date)
-                po_during = merged.loc[mask,'PO_Forecast'].mean() if not merged.loc[mask].empty else 0
-                
-                prior_mask = (merged['ds']<start_date)&(merged['ds']>=(start_date-pd.Timedelta(weeks=4)))
-                po_prior = merged.loc[prior_mask,'PO_Forecast'].mean() if not merged.loc[prior_mask].empty else 0
-                
-                change_pct = ((po_during - po_prior)/(po_prior+1e-9))*100
-                big_sales_checks.append({
-                    'ASIN': asin,
-                    'Season': season_name,
-                    'Start': start_date.date(),
-                    'End': end_date.date(),
-                    'Avg_PO_Prior_4wks': po_prior,
-                    'Avg_PO_During': po_during,
-                    'Change(%)': change_pct
-                })
-
-            summary_dict = {
-                'ASIN': asin,
-                'Corr_lag0': corr_val,
-                'AvgRatio': avg_ratio,
-                'AvgDiff': avg_diff,
-                'BestLag': best_lag,
-                'Corr@BestLag': max_corr_abs
-            }
-            relationship_summaries.append(summary_dict)
-
-            # Write detail sheets
-            lag_df = pd.DataFrame(lag_results, columns=['lag','correlation'])
-            lag_df.to_excel(writer, sheet_name=f"{asin}_CrossCorr", index=False)
-
-            big_sales_df = pd.DataFrame(big_sales_checks)
-            big_sales_df.to_excel(writer, sheet_name=f"{asin}_Seasons", index=False)
-
-            # Also write merged detail
-            merged.to_excel(writer, sheet_name=f"{asin}_Detail", index=False)
-
-        # Final summary sheet
-        summary_df = pd.DataFrame(relationship_summaries)
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        print(f"PO-Sales relationship analysis saved to '{relationship_excel_path}'.")
+    generate_4_week_report(consolidated_forecasts_with_po)
+    generate_combined_weekly_report(consolidated_forecasts_with_po)
 
     # Save param histories
     save_param_histories()
@@ -3435,7 +3245,6 @@ def main():
 ##############################
 # Run the Main Script
 ##############################
-
 if __name__ == '__main__':
     main()
     summarize_usage()
