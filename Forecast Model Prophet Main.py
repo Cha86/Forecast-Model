@@ -2841,6 +2841,72 @@ def generate_low_coverage_report(consolidated_data, coverage_threshold=1.0, outp
     flagged_df.to_excel(output_file, index=False)
     print(f"Low Coverage/High Urgency rows saved to {output_file}. Rows: {len(flagged_df)}")
 
+def generate_restock_suggestions(consolidated_data, coverage_threshold=1.0, output_file="restock_suggestions.xlsx"):
+    """
+    Goes through each ASIN's DataFrame in 'consolidated_data'.
+    Finds the FIRST week coverage < coverage_threshold.
+    Then calculates how many units are needed for the next 4, 8, and 16 weeks 
+    of MyForecast from that restock point.
+    
+    Output columns:
+      ASIN, Product Title, Restock Week, Restock_4wk, Restock_8wk, Restock_16wk
+    
+    Saves the result to an Excel file (or CSV).
+    """
+    import pandas as pd
+    
+    suggestions = []
+    
+    for asin, df_forecast in consolidated_data.items():
+        if df_forecast.empty:
+            continue
+        
+        if 'Inventory Coverage' not in df_forecast.columns:
+            continue
+        
+        required_cols = ['Week', 'MyForecast', 'Product Title', 'Inventory Coverage']
+        missing = [col for col in required_cols if col not in df_forecast.columns]
+        if missing:
+            print(f"Skipping ASIN {asin}, missing columns: {missing}")
+            continue
+        
+
+        condition = df_forecast['Inventory Coverage'] < coverage_threshold
+        low_cov = df_forecast[condition]
+        
+        if low_cov.empty:
+            continue
+        
+        first_row = low_cov.iloc[0]
+        restock_week = first_row['Week']  
+        product_title = first_row.get('Product Title', '')
+        
+        row_index = low_cov.index[0]
+        
+        future_forecast = df_forecast.loc[row_index:, 'MyForecast'].values
+        
+        restock_4 = future_forecast[:4].sum() if len(future_forecast) >= 4 else future_forecast.sum()
+        restock_8 = future_forecast[:8].sum() if len(future_forecast) >= 8 else future_forecast.sum()
+        restock_16 = future_forecast[:16].sum() if len(future_forecast) >= 16 else future_forecast.sum()
+        
+        suggestions.append({
+            'ASIN': asin,
+            'Product Title': product_title,
+            'Restock Week': restock_week,
+            'Restock_4wk': int(restock_4),
+            'Restock_8wk': int(restock_8),
+            'Restock_16wk': int(restock_16)
+        })
+    
+    if not suggestions:
+        print("No ASINs found requiring restock suggestions.")
+        return
+    
+    suggestions_df = pd.DataFrame(suggestions)
+    suggestions_df = suggestions_df.sort_values(['ASIN', 'Restock Week']).reset_index(drop=True)
+    
+    suggestions_df.to_excel(output_file, index=False)
+    print(f"Restock suggestions saved to {output_file}")
 
 ##############################
 # Main
@@ -3583,6 +3649,13 @@ def main():
     final_output_path_with_po = "consolidated_forecast_WITH_PO.xlsx"
     save_forecast_to_excel(final_output_path_with_po, consolidated_forecasts_with_po, missing_asin_data, base_year=2025)
     print(f"[WITH PO] All per-ASIN forecasts saved to {final_output_path_with_po}")
+
+    generate_restock_suggestions(
+        consolidated_forecasts_with_po,
+        coverage_threshold=1.0,
+        output_file="restock_suggestions.xlsx"
+    )
+    print("\n Restock Suggestion completed. \n")
 
     save_feedback_to_excel(prophet_feedback, "prophet_feedback.xlsx")
     generate_4_week_report(consolidated_forecasts_with_po)
