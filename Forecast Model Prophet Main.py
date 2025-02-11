@@ -1647,27 +1647,6 @@ def save_4_8_16_forecast_summary(consolidated_data, output_folder):
     print(f"4-8-16 Weeks Forecast Summary saved to {output_file_path}")
 
 def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, base_year=2025):
-    """
-    Save multiple ASIN forecasts (with "MyForecast") and any missing ASIN data into one Excel file,
-    each ASIN in a separate sheet.
-    
-    The final output uses the forecast dates (in 'Week_Start_Date') to compute the week labels
-    relative to the first forecast date. For example, if the first forecast date is 2025-01-26,
-    then that row is labeled "W1", the next (if exactly 7 days later) as "W2", etc.
-    
-    If 'Week_Start_Date' is missing, we do a fallback enumerating W1..Wn in sorted order.
-
-    Parameters:
-      output_path (str): File path for the consolidated Excel file.
-      consolidated_data (dict): Keys are ASINs; values are DataFrames with forecast data.
-      missing_asin_data (DataFrame): DataFrame for missing ASINs.
-      base_year (int): Base year used in fallback week label conversion if needed.
-    """
-    import pandas as pd
-    import numpy as np
-    from openpyxl import Workbook
-    from openpyxl.utils.dataframe import dataframe_to_rows
-
     # Desired final column order.
     desired_columns = [
         "Week",
@@ -1682,13 +1661,13 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
         "is_holiday_week"
     ]
 
-    # Columns we can safely drop if present.
+    # Columns to remove.
     unwanted_cols = [
-        "ds","yhat","yhat_upper","Diff_Mean","Diff_P70","Diff_P80","Diff_P90",
-        "Pct_Mean","Pct_P70","Pct_P80","Pct_P90","MyForecast_XGB","y"
+        "ds", "yhat", "yhat_upper", "Diff_Mean", "Diff_P70", "Diff_P80", "Diff_P90",
+        "Pct_Mean", "Pct_P70", "Pct_P80", "Pct_P90", "MyForecast_XGB", "y"
     ]
 
-    # Numeric forecast columns we want to fill/clean
+    # Columns to be cleaned.
     forecast_cols = [
         "MyForecast",
         "Amazon Mean Forecast",
@@ -1702,75 +1681,73 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
     for asin, forecast_df in consolidated_data.items():
         df_for_excel = forecast_df.copy()
 
-        # --- Step 1: Drop unwanted columns if present ---
+        # --- Step 1: Drop unwanted columns ---
         for col in unwanted_cols:
             if col in df_for_excel.columns:
-                df_for_excel.drop(columns=[col], inplace=True)
+                df_for_excel.drop(columns=[col], inplace=True, errors='ignore')
 
-        # --- Step 2: If there's a "ds" column, rename to "Week_Start_Date" ---
-        #    only if we don't already have "Week_Start_Date"
+        # --- Step 2: If there is a column "ds" but no "Week_Start_Date", rename ds to Week_Start_Date ---
         if "ds" in df_for_excel.columns and "Week_Start_Date" not in df_for_excel.columns:
             df_for_excel["ds"] = pd.to_datetime(df_for_excel["ds"], errors="coerce")
             df_for_excel["Week_Start_Date"] = df_for_excel["ds"].dt.strftime("%Y-%m-%d")
             df_for_excel.drop(columns=["ds"], inplace=True)
 
-        # --- Step 3: If 'Week_Start_Date' is present, we compute "Week" from it.
-        #    If not, we fallback to enumerating W1..Wn in sorted order.
+        # --- Step 3: Recompute 'Week' using ISO week from "Week_Start_Date" if it exists ---
         if "Week_Start_Date" in df_for_excel.columns:
             # Convert to datetime
             df_for_excel["Week_Start_Date"] = pd.to_datetime(df_for_excel["Week_Start_Date"], errors="coerce")
-            # Sort by date
-            df_for_excel = df_for_excel.sort_values("Week_Start_Date").reset_index(drop=True)
-            # If we have a valid first_date
-            if df_for_excel["Week_Start_Date"].notna().all():
-                first_date = df_for_excel["Week_Start_Date"].min()
-                # For each row, compute how many 7-day increments from first_date
-                def date_to_weeknum(d):
-                    if pd.isna(d):
-                        return None
-                    delta_days = (d - first_date).days
-                    return (delta_days // 7) + 1   
-                
-                df_for_excel["Week"] = df_for_excel["Week_Start_Date"].apply(lambda d: f"W{date_to_weeknum(d)}")
-                # Convert back to string for final
-                df_for_excel["Week_Start_Date"] = df_for_excel["Week_Start_Date"].dt.strftime("%Y-%m-%d")
-            else:
-                df_for_excel = df_for_excel.reset_index(drop=True)
-                df_for_excel["Week"] = [f"W{i+1}" for i in range(len(df_for_excel))]
+            # Now, compute ISO week for each row; for example, 2025-02-02 becomes ISO week 5 => label "W05"
+            def date_to_iso_week_label(d):
+                if pd.isna(d):
+                    return np.nan
+                # Use the ISO week number (which for 2025-02-02 should be 5)
+                return f"W{d.isocalendar().week:02d}"
+            df_for_excel["Week"] = df_for_excel["Week_Start_Date"].apply(date_to_iso_week_label)
+            # Convert date back to string for final output
+            df_for_excel["Week_Start_Date"] = df_for_excel["Week_Start_Date"].dt.strftime("%Y-%m-%d")
         else:
-            df_for_excel = df_for_excel.sort_index().reset_index(drop=True)
+            # If no "Week_Start_Date", fallback: enumerate rows as W1, W2, etc.
+            df_for_excel = df_for_excel.reset_index(drop=True)
             df_for_excel["Week"] = [f"W{i+1}" for i in range(len(df_for_excel))]
             df_for_excel["Week_Start_Date"] = ""
 
+        # --- Step 4: Clean forecast columns ---
         for col in forecast_cols:
             if col in df_for_excel.columns:
                 df_for_excel[col] = df_for_excel[col].replace([np.inf, -np.inf], 0).fillna(0)
                 df_for_excel[col] = df_for_excel[col].round().astype(int, errors='ignore')
 
+        # --- Step 5: Ensure all desired columns exist ---
         for col in desired_columns:
             if col not in df_for_excel.columns:
                 df_for_excel[col] = np.nan
 
+        # --- Step 6: Fill 'ASIN' and 'Product Title' if missing ---
         df_for_excel["ASIN"] = asin
         if "Product Title" in forecast_df.columns and not forecast_df["Product Title"].empty:
             df_for_excel["Product Title"] = forecast_df["Product Title"].iloc[0]
         else:
             df_for_excel["Product Title"] = ""
 
+        # --- Step 7: Reorder columns ---
         df_for_excel = df_for_excel[desired_columns]
 
+        # --- Step 8: Write this ASIN's data to a new worksheet ---
         ws = wb.create_sheet(title=str(asin)[:31])
         for row in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(row)
 
+    # --- Step 9: Add missing ASIN data as a separate sheet if available ---
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
         for row in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(row)
 
+    # --- Step 10: Remove the default sheet if more than one exists ---
     if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
         del wb["Sheet"]
 
+    # --- Step 11: Create a Summary Sheet for 4,8,16 Week Forecasts ---
     ws_summary = wb.create_sheet(title="Summary")
     ws_summary.append(["ASIN", "Product Title", "4 Week Forecast", "8 Week Forecast", "16 Week Forecast"])
 
@@ -1778,7 +1755,7 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
         if df.empty:
             ws_summary.append([asin, "No data", None, None, None])
             continue
-        
+
         product_title = df["Product Title"].iloc[0] if "Product Title" in df.columns else ""
         if "MyForecast" in df.columns:
             df["MyForecast"] = df["MyForecast"].replace([np.inf, -np.inf], 0).fillna(0)
@@ -1788,7 +1765,7 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
             sixteen_wk_val = df["MyForecast"].iloc[:16].sum() if len(df) >= 16 else df["MyForecast"].sum()
         else:
             four_wk_val = eight_wk_val = sixteen_wk_val = 0
-        
+
         ws_summary.append([
             asin,
             product_title,
@@ -1797,6 +1774,7 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
             int(round(sixteen_wk_val))
         ])
 
+    # --- Step 12: Save the workbook ---
     try:
         wb.save(output_path)
         print(f"All forecasts saved to '{output_path}'")
@@ -2854,7 +2832,6 @@ def generate_low_coverage_report(consolidated_data, coverage_threshold=1.0, outp
     print(f"Low Coverage/High Urgency rows saved to {output_file}. Rows: {len(flagged_df)}")
 
 def generate_restock_suggestions(consolidated_data, coverage_threshold=1.0, output_file="restock_suggestions.xlsx"):
-
     suggestions = []
     
     for asin, df_forecast in consolidated_data.items():
@@ -3290,11 +3267,17 @@ def main():
                             comparison_with_po['Week_Start_Date'] = ''
 
                     # 2) Guarantee 'Week'
-                    if 'Week' not in comparison_with_po.columns:
-                        comparison_with_po = comparison_with_po.sort_values(
-                            'Week_Start_Date', na_position='last'
-                        ).reset_index(drop=True)
-                        comparison_with_po['Week'] = ['W' + str(i+1) for i in range(len(comparison_with_po))]
+                    comparison_with_po['Week_Start_Date'] = pd.to_datetime(comparison_with_po['Week_Start_Date'], errors='coerce')
+
+                    # Now compute the ISO week
+                    def iso_week_label(d):
+                        if pd.isna(d):
+                            return "W??"
+                        return f"W{d.isocalendar().week:02d}"
+
+                    comparison_with_po['Week'] = comparison_with_po['Week_Start_Date'].apply(iso_week_label)
+                    comparison_with_po['Week_Start_Date'] = comparison_with_po['Week_Start_Date'].dt.strftime('%Y-%m-%d')
+
 
                     # 3) Trend
                     comparison_with_po['Trend'] = determine_seasonal_trend(comparison_with_po['MyForecast'])
@@ -3531,11 +3514,17 @@ def main():
                         comparison_with_po['Week_Start_Date'] = ''
 
                 # 2) Guarantee 'Week'
-                if 'Week' not in comparison_with_po.columns:
-                    comparison_with_po = comparison_with_po.sort_values(
-                        'Week_Start_Date', na_position='last'
-                    ).reset_index(drop=True)
-                    comparison_with_po['Week'] = ['W' + str(i+1) for i in range(len(comparison_with_po))]
+                comparison_with_po['Week_Start_Date'] = pd.to_datetime(comparison_with_po['Week_Start_Date'], errors='coerce')
+
+                # Now compute the ISO week
+                def iso_week_label(d):
+                    if pd.isna(d):
+                        return "W??"
+                    return f"W{d.isocalendar().week:02d}"
+
+                comparison_with_po['Week'] = comparison_with_po['Week_Start_Date'].apply(iso_week_label)
+                comparison_with_po['Week_Start_Date'] = comparison_with_po['Week_Start_Date'].dt.strftime('%Y-%m-%d')
+
 
                 # 3) Trend
                 comparison_with_po['Trend'] = determine_seasonal_trend(comparison_with_po['MyForecast'])
