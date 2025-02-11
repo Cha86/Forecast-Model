@@ -3273,7 +3273,7 @@ def main():
                     def iso_week_label(d):
                         if pd.isna(d):
                             return "W??"
-                        return f"W{d.isocalendar().week:02d}"
+                        return f"W{d.isocalendar().week + 1}"
 
                     comparison_with_po['Week'] = comparison_with_po['Week_Start_Date'].apply(iso_week_label)
                     comparison_with_po['Week_Start_Date'] = comparison_with_po['Week_Start_Date'].dt.strftime('%Y-%m-%d')
@@ -3519,8 +3519,8 @@ def main():
                 # Now compute the ISO week
                 def iso_week_label(d):
                     if pd.isna(d):
-                        return "W??"
-                    return f"W{d.isocalendar().week:02d}"
+                        return "W?"
+                    return f"W{d.isocalendar().week + 1}"
 
                 comparison_with_po['Week'] = comparison_with_po['Week_Start_Date'].apply(iso_week_label)
                 comparison_with_po['Week_Start_Date'] = comparison_with_po['Week_Start_Date'].dt.strftime('%Y-%m-%d')
