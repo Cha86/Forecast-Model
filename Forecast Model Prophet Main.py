@@ -187,6 +187,121 @@ def determine_lifecycle_stage(slope):
     else:
         return "Mature"
 
+def forecast_po_order(current_inventory, forecasted_weekly_sales, target_coverage=5):
+    """
+    Given the current inventory and forecasted weekly sales (e.g. for the coming 4–16 weeks),
+    estimate the PO order quantity needed to bring inventory up to a target coverage level.
+    
+    target_coverage: desired number of weeks of inventory (e.g., 5 weeks)
+    forecasted_weekly_sales: list or array of forecasted weekly sales (you could use average sales)
+    """
+    avg_forecast_sales = np.mean(forecasted_weekly_sales)
+    target_inventory = target_coverage * avg_forecast_sales
+    if current_inventory < target_inventory:
+        return target_inventory - current_inventory
+    else:
+        return 0
+
+def generate_restock_suggestions(consolidated_data, runrate_inventory, coverage_threshold=1.0, output_file="restock_suggestions.xlsx", target_weeks=4):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Restock Suggestions"
+
+    # Define header row (note the additional column for trigger week PO qty)
+    header = [
+        "ASIN", "Product Title", "Trigger Week", "Trigger Date",
+        "Expected PO Qty (Trigger Week)", "Expected PO Qty (4 Weeks)",
+        "Suggested PO Qty (4 Weeks)", "Suggested PO Qty (8 Weeks)",
+        "Suggested PO Qty (16 Weeks)"
+    ]
+    ws.append(header)
+
+    # Process each ASIN’s forecast DataFrame.
+    for asin, df in consolidated_data.items():
+        if df.empty:
+            continue
+
+        # Get the product title (assumed to be in the "Product Title" column of the first row)
+        product_title = df["Product Title"].iloc[0] if "Product Title" in df.columns else ""
+
+        # Ensure the DataFrame has the required columns.
+        required_cols = {"Week", "Week_Start_Date", "MyForecast"}
+        if not required_cols.issubset(set(df.columns)):
+            print(f"ASIN {asin} is missing required columns. Skipping restock suggestion for this ASIN.")
+            continue
+
+        # Start with the current inventory for this ASIN.
+        current_inv = runrate_inventory.get(asin, 0)
+        simulated_inv = current_inv
+
+        trigger_week = None
+        trigger_date = None
+        trigger_index = None
+        simulated_inv_at_trigger = None
+
+        # Loop through each week (row) in the forecast DataFrame.
+        for idx, row in df.iterrows():
+            weekly_forecast = row["MyForecast"]
+            if weekly_forecast <= 0:
+                continue  # Skip weeks with zero forecast to avoid division by zero.
+            coverage = simulated_inv / weekly_forecast
+            if coverage < coverage_threshold:
+                trigger_week = row["Week"]
+                trigger_date = row["Week_Start_Date"]
+                trigger_index = idx
+                simulated_inv_at_trigger = simulated_inv  # Record the inventory remaining at trigger.
+                break
+            # Subtract the forecasted sales from inventory.
+            simulated_inv -= weekly_forecast
+
+        if trigger_week is None:
+            # No trigger was found; set output values to "N/A"
+            trigger_week = "N/A"
+            trigger_date = "N/A"
+            expected_trigger_po = "N/A"
+            expected_po_qty = "N/A"
+            sug_po_4 = "N/A"
+            sug_po_8 = "N/A"
+            sug_po_16 = "N/A"
+        else:
+            # Calculate the expected PO for the trigger week.
+            trigger_week_forecast = df["MyForecast"].iloc[trigger_index]
+            expected_trigger_po = max(trigger_week_forecast - simulated_inv_at_trigger, 0)
+
+            # For the next target_weeks (default 4 weeks) demand:
+            trigger_idx_pos = df.index.get_loc(trigger_index)
+            forecast_4wk = df["MyForecast"].iloc[trigger_idx_pos : trigger_idx_pos + target_weeks]
+            total_demand_4wk = forecast_4wk.sum()
+            # Expected PO qty for 4 weeks: additional units required to cover 4-week demand.
+            expected_po_qty = max(total_demand_4wk - simulated_inv, 0)
+
+            # Suggested PO quantities for extended planning horizons.
+            forecast_8wk = df["MyForecast"].iloc[trigger_idx_pos : trigger_idx_pos + 8]
+            forecast_16wk = df["MyForecast"].iloc[trigger_idx_pos : trigger_idx_pos + 16]
+            sug_po_4 = total_demand_4wk
+            sug_po_8 = forecast_8wk.sum() if len(forecast_8wk) > 0 else total_demand_4wk
+            sug_po_16 = forecast_16wk.sum() if len(forecast_16wk) > 0 else total_demand_4wk
+
+        # Append a new row with the computed information.
+        ws.append([
+            asin,
+            product_title,
+            trigger_week,
+            trigger_date,
+            expected_trigger_po,
+            expected_po_qty,
+            sug_po_4,
+            sug_po_8,
+            sug_po_16
+        ])
+
+    # Save the workbook.
+    try:
+        wb.save(output_file)
+        print(f"Restock suggestions saved to '{output_file}'")
+    except Exception as e:
+        print(f"Failed to save restock suggestions to '{output_file}': {e}")
+
 ##############################
 # Reward & Penalty Functions
 ##############################
@@ -1474,21 +1589,7 @@ def save_summary_to_excel(
     output_file_path,
     metrics=None
 ):
-    """
-    Saves the 'comparison' DataFrame and a summary sheet to 'output_file_path' in Excel.
-    It ensures that 'Week_Start_Date' and 'Week' columns exist before sorting or enumerating.
-
-    Parameters:
-      comparison (pd.DataFrame): The forecast data for a single ASIN (or multiple).
-      summary_stats (dict): Basic stats for historical data (min, max, mean, total, etc.).
-      total_forecast_16, total_forecast_8, total_forecast_4 (float): Summations of MyForecast for
-        the next 16, 8, and 4 weeks respectively.
-      max_forecast, min_forecast (float): The max/min forecast values found in the next horizon.
-      max_week, min_week (datetime or str): The week of the max/min forecast.
-      output_file_path (str): Where to write the Excel file.
-      metrics (dict or None): Optional additional model evaluation metrics (RMSE, MAE, etc.).
-
-    """
+  
     # 1) Ensure we have 'Week_Start_Date' or create from 'ds' if it doesn't exist
     if 'Week_Start_Date' not in comparison.columns:
         if 'ds' in comparison.columns:
@@ -1533,10 +1634,6 @@ def save_summary_to_excel(
         "Week_Start_Date",
         "ASIN",
         "MyForecast",
-        "Amazon Mean Forecast",
-        "Amazon P70 Forecast",
-        "Amazon P80 Forecast",
-        "Amazon P90 Forecast",
         "Product Title",
         "is_holiday_week",
         # Add any new columns like "Trend", "Inventory Coverage", etc. if you wish:
@@ -1646,7 +1743,13 @@ def save_4_8_16_forecast_summary(consolidated_data, output_folder):
     summary_df.to_excel(output_file_path, index=False)
     print(f"4-8-16 Weeks Forecast Summary saved to {output_file_path}")
 
-def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, base_year=2025):
+def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data):
+    """
+    Save multiple ASIN forecasts (with "MyForecast") and any missing ASIN data into one Excel file,
+    each ASIN in a separate sheet.
+    
+    This version enumerates from W0, W1, W2... for each row in ascending date order.
+    """
     # Desired final column order.
     desired_columns = [
         "Week",
@@ -1664,7 +1767,10 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
     # Columns to remove.
     unwanted_cols = [
         "ds", "yhat", "yhat_upper", "Diff_Mean", "Diff_P70", "Diff_P80", "Diff_P90",
-        "Pct_Mean", "Pct_P70", "Pct_P80", "Pct_P90", "MyForecast_XGB", "y"
+        "Pct_Mean", "Pct_P70", "Pct_P80", "Pct_P90", "MyForecast_XGB", "y", "Amazon Mean Forecast",
+        "Amazon P70 Forecast",
+        "Amazon P80 Forecast",
+        "Amazon P90 Forecast",
     ]
 
     # Columns to be cleaned.
@@ -1686,29 +1792,25 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
             if col in df_for_excel.columns:
                 df_for_excel.drop(columns=[col], inplace=True, errors='ignore')
 
-        # --- Step 2: If there is a column "ds" but no "Week_Start_Date", rename ds to Week_Start_Date ---
+        # --- Step 2: If "ds" but no "Week_Start_Date", rename "ds" to "Week_Start_Date" ---
         if "ds" in df_for_excel.columns and "Week_Start_Date" not in df_for_excel.columns:
             df_for_excel["ds"] = pd.to_datetime(df_for_excel["ds"], errors="coerce")
             df_for_excel["Week_Start_Date"] = df_for_excel["ds"].dt.strftime("%Y-%m-%d")
             df_for_excel.drop(columns=["ds"], inplace=True)
 
-        # --- Step 3: Recompute 'Week' using ISO week from "Week_Start_Date" if it exists ---
+        # --- Step 3: If "Week_Start_Date" present, label from W0 upward ---
         if "Week_Start_Date" in df_for_excel.columns:
-            # Convert to datetime
             df_for_excel["Week_Start_Date"] = pd.to_datetime(df_for_excel["Week_Start_Date"], errors="coerce")
-            # Now, compute ISO week for each row; for example, 2025-02-02 becomes ISO week 5 => label "W05"
-            def date_to_iso_week_label(d):
-                if pd.isna(d):
-                    return np.nan
-                # Use the ISO week number (which for 2025-02-02 should be 5)
-                return f"W{d.isocalendar().week:02d}"
-            df_for_excel["Week"] = df_for_excel["Week_Start_Date"].apply(date_to_iso_week_label)
-            # Convert date back to string for final output
+            # Sort by earliest date
+            df_for_excel = df_for_excel.sort_values("Week_Start_Date", na_position='last').reset_index(drop=True)
+            # Label row 0 as W0, row 1 as W1, etc.
+            df_for_excel["Week"] = [f"W{i}" for i in range(len(df_for_excel))]
+            # Convert back to string
             df_for_excel["Week_Start_Date"] = df_for_excel["Week_Start_Date"].dt.strftime("%Y-%m-%d")
         else:
-            # If no "Week_Start_Date", fallback: enumerate rows as W1, W2, etc.
+            # Fallback if no "Week_Start_Date" => enumerating from W0
             df_for_excel = df_for_excel.reset_index(drop=True)
-            df_for_excel["Week"] = [f"W{i+1}" for i in range(len(df_for_excel))]
+            df_for_excel["Week"] = [f"W{i}" for i in range(len(df_for_excel))]
             df_for_excel["Week_Start_Date"] = ""
 
         # --- Step 4: Clean forecast columns ---
@@ -1737,17 +1839,17 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
         for row in dataframe_to_rows(df_for_excel, index=False, header=True):
             ws.append(row)
 
-    # --- Step 9: Add missing ASIN data as a separate sheet if available ---
+    # --- Step 9: Missing ASINs as a separate sheet ---
     if not missing_asin_data.empty:
         ws_missing = wb.create_sheet(title="No ASIN")
         for row in dataframe_to_rows(missing_asin_data, index=False, header=True):
             ws_missing.append(row)
 
-    # --- Step 10: Remove the default sheet if more than one exists ---
+    # --- Step 10: Remove default sheet if >1 sheets exist ---
     if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
         del wb["Sheet"]
 
-    # --- Step 11: Create a Summary Sheet for 4,8,16 Week Forecasts ---
+    # --- Step 11: Create a 4/8/16-Week Summary sheet ---
     ws_summary = wb.create_sheet(title="Summary")
     ws_summary.append(["ASIN", "Product Title", "4 Week Forecast", "8 Week Forecast", "16 Week Forecast"])
 
@@ -1755,17 +1857,14 @@ def save_forecast_to_excel(output_path, consolidated_data, missing_asin_data, ba
         if df.empty:
             ws_summary.append([asin, "No data", None, None, None])
             continue
-
         product_title = df["Product Title"].iloc[0] if "Product Title" in df.columns else ""
         if "MyForecast" in df.columns:
             df["MyForecast"] = df["MyForecast"].replace([np.inf, -np.inf], 0).fillna(0)
-            df["MyForecast"] = df["MyForecast"].astype(float)
             four_wk_val = df["MyForecast"].iloc[:4].sum() if len(df) >= 4 else df["MyForecast"].sum()
             eight_wk_val = df["MyForecast"].iloc[:8].sum() if len(df) >= 8 else df["MyForecast"].sum()
             sixteen_wk_val = df["MyForecast"].iloc[:16].sum() if len(df) >= 16 else df["MyForecast"].sum()
         else:
             four_wk_val = eight_wk_val = sixteen_wk_val = 0
-
         ws_summary.append([
             asin,
             product_title,
@@ -2217,108 +2316,77 @@ def adjust_forecast_if_out_of_range(
     comparison,
     asin,
     forecast_col_name='MyForecast',
-    adjustment_threshold=0.3
+    adjustment_threshold=0.3,
+    bypass_seasonality=True  # New flag to enable seasonal bypass
 ):
     """
     Adjust 'MyForecast' if it is too far from Amazon Mean Forecast.
-    Uses a higher threshold (0.6) ONLY if the last 5 sales data points
-    average is lower than the overall average.
+    
+    If bypass_seasonality is True and a row is marked (via the 'seasonal_cluster'
+    column) as belonging to a known hot or cold selling season (e.g., 'high' or 'low'),
+    then bypass (skip) the adjustment for that row.
     """
     global out_of_range_counter
     global out_of_range_stats
 
-    # 1) Debugging: Print a small sample of columns
-    print("\nAmazon Forecast Statistics for Debugging:")
-    required_amazon_cols = ['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']
-    existing_cols = [col for col in required_amazon_cols if col in comparison.columns]
-    print(comparison[existing_cols].head())
+    # --- Step 1: Flag rows that should bypass the adjustment ---
+    if bypass_seasonality and 'seasonal_cluster' in comparison.columns:
+        # Mark rows where the seasonal_cluster indicates a seasonal effect
+        comparison['bypass_adjustment'] = comparison['seasonal_cluster'].apply(
+            lambda x: x in ['high', 'low']  # Adjust these labels as needed
+        )
+    else:
+        comparison['bypass_adjustment'] = False
 
-    # 2) Compute average sales of the last 5 data points
-    #    Make sure we have 'y' in the DataFrame
+    # --- Step 2: Compute the local threshold based on recent vs overall averages ---
     if 'y' in comparison.columns:
         recent_5 = comparison.dropna(subset=['y']).sort_values('ds').tail(5)
         last_5_avg = recent_5['y'].mean() if len(recent_5) > 0 else 0
         overall_avg = comparison['y'].mean()
     else:
-        # Fallback if there's no 'y' column at all
         last_5_avg = 0
         overall_avg = 0
 
-    # 3) Decide local threshold
     if last_5_avg < overall_avg:
-        # Use a higher threshold if recent sales are below overall average
-        local_threshold = 0.6
-        print(f"Recent 5-wk avg {last_5_avg:.2f} is below overall avg {overall_avg:.2f}. "
-              f"Using threshold={int(local_threshold*100)}%.")
+        local_threshold = 0.6  # Use a higher (looser) threshold if recent sales are low
+        print(f"Recent 5-wk avg is below overall avg, using threshold=60%")
     else:
         local_threshold = adjustment_threshold
 
-    # 4) Identify rows "out of range" based on local_threshold
-    #    (±30% or ±60%, depending on local_threshold)
-    comparison['is_out_of_range'] = (
-        (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
-        (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
+    # --- Step 3: Identify rows that are "out of range" but are not in seasonal bypass ---
+    condition_adjust = (
+        ((comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
+         (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold)))
+        & (~comparison['bypass_adjustment'])  # Only adjust if not bypassed due to seasonality
     )
+    comparison['is_out_of_range'] = condition_adjust
 
-    adjustment_mask = comparison['is_out_of_range']
-    total_forecasts = len(comparison)
-
-    # 5) If any rows are out of range, adjust the forecast
-    if adjustment_mask.any():
-        num_adjustments = adjustment_mask.sum()
-        print(f"\nAdjusting {num_adjustments} out-of-range forecasts for ASIN {asin} using Amazon Mean Forecast.")
+    # --- Step 4: Apply adjustment only to rows that are not bypassed ---
+    if comparison['is_out_of_range'].any():
+        num_adjustments = comparison['is_out_of_range'].sum()
+        print(f"Adjusting {num_adjustments} out-of-range forecasts for ASIN {asin}.")
         out_of_range_counter[asin] += num_adjustments
-
         if asin not in out_of_range_stats:
             out_of_range_stats[asin] = {'total': 0, 'adjusted': 0}
-        out_of_range_stats[asin]['total'] += total_forecasts
+        out_of_range_stats[asin]['total'] += len(comparison)
         out_of_range_stats[asin]['adjusted'] += num_adjustments
 
-        # Adjust MyForecast to be within ±local_threshold of Amazon Mean
-        comparison.loc[adjustment_mask, forecast_col_name] = (
-            comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] *
-            comparison.loc[adjustment_mask, forecast_col_name] /
-            comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
+        idx = comparison['is_out_of_range']
+        # This adjustment clips the forecast to within (1 ± local_threshold) of Amazon Mean Forecast
+        comparison.loc[idx, forecast_col_name] = (
+            comparison.loc[idx, 'Amazon Mean Forecast'] *
+            comparison.loc[idx, forecast_col_name] /
+            comparison.loc[idx, 'Amazon Mean Forecast']
         ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) * \
-          comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
+          comparison.loc[idx, 'Amazon Mean Forecast']
 
-        # Ensure non-negative after adjustment
+        # Ensure non-negative values
         comparison[forecast_col_name] = comparison[forecast_col_name].clip(lower=0)
 
-        # Debug: see if anything is still out of range
-        comparison['is_still_out_of_range'] = (
-            (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
-            (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
-        )
-        if comparison['is_still_out_of_range'].any():
-            print("\nRows still out of range after primary adjustment:")
-            print(
-                comparison.loc[comparison['is_still_out_of_range'],
-                               ['ds', forecast_col_name, 'Amazon Mean Forecast',
-                                'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']]
-            )
-
-    # Debug: show adjusted rows
-    if adjustment_mask.any():
-        print("\nAdjusted forecasts for out-of-range rows:")
-        print(
-            comparison.loc[adjustment_mask,
-                           ['ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast']]
-        )
-
-    # Final check or summary
-    if existing_cols:
-        print("\nFinal adjusted forecast data (head):")
-        print(comparison[['ds', forecast_col_name] + existing_cols].head())
-    else:
-        print("Warning: No Amazon forecast columns were found. No adjustments applied.")
-
-    # Clean up temporary columns, if desired
-    if 'is_still_out_of_range' in comparison.columns:
-        comparison.drop(columns=['is_still_out_of_range'], inplace=True)
-    comparison.drop(columns=['is_out_of_range'], inplace=True)
-
+    # --- Step 5: Clean up temporary column ---
+    comparison.drop(columns=['bypass_adjustment'], inplace=True)
     return comparison
+
 
 def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallback_triggers.csv"):
     """
@@ -2650,7 +2718,7 @@ def compare_historical_sales_po(asin, sales_df, po_df, output_folder="po_forecas
 def forecast_sales_with_po_regressor(sales_file='weekly_sales_data.xlsx',
                                      po_file='po database.xlsx',
                                      horizon_weeks=16,
-                                     amazon_start_date='2025-02-02',
+                                     amazon_start_date='2025-02-09', #Change dates here
                                      cv_initial='730 days',
                                      cv_period='180 days',
                                      cv_horizon='365 days'):
@@ -2831,59 +2899,192 @@ def generate_low_coverage_report(consolidated_data, coverage_threshold=1.0, outp
     flagged_df.to_excel(output_file, index=False)
     print(f"Low Coverage/High Urgency rows saved to {output_file}. Rows: {len(flagged_df)}")
 
-def generate_restock_suggestions(consolidated_data, coverage_threshold=1.0, output_file="restock_suggestions.xlsx"):
-    suggestions = []
-    
-    for asin, df_forecast in consolidated_data.items():
-        if df_forecast.empty:
-            continue
-        
-        if 'Inventory Coverage' not in df_forecast.columns:
-            continue
-        
-        required_cols = ['Week', 'MyForecast', 'Product Title', 'Inventory Coverage']
-        missing = [col for col in required_cols if col not in df_forecast.columns]
-        if missing:
-            print(f"Skipping ASIN {asin}, missing columns: {missing}")
-            continue
-        
 
-        condition = df_forecast['Inventory Coverage'] < coverage_threshold
-        low_cov = df_forecast[condition]
-        
-        if low_cov.empty:
-            continue
-        
-        first_row = low_cov.iloc[0]
-        restock_week = first_row['Week']  
-        product_title = first_row.get('Product Title', '')
-        
-        row_index = low_cov.index[0]
-        
-        future_forecast = df_forecast.loc[row_index:, 'MyForecast'].values
-        
-        restock_4 = future_forecast[:4].sum() if len(future_forecast) >= 4 else future_forecast.sum()
-        restock_8 = future_forecast[:8].sum() if len(future_forecast) >= 8 else future_forecast.sum()
-        restock_16 = future_forecast[:16].sum() if len(future_forecast) >= 16 else future_forecast.sum()
-        
-        suggestions.append({
-            'ASIN': asin,
-            'Product Title': product_title,
-            'Restock Week': restock_week,
-            'Restock_4wk': int(restock_4),
-            'Restock_8wk': int(restock_8),
-            'Restock_16wk': int(restock_16)
-        })
+##############################
+# PO Order Data Analysis
+##############################
+def generate_po_coverage_report(
+    merged_df,
+    output_folder="po_coverage_analysis",
+    output_file="po_coverage_summary.xlsx"
+):
+
+    # 1) Ensure the output folder exists
+    os.makedirs(output_folder, exist_ok=True)
+    output_path = os.path.join(output_folder, output_file)
+
+    df = merged_df.copy()
+    mapping = {
+        'high': 'High Volume Season',
+        'low': 'Low Volume Season',
+        'medium': 'Regular Season',
+        # If your code calls it "stable" or anything else, map it to "Regular Season"
+        'stable': 'Regular Season'
+    }
     
-    if not suggestions:
-        print("No ASINs found requiring restock suggestions.")
-        return
+    # If you named the column differently, adjust as needed:
+    if 'seasonal_cluster' not in df.columns:
+        df['seasonal_cluster'] = 'regular'
+        mapping = {'regular': 'Regular Season'}
+
+    df['SeasonLabel'] = df['seasonal_cluster'].map(mapping).fillna('Regular Season')
+
+    group_cols = ['ASIN', 'SeasonLabel']
+    agg_df = (df
+              .groupby(group_cols, as_index=False)
+              .agg({
+                  'Weekly_PO_Qty': 'mean',
+                  'coverage': 'mean',
+                  'ds': [ 'min', 'max' ]
+              }))
+
+    # Flatten multi-level columns
+    agg_df.columns = [
+        'ASIN', 'SeasonLabel',
+        'avg_po', 'avg_cov',
+        'start_date', 'end_date'
+    ]
+
+    asin_titles = df[['ASIN', 'Model Name']].drop_duplicates()
+    agg_df = pd.merge(agg_df, asin_titles, on='ASIN', how='left')
+
+    pivoted = agg_df.pivot(
+        index=['ASIN','Model Name'],
+        columns='SeasonLabel',
+        values=['avg_po','avg_cov','start_date','end_date']
+    )
+
+    # pivoted will have a multi-level column structure.
+    # We'll flatten them and rename to a simpler pattern.
+    pivoted.columns = [
+        f"{col[0]} ({col[1]})" for col in pivoted.columns
+    ]
+    # Example columns might look like "avg_po (High Volume Season)", "avg_cov (Regular Season)", etc.
+
+    pivoted.reset_index(inplace=True)
+
+    rename_map = {
+        'avg_po (Regular Season)': 'Average PO order (regular season)',
+        'avg_cov (Regular Season)': 'average Inventory coverage (regular season)',
+        'start_date (Regular Season)': 'start_date_regular',
+        'end_date (Regular Season)': 'end_date_regular',
+
+        'avg_po (High Volume Season)': 'Average PO order (High Volume season)',
+        'avg_cov (High Volume Season)': 'average Inventory coverage (High volume season)',
+        'start_date (High Volume Season)': 'start_date_high',
+        'end_date (High Volume Season)': 'end_date_high',
+
+        'avg_po (Low Volume Season)': 'Average PO order (low volume season)',
+        'avg_cov (Low Volume Season)': 'average Inventory coverage (low volume season)',
+        'start_date (Low Volume Season)': 'start_date_low',
+        'end_date (Low Volume Season)': 'end_date_low',
+    }
+
+    # Some columns may be missing if an ASIN never had a "high" or "low" cluster, so we do a safe rename:
+    pivoted.rename(columns=rename_map, inplace=True)
+
+    # 7) Create final columns for date range (regular, high, low).
+    #    We'll combine the start_date_X and end_date_X into one string:
+    def make_date_range(row, start_col, end_col):
+        s = row.get(start_col, pd.NaT)
+        e = row.get(end_col, pd.NaT)
+        if pd.isna(s) or pd.isna(e):
+            return ""
+        return f"{pd.to_datetime(s).date()} to {pd.to_datetime(e).date()}"
+
+    for label in ['regular','high','low']:
+        start_col = f"start_date_{label}"
+        end_col   = f"end_date_{label}"
+        range_col = f"Date range  ({label} season)"
+        pivoted[range_col] = pivoted.apply(
+            lambda row: make_date_range(row, start_col, end_col),
+            axis=1
+        )
+
+    # 8) Drop the start_date_X/end_date_X helper columns if you don’t want them in final output
+    drop_cols = [
+        'start_date_regular','end_date_regular',
+        'start_date_high','end_date_high',
+        'start_date_low','end_date_low'
+    ]
+    for c in drop_cols:
+        if c in pivoted.columns:
+            pivoted.drop(columns=[c], inplace=True)
+
+    # 9) Final column order
+    final_columns = [
+        'ASIN',
+        'Model Name',
+
+        'Average PO order (regular season)',
+        'average Inventory coverage (regular season)',
+        'Date range  (regular season)',
+
+        'Average PO order (High Volume season)',
+        'average Inventory coverage (High volume season)',
+        'Date range  (high volume season)',
+
+        'Average PO order (low volume season)',
+        'average Inventory coverage (low volume season)',
+        'Date range  (low volume season)',
+    ]
+    for c in final_columns:
+        if c not in pivoted.columns:
+            pivoted[c] = ""
+
+    pivoted = pivoted[final_columns]
+
+    # 10) Optionally round numeric columns
+    numeric_cols = [
+        'Average PO order (regular season)',
+        'average Inventory coverage (regular season)',
+        'Average PO order (High Volume season)',
+        'average Inventory coverage (High volume season)',
+        'Average PO order (low volume season)',
+        'average Inventory coverage (low volume season)'
+    ]
+    for col in numeric_cols:
+        if col in pivoted.columns:
+            pivoted[col] = pivoted[col].astype(float).round(2)
+
+    # 11) Save to Excel
+    pivoted.to_excel(output_path, index=False)
+    print(f"PO coverage analysis saved to: {output_path}")
+
+def merge_historical_data(sales_file, inventory_file, po_file):
+    # Load weekly sales data (assumed to have columns: 'asin', 'product title', 'ds', 'y')
+    sales_df = load_weekly_sales_data(sales_file)
+    sales_df = sales_df.rename(columns={'asin': 'ASIN', 'y': 'Weekly_Sales', 'product title': 'Model Name'})
     
-    suggestions_df = pd.DataFrame(suggestions)
-    suggestions_df = suggestions_df.sort_values(['ASIN', 'Restock Week']).reset_index(drop=True)
+    # Load inventory data (assumed to have columns: 'ASIN', 'Starting_Inventory', 'ds')
+    # You may need to implement load_inventory_data if you don't have one.
+    inventory_df = pd.read_excel(inventory_file)
+    inventory_df.columns = inventory_df.columns.str.strip()
+    # Make sure you have at least 'ASIN', 'Starting_Inventory', and a date column ('ds')
+    inventory_df['ds'] = pd.to_datetime(inventory_df['ds'], errors='coerce')
     
-    suggestions_df.to_excel(output_file, index=False)
-    print(f"Restock suggestions saved to {output_file}")
+    # Load PO order data (assumed to have columns: 'ASIN', 'Order date', 'Requested quantity')
+    po_df = pd.read_excel(po_file)
+    po_df.columns = po_df.columns.str.strip()
+    po_df['Order date'] = pd.to_datetime(po_df['Order date'], errors='coerce')
+    
+    # Aggregate PO orders by week (assuming week ending on Sunday)
+    po_df['ds'] = po_df['Order date'].dt.to_period('W-SUN').apply(lambda r: r.end_time)
+    po_weekly = (po_df.groupby(['ASIN', 'ds'], as_index=False)
+                      .agg({'Requested quantity': 'sum'})
+                      .rename(columns={'Requested quantity': 'Weekly_PO_Qty'}))
+    
+    # Merge the data on ASIN and ds (date)
+    merged = pd.merge(sales_df, inventory_df[['ASIN', 'ds', 'Starting_Inventory']], on=['ASIN', 'ds'], how='left')
+    merged = pd.merge(merged, po_weekly, on=['ASIN', 'ds'], how='left')
+    
+    # Fill missing PO orders with 0
+    merged['Weekly_PO_Qty'] = merged['Weekly_PO_Qty'].fillna(0)
+    
+    # Compute coverage as Starting_Inventory divided by Weekly_Sales (avoid division by zero)
+    merged['coverage'] = merged['Starting_Inventory'] / (merged['Weekly_Sales'] + 1e-9)
+    
+    return merged
 
 ##############################
 # Main
@@ -2896,8 +3097,7 @@ def main():
     load_param_histories()
 
     runrate_file = "Runrate.xlsx"  
-    runrate_inventory = load_runrate_inventory(runrate_file)  # {asin: total_inventory, ...}
-
+    runrate_inventory = load_runrate_inventory(runrate_file) 
     sales_file = 'weekly_sales_data.xlsx'
     forecasts_folder = 'forecasts_folder'
     asins_to_forecast_file = 'ASINs to Forecast.xlsx'
@@ -2956,6 +3156,8 @@ def main():
     # 2) Load and prepare global PO data (for merging per ASIN)
     # ----------------------------------------------------------------------------
     po_file = "po database.xlsx"
+    inventory_file = "inventory_data.xlsx"  # Pending file
+    po_file = "po database.xlsx"
     po_df = pd.read_excel(po_file)
     po_df.columns = po_df.columns.str.strip()
     po_df['Order date'] = pd.to_datetime(po_df['Order date'], errors='coerce')
@@ -2968,6 +3170,12 @@ def main():
         .replace('', '0')
     )
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
+
+    # Merge data for analysis if needed
+    # This merged_df is not directly used in the pipeline below unless you incorporate it,
+    # but we preserve it for demonstration. If you only need it for a coverage analysis report,
+    # you can pass it to any specialized function that summarizes coverage vs. PO, etc.
+    merged_df = merge_historical_data(sales_file, inventory_file, po_file)
 
     # ----------------------------------------------------------------------------
     # 3) For each ASIN, generate forecast WITH PO integration
@@ -3636,13 +3844,15 @@ def main():
     # 6) After processing ALL ASINs, save consolidated data
     # ----------------------------------------------------------------------------
     final_output_path_with_po = "consolidated_forecast_WITH_PO.xlsx"
-    save_forecast_to_excel(final_output_path_with_po, consolidated_forecasts_with_po, missing_asin_data, base_year=2025)
+    save_forecast_to_excel(final_output_path_with_po, consolidated_forecasts_with_po, missing_asin_data)
     print(f"[WITH PO] All per-ASIN forecasts saved to {final_output_path_with_po}")
 
     generate_restock_suggestions(
         consolidated_forecasts_with_po,
+        runrate_inventory,
         coverage_threshold=1.0,
-        output_file="restock_suggestions.xlsx"
+        output_file="restock_suggestions.xlsx",
+        target_weeks=4
     )
     print("\n Restock Suggestion completed. \n")
 
