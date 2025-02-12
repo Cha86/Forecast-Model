@@ -832,6 +832,36 @@ def generate_date_from_week(row):
     week_number = int(week_str[1:])
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
+def generate_date_from_inventory_week(row):
+    week_str = str(row['Week']) 
+    year = str(row['Year'])    
+
+    if week_str.upper().startswith('W'):
+        week_number = int(week_str[1:])
+    else:
+        week_number = int(week_str) 
+
+    date_str = f"{year}-W{week_number - 1}-0"
+    try:
+        dt = pd.to_datetime(date_str, format='%Y-W%U-%w')
+    except ValueError:
+        dt = pd.NaT
+
+    return dt
+
+def load_inventory_data(inventory_file):
+    inv_df = pd.read_excel(inventory_file)
+    inv_df.columns = inv_df.columns.str.strip()
+    
+    inv_df['ds'] = inv_df.apply(generate_date_from_inventory_week, axis=1)
+    
+    inv_df.rename(columns={'Total': 'Starting_Inventory'}, inplace=True)
+
+    inv_df.dropna(subset=['ds'], inplace=True)
+    
+    return inv_df
+
+
 def clean_weekly_sales_data(data):
     """Placeholder for additional cleaning steps if needed."""
     return data
@@ -3052,38 +3082,69 @@ def generate_po_coverage_report(
     print(f"PO coverage analysis saved to: {output_path}")
 
 def merge_historical_data(sales_file, inventory_file, po_file):
-    # Load weekly sales data (assumed to have columns: 'asin', 'product title', 'ds', 'y')
+    """
+      - weekly_sales_data (via load_weekly_sales_data),
+      - inventory_data (via load_inventory_data), 
+      - po_file (with columns 'ASIN', 'Order date', 'Requested quantity'),
+    and merges them so we get a final DataFrame with:
+      'ASIN', 'ds', 'Weekly_Sales', 'Starting_Inventory', 'Weekly_PO_Qty', 'coverage', etc.
+    """
+
+    # 1) Load weekly sales data
+    #    This uses your original generate_date_from_week if needed,
+    #    or it might be part of load_weekly_sales_data.
     sales_df = load_weekly_sales_data(sales_file)
-    sales_df = sales_df.rename(columns={'asin': 'ASIN', 'y': 'Weekly_Sales', 'product title': 'Model Name'})
-    
-    # Load inventory data (assumed to have columns: 'ASIN', 'Starting_Inventory', 'ds')
-    # You may need to implement load_inventory_data if you don't have one.
-    inventory_df = pd.read_excel(inventory_file)
-    inventory_df.columns = inventory_df.columns.str.strip()
-    # Make sure you have at least 'ASIN', 'Starting_Inventory', and a date column ('ds')
-    inventory_df['ds'] = pd.to_datetime(inventory_df['ds'], errors='coerce')
-    
-    # Load PO order data (assumed to have columns: 'ASIN', 'Order date', 'Requested quantity')
+    # unify column names
+    sales_df = sales_df.rename(columns={
+        'asin': 'ASIN',
+        'y': 'Weekly_Sales',
+        'product title': 'Model Name'
+    })
+
+    # 2) Load inventory data using our new function
+    inv_df = load_inventory_data(inventory_file)
+    # Now inv_df has columns [ASIN, Model, OTW, INV, Starting_Inventory, POS, Week, Year, ds]
+
+    # 3) Load and process PO data
     po_df = pd.read_excel(po_file)
     po_df.columns = po_df.columns.str.strip()
     po_df['Order date'] = pd.to_datetime(po_df['Order date'], errors='coerce')
-    
-    # Aggregate PO orders by week (assuming week ending on Sunday)
+    po_df = po_df.dropna(subset=['ASIN', 'Order date', 'Requested quantity'])
+    po_df['Requested quantity'] = (
+        po_df['Requested quantity']
+        .astype(str)
+        .str.replace(',', '')
+        .str.strip()
+        .replace('', '0')
+    )
+    po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
+
+    # 4) Aggregate PO data weekly (Sunday-end)
     po_df['ds'] = po_df['Order date'].dt.to_period('W-SUN').apply(lambda r: r.end_time)
     po_weekly = (po_df.groupby(['ASIN', 'ds'], as_index=False)
                       .agg({'Requested quantity': 'sum'})
                       .rename(columns={'Requested quantity': 'Weekly_PO_Qty'}))
-    
-    # Merge the data on ASIN and ds (date)
-    merged = pd.merge(sales_df, inventory_df[['ASIN', 'ds', 'Starting_Inventory']], on=['ASIN', 'ds'], how='left')
-    merged = pd.merge(merged, po_weekly, on=['ASIN', 'ds'], how='left')
-    
-    # Fill missing PO orders with 0
+
+    # 5) Merge sales + inventory on (ASIN, ds)
+    merged = pd.merge(
+        sales_df,
+        inv_df[['ASIN','ds','Starting_Inventory']],
+        on=['ASIN','ds'],
+        how='left'
+    )
+
+    # 6) Merge with weekly PO data
+    merged = pd.merge(merged, po_weekly, on=['ASIN','ds'], how='left')
     merged['Weekly_PO_Qty'] = merged['Weekly_PO_Qty'].fillna(0)
-    
-    # Compute coverage as Starting_Inventory divided by Weekly_Sales (avoid division by zero)
-    merged['coverage'] = merged['Starting_Inventory'] / (merged['Weekly_Sales'] + 1e-9)
-    
+
+    # 7) Optionally compute coverage:
+    merged['coverage'] = merged.apply(
+        lambda row: row['Starting_Inventory'] / (row['Weekly_Sales'] + 1e-9)
+                    if pd.notna(row['Starting_Inventory']) and pd.notna(row['Weekly_Sales'])
+                    else 0,
+        axis=1
+    )
+
     return merged
 
 ##############################
