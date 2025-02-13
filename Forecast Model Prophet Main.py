@@ -21,7 +21,7 @@ from math import sqrt
 from pykalman import KalmanFilter
 from statsmodels.tsa.stattools import adfuller
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from scipy.optimize import minimize
 from statsmodels.tsa.seasonal import STL
 from sklearn.cluster import KMeans
@@ -978,6 +978,35 @@ def get_shifted_holidays():
     holidays = pd.DataFrame(holidays_list, columns=['holiday', 'ds'])
     holidays['ds'] = pd.to_datetime(holidays['ds'])
     return holidays
+
+def add_holiday_lead_time_features(merged_df, holidays):
+    """
+    For each row in merged_df (each ds date),
+    compute how many days until the next holiday.
+    Also mark if we are within 2 weeks prior to a major holiday.
+    """
+    merged = merged_df.copy()
+    holidays_sorted = holidays.sort_values('ds').reset_index(drop=True)
+
+    # For performance, you can do a merge_asof or a nearest join,
+    # but here's a simple approach for demonstration:
+    merged['days_to_next_holiday'] = None
+    for i, row in merged.iterrows():
+        current_date = row['ds']
+        # find the next holiday date >= current_date
+        upcoming = holidays_sorted[holidays_sorted['ds'] >= current_date]
+        if upcoming.empty:
+            merged.at[i, 'days_to_next_holiday'] = 9999  # no future holiday
+        else:
+            next_hol_date = upcoming['ds'].iloc[0]
+            days_diff = (next_hol_date - current_date).days
+            merged.at[i, 'days_to_next_holiday'] = days_diff
+
+    # Optionally create a boolean feature: "is_within_14_days_of_holiday"
+    merged['is_within_14_days_of_holiday'] = merged['days_to_next_holiday'] <= 14
+
+    return merged
+
 
 ##############################
 # Ensemble Approach (SARIMA, Prophet, XGBoost)
@@ -3147,6 +3176,194 @@ def merge_historical_data(sales_file, inventory_file, po_file):
 
     return merged
 
+def train_amazon_po_model(merged_df):
+    """
+    Train a 2-stage model:
+      1) logistic to predict if an order is placed (Weekly_PO_Qty > 0),
+      2) linear regression to predict order size (for weeks with >0 order).
+    
+    Required columns in merged_df:
+      - coverage (float)
+      - Weekly_PO_Qty (float)
+      - days_to_next_holiday (int or float)
+      - is_within_14_days_of_holiday (bool or int)
+      - optionally more features
+    
+    Returns a tuple (logistic_model, regression_model).
+    """
+    df = merged_df.copy()
+
+    # 1) Classification label: Order_Placed
+    df['Order_Placed'] = (df['Weekly_PO_Qty'] > 0).astype(int)
+
+    # coverage, days_to_next_holiday, is_within_14_days_of_holiday
+    X_class = df[['coverage', 'days_to_next_holiday', 'is_within_14_days_of_holiday']].copy()
+    # convert bool to int
+    X_class['is_within_14_days_of_holiday'] = X_class['is_within_14_days_of_holiday'].astype(int)
+    y_class = df['Order_Placed']
+
+    # Fit logistic model
+    log_reg = LogisticRegression()
+    log_reg.fit(X_class, y_class)
+
+    # 2) For the linear regression, only use rows where an order was placed
+    df_orders = df[df['Order_Placed'] == 1].copy()
+    if df_orders.empty:
+        print("Warning: No positive PO data found, regression model will be trivial.")
+        return log_reg, None
+
+    X_reg = df_orders[['coverage', 'days_to_next_holiday', 'is_within_14_days_of_holiday']].copy()
+    X_reg['is_within_14_days_of_holiday'] = X_reg['is_within_14_days_of_holiday'].astype(int)
+    y_reg = df_orders['Weekly_PO_Qty']
+
+    lin_reg = LinearRegression()
+    lin_reg.fit(X_reg, y_reg)
+
+    return log_reg, lin_reg
+
+def forecast_amazon_po_orders(future_df, logistic_model, regression_model, initial_inventory):
+    """
+    Simulate Amazon's PO ordering for the future horizon.
+    
+    future_df columns needed:
+      - 'ds'
+      - 'MyForecast' or 'forecasted_sales'
+      - 'days_to_next_holiday'
+      - 'is_within_14_days_of_holiday'
+    logistic_model, regression_model: from train_amazon_po_model
+    initial_inventory: your starting on-hand (or predicted) inventory
+    
+    Returns: a DataFrame with columns ['ds', 'Predicted_PO_Qty', 'Inventory_After_PO']
+    """
+    pred_rows = []
+    current_inventory = initial_inventory
+
+    for i in range(len(future_df)):
+        row = future_df.iloc[i]
+        ds_date = row['ds']
+        sales_fc = row.get('MyForecast', row.get('forecasted_sales', 0))
+        
+        # coverage
+        coverage = current_inventory / (sales_fc + 1e-9)
+        
+        # logistic features:
+        feat = [
+            coverage,
+            row.get('days_to_next_holiday', 9999),
+            int(row.get('is_within_14_days_of_holiday', False))
+        ]
+        order_prob = logistic_model.predict_proba([feat])[0,1]
+        place_order = (order_prob >= 0.5)  # threshold
+        
+        if place_order and regression_model is not None:
+            po_qty = regression_model.predict([feat])[0]
+            po_qty = max(po_qty, 0)
+        else:
+            po_qty = 0
+
+        # Update inventory
+        current_inventory = current_inventory - sales_fc + po_qty
+        if current_inventory < 0:
+            current_inventory = 0
+        
+        pred_rows.append({
+            'ds': ds_date,
+            'Predicted_PO_Qty': round(po_qty),
+            'Coverage_Sim': coverage,
+            'Inventory_After_PO': current_inventory,
+            'Order_Probability': order_prob
+        })
+
+    return pd.DataFrame(pred_rows)
+
+def apply_inventory_constraints(forecast_df, runrate_inventory):
+    """
+    Compare your unconstrained forecast to an 'adjusted' forecast that accounts
+    for possible inventory shortfalls or reorder surges.
+    """
+    df = forecast_df.copy()
+    starting_inv = runrate_inventory  # from your runrate or initial inventory
+    influences = []
+    adj_forecasts = []
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        predicted_sales = row['MyForecast']  
+
+        coverage = starting_inv / (predicted_sales + 1e-9)
+        
+        # naive rule: if coverage < 0.8, reduce the forecast by 10%
+        # if coverage > 2.0, increase forecast by 5%, etc. purely example
+        if coverage < 0.8:
+            adj_sales = predicted_sales * 0.90
+        elif coverage > 2.0:
+            adj_sales = predicted_sales * 1.05
+        else:
+            adj_sales = predicted_sales
+        
+        # inventory_influence = (adj_sales - predicted_sales)
+        influences.append(round(adj_sales - predicted_sales))
+        adj_forecasts.append(round(adj_sales))
+
+        # reduce inventory by the actual adjusted sales
+        starting_inv = starting_inv - adj_sales
+        if starting_inv < 0:
+            starting_inv = 0
+
+    df['AdjustedForecast'] = adj_forecasts
+    df['inventory_influence'] = influences  
+    return df
+
+def generate_future_forecast(training_data, periods=16):
+    model = Prophet(yearly_seasonality=True, weekly_seasonality=True)
+    model.fit(training_data[['ds', 'y']])
+    future = model.make_future_dataframe(periods=periods, freq='W-SUN')
+    forecast = model.predict(future)
+    forecast.rename(columns={'yhat': 'MyForecast'}, inplace=True)
+    return forecast
+
+def main_po_forecast_pipeline():
+    # 1) Merge historical data (sales, inventory, PO)
+    merged_df = merge_historical_data("weekly_sales_data.xlsx", "inventory_data.xlsx", "po_database.xlsx")
+    
+    # 2) Load holidays
+    holidays = get_shifted_holidays()
+    
+    # 3) Add lead time features to merged historical data
+    merged_df = add_holiday_lead_time_features(merged_df, holidays)
+    
+    # 4) Train logistic+regression model on historical data
+    logistic_model, regression_model = train_amazon_po_model(merged_df)
+    
+    # 5) Generate forecast_df using a forecasting model
+    training_data = merged_df[['ds', 'Weekly_Sales']].dropna()
+    forecast_df = generate_future_forecast(training_data, periods=16)
+    
+    # 6) Add holiday lead time features to the forecast DataFrame
+    future_forecast_df = add_holiday_lead_time_features(forecast_df, holidays)
+    
+    # 7) Forecast Amazon PO Orders using the trained models
+    initial_inventory = 1000  # example starting inventory
+    po_prediction = forecast_amazon_po_orders(
+        future_forecast_df,
+        logistic_model,
+        regression_model,
+        initial_inventory
+    )
+    
+    # 8) Combine the predicted PO data with the future forecast
+    final_result = future_forecast_df.merge(
+        po_prediction[['ds','Predicted_PO_Qty','Coverage_Sim','Inventory_After_PO','Order_Probability']],
+        on='ds', how='left'
+    )
+    
+    # 9) Optionally apply inventory influence adjustments
+    final_result = apply_inventory_constraints(final_result, initial_inventory)
+    
+    # 10) Save the final result
+    final_result.to_excel("predicted_po_and_inventory_influence.xlsx", index=False)
+    print("PO Forecast pipeline complete. See predicted_po_and_inventory_influence.xlsx for details.")
+
 ##############################
 # Main
 ##############################
@@ -3938,3 +4155,4 @@ def main():
 if __name__ == '__main__':
     main()
     summarize_usage()
+    main_po_forecast_pipeline()
