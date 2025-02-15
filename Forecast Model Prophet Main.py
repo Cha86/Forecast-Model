@@ -188,13 +188,6 @@ def determine_lifecycle_stage(slope):
         return "Mature"
 
 def forecast_po_order(current_inventory, forecasted_weekly_sales, target_coverage=5):
-    """
-    Given the current inventory and forecasted weekly sales (e.g. for the coming 4–16 weeks),
-    estimate the PO order quantity needed to bring inventory up to a target coverage level.
-    
-    target_coverage: desired number of weeks of inventory (e.g., 5 weeks)
-    forecasted_weekly_sales: list or array of forecasted weekly sales (you could use average sales)
-    """
     avg_forecast_sales = np.mean(forecasted_weekly_sales)
     target_inventory = target_coverage * avg_forecast_sales
     if current_inventory < target_inventory:
@@ -266,14 +259,14 @@ def generate_restock_suggestions(consolidated_data, runrate_inventory, coverage_
         else:
             # Calculate the expected PO for the trigger week.
             trigger_week_forecast = df["MyForecast"].iloc[trigger_index]
-            expected_trigger_po = max(trigger_week_forecast - simulated_inv_at_trigger, 0)
+            expected_trigger_po = int(round(max(trigger_week_forecast - simulated_inv_at_trigger, 0)))
 
             # For the next target_weeks (default 4 weeks) demand:
             trigger_idx_pos = df.index.get_loc(trigger_index)
             forecast_4wk = df["MyForecast"].iloc[trigger_idx_pos : trigger_idx_pos + target_weeks]
             total_demand_4wk = forecast_4wk.sum()
             # Expected PO qty for 4 weeks: additional units required to cover 4-week demand.
-            expected_po_qty = max(total_demand_4wk - simulated_inv, 0)
+            expected_po_qty = int(round(max(total_demand_4wk - simulated_inv, 0)))
 
             # Suggested PO quantities for extended planning horizons.
             forecast_8wk = df["MyForecast"].iloc[trigger_idx_pos : trigger_idx_pos + 8]
@@ -281,6 +274,9 @@ def generate_restock_suggestions(consolidated_data, runrate_inventory, coverage_
             sug_po_4 = total_demand_4wk
             sug_po_8 = forecast_8wk.sum() if len(forecast_8wk) > 0 else total_demand_4wk
             sug_po_16 = forecast_16wk.sum() if len(forecast_16wk) > 0 else total_demand_4wk
+
+            expected_trigger_po = int(round(expected_trigger_po))
+            expected_po_qty = int(round(expected_po_qty))
 
         # Append a new row with the computed information.
         ws.append([
@@ -471,16 +467,27 @@ def load_model(model_type, asin):
         return model, None
     return None, None
 
-def is_model_up_to_date(cached_model_path, ts_data):
-    """Check if a cached model was trained up to the most recent data in ts_data."""
-    if not os.path.exists(cached_model_path):
-        return False
-    model = joblib.load(cached_model_path)
-    if hasattr(model, 'last_train_date'):
-        last_train_date = model.last_train_date
-        latest_data_date = ts_data['ds'].max()
-        return last_train_date >= latest_data_date
-    return False
+def is_model_up_to_date(model_type, asin, merged_df, model_cache_folder="model_cache"):
+    """
+    Checks if we have a cached model for the given (model_type, asin),
+    and if that model is trained through the latest historical date in merged_df.
+    If up to date, return True, else False.
+    """
+    model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
+    if not os.path.exists(model_path):
+        return False  # no cached model
+
+    # Load the cached model
+    cached_model = joblib.load(model_path)
+    if not hasattr(cached_model, 'last_train_date'):
+        return False  # no attribute to compare => treat as not up to date
+
+    # Compare the model's last_train_date to the max ds in merged_df
+    last_date_in_data = merged_df['ds'].max()
+    model_train_date = cached_model.last_train_date
+
+    # If model was trained through or beyond the last date in your data, it's up to date
+    return model_train_date >= last_date_in_data
 
 
 ##############################
@@ -833,34 +840,47 @@ def generate_date_from_week(row):
     return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
 
 def generate_date_from_inventory_week(row):
-    week_str = str(row['Week']) 
-    year = str(row['Year'])    
+    """
+    Convert (Week, Year) in your inventory_data to a proper datetime 'ds'.
+    For example, if row['Week'] = 'W1' and row['Year'] = 2025,
+    we interpret it as the Sunday of ISO week 0:
+    """
+    week_str = str(row['Week']).strip()
+    year_str = str(row['Year']).strip()
 
     if week_str.upper().startswith('W'):
         week_number = int(week_str[1:])
     else:
-        week_number = int(week_str) 
+        week_number = int(week_str)
 
-    date_str = f"{year}-W{week_number - 1}-0"
+    date_str = f"{year_str}-W{week_number - 1}-0"  # Sunday of that ISO week
     try:
         dt = pd.to_datetime(date_str, format='%Y-W%U-%w')
     except ValueError:
         dt = pd.NaT
-
     return dt
 
 def load_inventory_data(inventory_file):
+    """
+    Loads the inventory_data.xlsx file, which should have columns like:
+       'ASIN', 'Model', 'OTW', 'INV', 'Total', 'POS', 'Week', 'Year'
+    'Total' is the weekly inventory for each ASIN. We rename it to 'Starting_Inventory'.
+
+    Then we parse Week+Year -> ds using generate_date_from_inventory_week.
+    """
     inv_df = pd.read_excel(inventory_file)
     inv_df.columns = inv_df.columns.str.strip()
-    
+
+    # Convert (Week, Year) -> ds
     inv_df['ds'] = inv_df.apply(generate_date_from_inventory_week, axis=1)
-    
+
+    # Rename 'Total' to 'Starting_Inventory'
     inv_df.rename(columns={'Total': 'Starting_Inventory'}, inplace=True)
 
+    # Drop rows that can't parse date
     inv_df.dropna(subset=['ds'], inplace=True)
-    
-    return inv_df
 
+    return inv_df
 
 def clean_weekly_sales_data(data):
     """Placeholder for additional cleaning steps if needed."""
@@ -1301,7 +1321,7 @@ def calculate_rmse(forecast, forecast_data, horizon):
 
 def stl_decomposition(ts_data, period=52):
     """Perform STL decomposition on historical data"""
-    decomposition = STL(ts_data['y'], period=period, robust=True).fit()
+    decomposition = STL(ts_data['Weekly_Sales'], period=period, robust=True).fit()
     return decomposition
 
 def calculate_seasonal_strength(decomposition):
@@ -3018,7 +3038,6 @@ def generate_po_coverage_report(
     pivoted.columns = [
         f"{col[0]} ({col[1]})" for col in pivoted.columns
     ]
-    # Example columns might look like "avg_po (High Volume Season)", "avg_cov (Regular Season)", etc.
 
     pivoted.reset_index(inplace=True)
 
@@ -3112,27 +3131,31 @@ def generate_po_coverage_report(
 
 def merge_historical_data(sales_file, inventory_file, po_file):
     """
-      - weekly_sales_data (via load_weekly_sales_data),
-      - inventory_data (via load_inventory_data), 
-      - po_file (with columns 'ASIN', 'Order date', 'Requested quantity'),
-    and merges them so we get a final DataFrame with:
-      'ASIN', 'ds', 'Weekly_Sales', 'Starting_Inventory', 'Weekly_PO_Qty', 'coverage', etc.
-    """
+    1) Load weekly sales data (via load_weekly_sales_data), which yields columns:
+       'ds','asin','product title','y' (renamed to 'Weekly_Sales'), etc.
+    2) Load inventory data (via load_inventory_data), which yields:
+       'ds','ASIN','Starting_Inventory',...
+    3) Load PO data from Excel, aggregate to weekly.
 
+    Merge them so the final DataFrame has:
+      - 'ASIN'
+      - 'ds'
+      - 'Weekly_Sales'
+      - 'Starting_Inventory'
+      - 'Weekly_PO_Qty'
+      - 'coverage' (computed as Starting_Inventory / Weekly_Sales)
+      etc.
+    """
     # 1) Load weekly sales data
-    #    This uses your original generate_date_from_week if needed,
-    #    or it might be part of load_weekly_sales_data.
     sales_df = load_weekly_sales_data(sales_file)
-    # unify column names
     sales_df = sales_df.rename(columns={
         'asin': 'ASIN',
         'y': 'Weekly_Sales',
         'product title': 'Model Name'
     })
 
-    # 2) Load inventory data using our new function
+    # 2) Load inventory data
     inv_df = load_inventory_data(inventory_file)
-    # Now inv_df has columns [ASIN, Model, OTW, INV, Starting_Inventory, POS, Week, Year, ds]
 
     # 3) Load and process PO data
     po_df = pd.read_excel(po_file)
@@ -3148,13 +3171,15 @@ def merge_historical_data(sales_file, inventory_file, po_file):
     )
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
 
-    # 4) Aggregate PO data weekly (Sunday-end)
+    # Aggregate PO data weekly (Sunday-end)
     po_df['ds'] = po_df['Order date'].dt.to_period('W-SUN').apply(lambda r: r.end_time)
-    po_weekly = (po_df.groupby(['ASIN', 'ds'], as_index=False)
-                      .agg({'Requested quantity': 'sum'})
-                      .rename(columns={'Requested quantity': 'Weekly_PO_Qty'}))
+    po_weekly = (
+        po_df.groupby(['ASIN', 'ds'], as_index=False)['Requested quantity']
+        .sum()
+        .rename(columns={'Requested quantity': 'Weekly_PO_Qty'})
+    )
 
-    # 5) Merge sales + inventory on (ASIN, ds)
+    # Merge sales + inventory on (ASIN, ds)
     merged = pd.merge(
         sales_df,
         inv_df[['ASIN','ds','Starting_Inventory']],
@@ -3162,11 +3187,11 @@ def merge_historical_data(sales_file, inventory_file, po_file):
         how='left'
     )
 
-    # 6) Merge with weekly PO data
+    # Merge with weekly PO data
     merged = pd.merge(merged, po_weekly, on=['ASIN','ds'], how='left')
     merged['Weekly_PO_Qty'] = merged['Weekly_PO_Qty'].fillna(0)
 
-    # 7) Optionally compute coverage:
+    # Compute coverage
     merged['coverage'] = merged.apply(
         lambda row: row['Starting_Inventory'] / (row['Weekly_Sales'] + 1e-9)
                     if pd.notna(row['Starting_Inventory']) and pd.notna(row['Weekly_Sales'])
@@ -3179,41 +3204,46 @@ def merge_historical_data(sales_file, inventory_file, po_file):
 def train_amazon_po_model(merged_df):
     """
     Train a 2-stage model:
-      1) logistic to predict if an order is placed (Weekly_PO_Qty > 0),
-      2) linear regression to predict order size (for weeks with >0 order).
-    
-    Required columns in merged_df:
-      - coverage (float)
-      - Weekly_PO_Qty (float)
-      - days_to_next_holiday (int or float)
-      - is_within_14_days_of_holiday (bool or int)
-      - optionally more features
-    
-    Returns a tuple (logistic_model, regression_model).
+      - logistic -> did Amazon place an order? (Weekly_PO_Qty > 0)
+      - linear regression -> how big was the order if placed
+    Using coverage, holiday lead-time features, etc.
     """
     df = merged_df.copy()
 
-    # 1) Classification label: Order_Placed
+    # Classification label
     df['Order_Placed'] = (df['Weekly_PO_Qty'] > 0).astype(int)
+    classes = df['Order_Placed'].unique()
+    if len(classes) < 2:
+        print("Only one class (no PO placed). Returning dummy model.")
+        return None, None
 
-    # coverage, days_to_next_holiday, is_within_14_days_of_holiday
-    X_class = df[['coverage', 'days_to_next_holiday', 'is_within_14_days_of_holiday']].copy()
-    # convert bool to int
-    X_class['is_within_14_days_of_holiday'] = X_class['is_within_14_days_of_holiday'].astype(int)
+    # If you have holiday lead time features: 'days_to_next_holiday','is_within_14_days_of_holiday'
+    # Otherwise, just coverage
+    features = []
+    if 'days_to_next_holiday' in df.columns and 'is_within_14_days_of_holiday' in df.columns:
+        features = ['coverage', 'days_to_next_holiday', 'is_within_14_days_of_holiday']
+        # convert bool
+        df['is_within_14_days_of_holiday'] = df['is_within_14_days_of_holiday'].astype(int)
+    else:
+        features = ['coverage']
+
+    X_class = df[features].copy()
+    X_class = X_class.fillna(0)
     y_class = df['Order_Placed']
 
-    # Fit logistic model
+    print("Sample merged data:\n", df[['ASIN','ds','Weekly_PO_Qty','coverage']].head(30))
+
+    # Logistic
     log_reg = LogisticRegression()
     log_reg.fit(X_class, y_class)
 
-    # 2) For the linear regression, only use rows where an order was placed
+    # For regression, only rows where an order was placed
     df_orders = df[df['Order_Placed'] == 1].copy()
     if df_orders.empty:
-        print("Warning: No positive PO data found, regression model will be trivial.")
+        print("Warning: No positive PO data found, returning logistic model + None for regression.")
         return log_reg, None
 
-    X_reg = df_orders[['coverage', 'days_to_next_holiday', 'is_within_14_days_of_holiday']].copy()
-    X_reg['is_within_14_days_of_holiday'] = X_reg['is_within_14_days_of_holiday'].astype(int)
+    X_reg = df_orders[features].copy()
     y_reg = df_orders['Weekly_PO_Qty']
 
     lin_reg = LinearRegression()
@@ -3223,55 +3253,62 @@ def train_amazon_po_model(merged_df):
 
 def forecast_amazon_po_orders(future_df, logistic_model, regression_model, initial_inventory):
     """
-    Simulate Amazon's PO ordering for the future horizon.
-    
-    future_df columns needed:
-      - 'ds'
-      - 'MyForecast' or 'forecasted_sales'
-      - 'days_to_next_holiday'
-      - 'is_within_14_days_of_holiday'
-    logistic_model, regression_model: from train_amazon_po_model
-    initial_inventory: your starting on-hand (or predicted) inventory
-    
-    Returns: a DataFrame with columns ['ds', 'Predicted_PO_Qty', 'Inventory_After_PO']
+    Stepwise approach for each future date:
+      coverage = current_inventory / forecasted sales
+      logistic_model -> place_order?
+      if place_order => regression_model for PO qty
+      update inventory
     """
+    if logistic_model is None:
+        print("No logistic model was trained (only one class). Returning an empty PO forecast.")
+        return pd.DataFrame({
+            'ds': future_df['ds'],
+            'Predicted_PO_Qty': 0,
+            'Coverage_Sim': 999,
+            'Inventory_After_PO': initial_inventory,
+            'Order_Probability': 0
+        })
+
     pred_rows = []
     current_inventory = initial_inventory
 
     for i in range(len(future_df)):
         row = future_df.iloc[i]
         ds_date = row['ds']
-        sales_fc = row.get('MyForecast', row.get('forecasted_sales', 0))
-        
+        sales_fc = row.get('MyForecast', 0)
+
         # coverage
         coverage = current_inventory / (sales_fc + 1e-9)
+
+        # logistic features (just coverage if no holiday lead-time)
+        # if you have holiday lead-time in future_df, do:
+        days_next = row.get('days_to_next_holiday', 9999)
+        is_holiday_14 = int(row.get('is_within_14_days_of_holiday', False))
+
+        feat = [coverage, days_next, is_holiday_14] \
+            if 'days_to_next_holiday' in future_df.columns else [coverage]
         
-        # logistic features:
-        feat = [
-            coverage,
-            row.get('days_to_next_holiday', 9999),
-            int(row.get('is_within_14_days_of_holiday', False))
-        ]
-        order_prob = logistic_model.predict_proba([feat])[0,1]
-        place_order = (order_prob >= 0.5)  # threshold
-        
+        # logistic predict
+        order_prob = logistic_model.predict_proba([feat])[0,1] if logistic_model else 0
+        place_order = (order_prob >= 0.5)
+
         if place_order and regression_model is not None:
             po_qty = regression_model.predict([feat])[0]
             po_qty = max(po_qty, 0)
         else:
             po_qty = 0
 
-        # Update inventory
+        # update inventory
         current_inventory = current_inventory - sales_fc + po_qty
         if current_inventory < 0:
             current_inventory = 0
-        
+
         pred_rows.append({
             'ds': ds_date,
             'Predicted_PO_Qty': round(po_qty),
-            'Coverage_Sim': coverage,
-            'Inventory_After_PO': current_inventory,
-            'Order_Probability': order_prob
+            'Coverage_Sim': round(coverage, 2),
+            'Inventory_After_PO': round(current_inventory, 2),
+            'Order_Probability': round(order_prob, 2)
         })
 
     return pd.DataFrame(pred_rows)
@@ -3315,54 +3352,135 @@ def apply_inventory_constraints(forecast_df, runrate_inventory):
     return df
 
 def generate_future_forecast(training_data, periods=16):
+    """
+    Basic example: fit Prophet on (ds,y) and create a 16-week future forecast.
+    """
     model = Prophet(yearly_seasonality=True, weekly_seasonality=True)
-    model.fit(training_data[['ds', 'y']])
+    model.fit(training_data[['ds','y']])
     future = model.make_future_dataframe(periods=periods, freq='W-SUN')
     forecast = model.predict(future)
     forecast.rename(columns={'yhat': 'MyForecast'}, inplace=True)
     return forecast
 
+def generate_sales_forecast_for_asin(asin_df, periods=16):
+    train_df = asin_df[['ds','Weekly_Sales']].dropna().rename(columns={'Weekly_Sales':'y'})
+    model = Prophet()
+    model.fit(train_df[['ds','y']])
+    future = model.make_future_dataframe(periods=periods, freq='W-SUN')
+    forecast = model.predict(future)
+    forecast.rename(columns={'yhat':'MyForecast'}, inplace=True)
+    return forecast
+
 def main_po_forecast_pipeline():
-    # 1) Merge historical data (sales, inventory, PO)
-    merged_df = merge_historical_data("weekly_sales_data.xlsx", "inventory_data.xlsx", "po_database.xlsx")
-    
-    # 2) Load holidays
-    holidays = get_shifted_holidays()
-    
-    # 3) Add lead time features to merged historical data
-    merged_df = add_holiday_lead_time_features(merged_df, holidays)
-    
-    # 4) Train logistic+regression model on historical data
-    logistic_model, regression_model = train_amazon_po_model(merged_df)
-    
-    # 5) Generate forecast_df using a forecasting model
-    training_data = merged_df[['ds', 'Weekly_Sales']].dropna()
-    forecast_df = generate_future_forecast(training_data, periods=16)
-    
-    # 6) Add holiday lead time features to the forecast DataFrame
-    future_forecast_df = add_holiday_lead_time_features(forecast_df, holidays)
-    
-    # 7) Forecast Amazon PO Orders using the trained models
-    initial_inventory = 1000  # example starting inventory
-    po_prediction = forecast_amazon_po_orders(
-        future_forecast_df,
-        logistic_model,
-        regression_model,
-        initial_inventory
+    # 1) Merge historical data
+    merged_df = merge_historical_data(
+        sales_file="weekly_sales_data.xlsx",
+        inventory_file="inventory_data.xlsx",
+        po_file="po database.xlsx"
     )
-    
-    # 8) Combine the predicted PO data with the future forecast
-    final_result = future_forecast_df.merge(
-        po_prediction[['ds','Predicted_PO_Qty','Coverage_Sim','Inventory_After_PO','Order_Probability']],
-        on='ds', how='left'
-    )
-    
-    # 9) Optionally apply inventory influence adjustments
-    final_result = apply_inventory_constraints(final_result, initial_inventory)
-    
-    # 10) Save the final result
-    final_result.to_excel("predicted_po_and_inventory_influence.xlsx", index=False)
-    print("PO Forecast pipeline complete. See predicted_po_and_inventory_influence.xlsx for details.")
+
+    # 2) Get a list of unique ASINs
+    asins = merged_df['ASIN'].dropna().unique()
+    if len(asins) == 0:
+        print("No valid ASINs found in merged data. Exiting.")
+        return
+
+    # 3) Prepare an Excel writer to save all forecasts in one file
+    output_file = "All_ASIN_PO_Forecasts.xlsx"
+    writer = pd.ExcelWriter(output_file, engine='openpyxl')
+
+    # 4) We'll also store a DataFrame with historical coverage for all ASINs in one sheet
+    coverage_df = merged_df[['ds','ASIN','coverage']].dropna()
+
+    # 5) Loop over each ASIN individually
+    for asin in asins:
+        print(f"\n=== Processing ASIN: {asin} ===")
+
+        # Subset the merged data for just this ASIN
+        asin_df = merged_df[merged_df['ASIN'] == asin].copy()
+        if asin_df.empty:
+            print(f"  ASIN {asin} is empty after filtering. Skipping.")
+            continue
+
+        # (Optional) Add holiday lead time features to historical data for this ASIN
+        # If you have get_shifted_holidays() and add_holiday_lead_time_features, call them here:
+        holidays = get_shifted_holidays()
+        if 'ds' in asin_df.columns:
+            asin_df = add_holiday_lead_time_features(asin_df, holidays)
+
+        # 6) Train logistic + regression model
+        logistic_model, regression_model = train_amazon_po_model(asin_df)
+
+        # If no logistic model could be trained (only one class), you can choose to skip forecast
+        if logistic_model is None:
+            print(f"  No logistic model for ASIN {asin}. Creating dummy forecast.")
+            # We'll still generate a future sales forecast so you see the dates, but predicted PO is 0
+            future_forecast_df = generate_sales_forecast_for_asin(asin_df)
+            po_prediction = forecast_amazon_po_orders(
+                future_forecast_df, None, None, initial_inventory=1000
+            )
+            final_result = future_forecast_df.merge(
+                po_prediction[['ds','Predicted_PO_Qty','Coverage_Sim','Inventory_After_PO','Order_Probability']],
+                on='ds', how='left'
+            )
+        else:
+            # 7) Generate future sales forecast for this ASIN
+            future_forecast_df = generate_sales_forecast_for_asin(asin_df)
+
+            # (Optional) Add holiday lead time to future forecast
+            future_forecast_df = add_holiday_lead_time_features(future_forecast_df, holidays)
+
+            # 8) Predict Amazon PO
+            #   You might want to set initial_inventory from last row or a default
+            initial_inventory = 1000
+            po_prediction = forecast_amazon_po_orders(
+                future_forecast_df, 
+                logistic_model, 
+                regression_model, 
+                initial_inventory
+            )
+
+            # Merge predictions with the future forecast
+            final_result = future_forecast_df.merge(
+                po_prediction[['ds','Predicted_PO_Qty','Coverage_Sim','Inventory_After_PO','Order_Probability']],
+                on='ds', how='left'
+            )
+
+        # 9) Optionally apply inventory constraints
+        final_result = apply_inventory_constraints(final_result, 1000)
+
+        # 10) Add columns for clarity
+        final_result['ASIN'] = asin
+        final_result['Model'] = "LogReg + Regr (PO Forecast)"
+        
+        # We keep only relevant columns
+        columns_to_keep = [
+            'ds', 
+            'ASIN',
+            'Model',
+            'MyForecast',         # from Prophet rename
+            'Predicted_PO_Qty',
+            'Coverage_Sim',
+            'Inventory_After_PO',
+            'Order_Probability'
+        ]
+        for c in columns_to_keep:
+            if c not in final_result.columns:
+                final_result[c] = np.nan
+
+        final_result = final_result[columns_to_keep]
+
+        # 11) Write to Excel (one sheet per ASIN)
+        sheet_name = str(asin)[:31]  # sheet name limit of 31 chars
+        final_result.to_excel(writer, sheet_name=sheet_name, index=False)
+        print(f"  Forecast for ASIN {asin} saved to sheet '{sheet_name}'.")
+
+    # 12) Also write historical coverage for all ASINs to a separate sheet
+    coverage_df.to_excel(writer, sheet_name="HistoricalCoverage", index=False)
+
+    writer.save()
+    print(f"\nAll forecasts saved to '{output_file}'")
+    print("PO Forecast pipeline complete.")
 
 ##############################
 # Main
@@ -3449,11 +3567,17 @@ def main():
     )
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
 
-    # Merge data for analysis if needed
-    # This merged_df is not directly used in the pipeline below unless you incorporate it,
-    # but we preserve it for demonstration. If you only need it for a coverage analysis report,
-    # you can pass it to any specialized function that summarizes coverage vs. PO, etc.
     merged_df = merge_historical_data(sales_file, inventory_file, po_file)
+
+
+    merged_df = detect_seasonal_periods(merged_df)  
+    # Now call generate_po_coverage_report:
+    generate_po_coverage_report(
+        merged_df,
+        output_folder="po_coverage_analysis",
+        output_file="po_coverage_summary.xlsx"
+    )
+    # ------------------------------------------------------------------------
 
     # ----------------------------------------------------------------------------
     # 3) For each ASIN, generate forecast WITH PO integration
@@ -3562,9 +3686,15 @@ def main():
             plt.close()
             print(f"Fallback (WITH PO) chart saved to {fallback_chart_with_po}")
 
+            def iso_week_label(d):
+                if pd.isna(d):
+                    return "W?"
+                # Add 1 to the ISO week number and zero-pad to two digits.
+                return f"W{d.isocalendar().week + 1}"
+
             fallback_df_with_po.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
             fallback_df_with_po['Week'] = pd.to_datetime(fallback_df_with_po['Week_Start_Date']).dt.isocalendar().week.apply(
-                lambda w: 'W' + str(w).zfill(2)
+                lambda w: 'W' + str(w)
             )
             fallback_df_with_po['is_holiday_week'] = False
 
@@ -3797,7 +3927,6 @@ def main():
                         else:
                             stockout_risk_list.append("Low")
 
-                        # Deplete inventory
                         starting_inv = max(0, starting_inv - fc_val)
 
                     comparison_with_po['Inventory Coverage'] = coverage_list
@@ -3833,7 +3962,7 @@ def main():
                         lcs_stage = "Mature"
                     comparison_with_po['Lifecycle Stage'] = lcs_stage
 
-                    # 8) Reorder columns (remove "Sales Volume Rank")
+                    # 8) Reorder columns (no "Sales Volume Rank" now)
                     desired_cols = [
                         "Week","Week_Start_Date","ASIN","MyForecast","Amazon Mean Forecast",
                         "Amazon P70 Forecast","Amazon P80 Forecast","Amazon P90 Forecast",
@@ -3844,17 +3973,20 @@ def main():
                     existing_cols = [c for c in desired_cols if c in comparison_with_po.columns]
                     comparison_with_po = comparison_with_po[existing_cols].copy()
 
-                    # 9) Save final forecast for this ASIN
-                    log_fallback_triggers(comparison_with_po, asin, product_title)
+                    comparison_with_po['ASIN'] = asin
+                    comparison_with_po['Product Title'] = product_title
+
+                    # Final save
                     output_file_name_with_po = f'forecast_summary_{asin}_WITH_PO.xlsx'
                     output_file_path_with_po = os.path.join(with_po_folder, output_file_name_with_po)
                     comparison_with_po.to_excel(output_file_path_with_po, index=False)
 
-                    # Summaries & saving
+                    # Summaries & save
                     summary_stats_with_po, total16_with_po, total8_with_po, total4_with_po, \
                     max_fc_with_po, min_fc_with_po, max_week_with_po, min_week_with_po = calculate_summary_statistics(
                         ts_data_with_po, comparison_with_po, horizon=horizon
                     )
+
                     save_summary_to_excel(
                         comparison_with_po,
                         summary_stats_with_po,
