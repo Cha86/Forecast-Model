@@ -27,6 +27,7 @@ from statsmodels.tsa.seasonal import STL
 from sklearn.cluster import KMeans
 from scipy.stats import linregress
 from math import ceil
+import optuna
 
 warnings.filterwarnings("ignore")
 
@@ -475,8 +476,7 @@ def is_model_up_to_date(model_type, asin, merged_df, model_cache_folder="model_c
     """
     model_path = os.path.join(model_cache_folder, f"{asin}_{model_type}.pkl")
     if not os.path.exists(model_path):
-        return False  # no cached model
-
+        return False  
     # Load the cached model
     cached_model = joblib.load(model_path)
     if not hasattr(cached_model, 'last_train_date'):
@@ -2859,7 +2859,7 @@ def forecast_sales_with_po_regressor(sales_file='weekly_sales_data.xlsx',
     model = Prophet(yearly_seasonality=True,
                     weekly_seasonality=True,
                     daily_seasonality=False,
-                    seasonality_mode='additive')
+                    seasonality_mode='multiplicative')
     model.add_regressor('Weekly_PO_Qty')
     
     # Fit the model using the columns ds, y, and Weekly_PO_Qty
@@ -3353,26 +3353,48 @@ def apply_inventory_constraints(forecast_df, runrate_inventory):
 
 def generate_future_forecast(training_data, periods=16):
     """
-    Basic example: fit Prophet on (ds,y) and create a 16-week future forecast.
+    Fit Prophet on the training data (which must have columns 'ds' and 'y'),
+    then generate a future DataFrame with exactly 'periods' rows.
+    We set include_history=False to return only forecast periods.
     """
     model = Prophet(yearly_seasonality=True, weekly_seasonality=True)
-    model.fit(training_data[['ds','y']])
-    future = model.make_future_dataframe(periods=periods, freq='W-SUN')
+    model.fit(training_data[['ds', 'y']])
+    # include_history=False ensures only future dates are returned
+    future = model.make_future_dataframe(periods=periods, freq='W-SUN', include_history=False)
     forecast = model.predict(future)
     forecast.rename(columns={'yhat': 'MyForecast'}, inplace=True)
     return forecast
 
 def generate_sales_forecast_for_asin(asin_df, periods=16):
-    train_df = asin_df[['ds','Weekly_Sales']].dropna().rename(columns={'Weekly_Sales':'y'})
-    model = Prophet()
-    model.fit(train_df[['ds','y']])
-    future = model.make_future_dataframe(periods=periods, freq='W-SUN')
+    """
+    Generate a future sales forecast for a given ASIN.
+    It takes the historical data (with 'Weekly_Sales') for that ASIN,
+    renames 'Weekly_Sales' to 'y' for Prophet, fits the model,
+    and creates a future DataFrame with exactly 'periods' rows.
+    """
+    # Extract and rename the necessary columns
+    train_df = asin_df[['ds', 'Weekly_Sales']].dropna().rename(columns={'Weekly_Sales': 'y'})
+    
+    # Check if there are enough data points to train Prophet
+    if len(train_df) < 2:
+        print(f"Not enough data to train Prophet for ASIN {asin_df['ASIN'].iloc[0]}.")
+        # Create a dummy DataFrame with forecast dates only:
+        future_dates = pd.date_range(start=pd.Timestamp.today(), periods=periods, freq='W-SUN')
+        return pd.DataFrame({'ds': future_dates})
+    
+    # Fit Prophet on the historical data
+    model = Prophet(yearly_seasonality=True, weekly_seasonality=True)
+    model.fit(train_df[['ds', 'y']])
+    
+    # Create a future DataFrame with exactly 'periods' rows (exclude history)
+    future = model.make_future_dataframe(periods=periods, freq='W-SUN', include_history=False)
     forecast = model.predict(future)
-    forecast.rename(columns={'yhat':'MyForecast'}, inplace=True)
+    forecast.rename(columns={'yhat': 'MyForecast'}, inplace=True)
     return forecast
 
+
 def main_po_forecast_pipeline():
-    # 1) Merge historical data
+    # 1) Merge historical data (sales, inventory, PO)
     merged_df = merge_historical_data(
         sales_file="weekly_sales_data.xlsx",
         inventory_file="inventory_data.xlsx",
@@ -3389,76 +3411,76 @@ def main_po_forecast_pipeline():
     output_file = "All_ASIN_PO_Forecasts.xlsx"
     writer = pd.ExcelWriter(output_file, engine='openpyxl')
 
-    # 4) We'll also store a DataFrame with historical coverage for all ASINs in one sheet
-    coverage_df = merged_df[['ds','ASIN','coverage']].dropna()
+    # 4) Also store a DataFrame with historical coverage for all ASINs in one sheet
+    coverage_df = merged_df[['ds', 'ASIN', 'coverage']].dropna()
 
     # 5) Loop over each ASIN individually
     for asin in asins:
         print(f"\n=== Processing ASIN: {asin} ===")
-
-        # Subset the merged data for just this ASIN
+        # Subset the merged data for this ASIN
         asin_df = merged_df[merged_df['ASIN'] == asin].copy()
         if asin_df.empty:
             print(f"  ASIN {asin} is empty after filtering. Skipping.")
             continue
 
-        # (Optional) Add holiday lead time features to historical data for this ASIN
-        # If you have get_shifted_holidays() and add_holiday_lead_time_features, call them here:
+        # (Optional) Add holiday lead time features to historical data
         holidays = get_shifted_holidays()
         if 'ds' in asin_df.columns:
             asin_df = add_holiday_lead_time_features(asin_df, holidays)
 
-        # 6) Train logistic + regression model
+        # 6) Train logistic + regression model for this ASIN
         logistic_model, regression_model = train_amazon_po_model(asin_df)
 
-        # If no logistic model could be trained (only one class), you can choose to skip forecast
+        # Check if there are at least 2 valid 'Weekly_Sales' data points
+        sales_data_count = len(asin_df.dropna(subset=['Weekly_Sales']))
+        if sales_data_count < 2:
+            print(f"ASIN {asin} has only {sales_data_count} data points for Prophet. Creating dummy forecast.")
+            future_forecast_df = pd.DataFrame(columns=['ds', 'MyForecast'])
+        else:
+            future_forecast_df = generate_sales_forecast_for_asin(asin_df, periods=16)
+
+        # 7) Branch based on whether a logistic model was trained
         if logistic_model is None:
-            print(f"  No logistic model for ASIN {asin}. Creating dummy forecast.")
-            # We'll still generate a future sales forecast so you see the dates, but predicted PO is 0
-            future_forecast_df = generate_sales_forecast_for_asin(asin_df)
+            print(f"  No logistic model for ASIN {asin}. Creating dummy PO forecast.")
             po_prediction = forecast_amazon_po_orders(
                 future_forecast_df, None, None, initial_inventory=1000
             )
             final_result = future_forecast_df.merge(
-                po_prediction[['ds','Predicted_PO_Qty','Coverage_Sim','Inventory_After_PO','Order_Probability']],
+                po_prediction[['ds', 'Predicted_PO_Qty', 'Coverage_Sim', 'Inventory_After_PO', 'Order_Probability']],
                 on='ds', how='left'
             )
         else:
-            # 7) Generate future sales forecast for this ASIN
-            future_forecast_df = generate_sales_forecast_for_asin(asin_df)
+            # (Optional) Add holiday lead time features to the future forecast
+            if 'ds' in future_forecast_df.columns:
+                future_forecast_df = add_holiday_lead_time_features(future_forecast_df, holidays)
 
-            # (Optional) Add holiday lead time to future forecast
-            future_forecast_df = add_holiday_lead_time_features(future_forecast_df, holidays)
-
-            # 8) Predict Amazon PO
-            #   You might want to set initial_inventory from last row or a default
-            initial_inventory = 1000
+            # 8) Forecast Amazon PO Orders using the trained models
+            initial_inventory = 1000  # example starting inventory
             po_prediction = forecast_amazon_po_orders(
-                future_forecast_df, 
-                logistic_model, 
-                regression_model, 
+                future_forecast_df,
+                logistic_model,
+                regression_model,
                 initial_inventory
             )
-
-            # Merge predictions with the future forecast
+            # Merge PO predictions with the future forecast
             final_result = future_forecast_df.merge(
-                po_prediction[['ds','Predicted_PO_Qty','Coverage_Sim','Inventory_After_PO','Order_Probability']],
+                po_prediction[['ds', 'Predicted_PO_Qty', 'Coverage_Sim', 'Inventory_After_PO', 'Order_Probability']],
                 on='ds', how='left'
             )
 
         # 9) Optionally apply inventory constraints
         final_result = apply_inventory_constraints(final_result, 1000)
 
-        # 10) Add columns for clarity
+        # 10) Add ASIN and Model columns (detected from data)
         final_result['ASIN'] = asin
         final_result['Model'] = "LogReg + Regr (PO Forecast)"
-        
-        # We keep only relevant columns
+
+        # 11) Keep only the desired columns
         columns_to_keep = [
             'ds', 
             'ASIN',
             'Model',
-            'MyForecast',         # from Prophet rename
+            'MyForecast',         # Prophet's forecast column
             'Predicted_PO_Qty',
             'Coverage_Sim',
             'Inventory_After_PO',
@@ -3467,15 +3489,14 @@ def main_po_forecast_pipeline():
         for c in columns_to_keep:
             if c not in final_result.columns:
                 final_result[c] = np.nan
-
         final_result = final_result[columns_to_keep]
 
-        # 11) Write to Excel (one sheet per ASIN)
-        sheet_name = str(asin)[:31]  # sheet name limit of 31 chars
+        # 12) Write this ASIN's forecast to a separate sheet
+        sheet_name = str(asin)[:31]  # limit to 31 characters
         final_result.to_excel(writer, sheet_name=sheet_name, index=False)
         print(f"  Forecast for ASIN {asin} saved to sheet '{sheet_name}'.")
 
-    # 12) Also write historical coverage for all ASINs to a separate sheet
+    # 13) Also write historical coverage for all ASINs to a separate sheet
     coverage_df.to_excel(writer, sheet_name="HistoricalCoverage", index=False)
 
     writer.save()
