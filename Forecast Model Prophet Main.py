@@ -53,6 +53,11 @@ prophet_param_history = {} # key = (asin, (changepoint, seasonality, holiday)), 
 # Seasonal Trend
 ##############################
 
+def compute_rmse(actual, predicted):
+    actual_filled = actual.fillna(0)
+    pred_filled   = predicted.fillna(0)
+    return sqrt(mean_squared_error(actual_filled, pred_filled))
+
 def determine_seasonal_trend(sales_series):
     """
     Determines the seasonal trend based on weekly sales data.
@@ -1029,7 +1034,7 @@ def add_holiday_lead_time_features(merged_df, holidays):
 
 
 ##############################
-# Ensemble Approach (SARIMA, Prophet, XGBoost)
+# Ensemble Approach (SARIMA, Prophet)
 ##############################
 
 def ensemble_forecast(sarima_preds, prophet_preds, amazon_mean_preds, weights):
@@ -1211,95 +1216,171 @@ PARAM_COUNTER = 0
 POOR_PARAM_FOUND = False
 EARLY_STOP_THRESHOLD = 10_000
 
-def optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=16, asin=None):
-    global PARAM_COUNTER, POOR_PARAM_FOUND, prophet_feedback
+def optimize_prophet_params_with_optuna(ts_data, forecast_data, horizon=16, asin=None, n_trials=30):
+    """
+    Use Optuna for Bayesian optimization of Prophet hyperparams.
+    Returns the best set of hyperparameters, plus an optional dictionary of RMSE values.
 
-    best_rmse = float('inf')
-    best_params = None
-    best_rmse_values = None
+    Parameters:
+      ts_data (DataFrame): historical time series for this ASIN with columns ['ds','y', ...].
+      forecast_data (dict): a dictionary of Amazon forecast arrays, e.g. {"Mean": [...], "P70": [...]}.
+      horizon (int): forecast horizon in weeks for cross-validation or hold-out tests.
+      asin (str): optional label for logging/feedback.
+      n_trials (int): how many optuna trials to run (the bigger, the more thorough).
 
-    skip_threshold_score = 0.001  # if average reward < this, skip trying it again
+    Returns:
+      best_params (dict): best set of hyperparams from the Optuna study
+      best_rmse_values (dict): optional dictionary of model vs. Amazon RMSE metrics
+    """
 
-    for changepoint_prior_scale in param_grid['changepoint_prior_scale']:
-        for seasonality_prior_scale in param_grid['seasonality_prior_scale']:
-            for holidays_prior_scale in param_grid['holidays_prior_scale']:
-                PARAM_COUNTER += 1
-                param_tuple = (changepoint_prior_scale, seasonality_prior_scale, holidays_prior_scale)
+    # Ensure your time series is sorted and has valid ds,y
+    ts_data = ts_data.copy()
+    ts_data = ts_data.sort_values('ds')
 
-                # If we have a bad param in prophet_param_history, skip it
-                if asin is not None:
-                    key = (asin, param_tuple)
-                    if key in prophet_param_history:
-                        if prophet_param_history[key]['score'] < skip_threshold_score:
-                            print(f"Skipping prophet params {param_tuple} for ASIN {asin} due to low historical score.")
-                            continue
+    # Optionally define your cross-validation settings
+    cv_initial = '365 days'  # or 52 weeks if weekly data
+    cv_period  = '180 days'  
+    cv_horizon = '90 days'   # you can adjust these if you have enough data
 
-                print(f"Testing Params #{PARAM_COUNTER} for {asin}: changepoint={changepoint_prior_scale}, "
-                      f"seasonality={seasonality_prior_scale}, holidays={holidays_prior_scale}")
-                try:
-                    forecast, _ = forecast_with_custom_params(
-                        ts_data, forecast_data,
-                        changepoint_prior_scale,
-                        seasonality_prior_scale,
-                        holidays_prior_scale,
-                        horizon=horizon
-                    )
-                    if forecast.empty or 'MyForecast' not in forecast.columns:
-                        raise ValueError("Forecast failed to generate 'MyForecast' column.")
+    # 1) Prepare an objective function for Optuna:
+    def objective(trial):
+        # Suggest hyperparams from a search space
+        changepoint_prior_scale = trial.suggest_loguniform('changepoint_prior_scale', 0.001, 5.0)
+        seasonality_prior_scale = trial.suggest_loguniform('seasonality_prior_scale', 0.001, 5.0)
+        holidays_prior_scale    = trial.suggest_float('holidays_prior_scale', 0.0, 20.0)
+        seasonality_mode        = trial.suggest_categorical('seasonality_mode', ['additive', 'multiplicative'])
+        
+        # Initialize Prophet with these hyperparams
+        model = Prophet(
+            yearly_seasonality=True,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            changepoint_prior_scale=changepoint_prior_scale,
+            seasonality_prior_scale=seasonality_prior_scale,
+            holidays_prior_scale=holidays_prior_scale,
+            seasonality_mode=seasonality_mode,
+            growth='linear'
+        )
 
-                    # Calculate average RMSE across the Amazon forecast streams
-                    rmse_values = calculate_rmse(forecast, forecast_data, horizon)
-                    avg_rmse = np.mean(list(rmse_values.values()))
+        # If you have regressors in your code, add them here EXACTLY as in your final model:
+        # for r in regressor_cols:
+        #     model.add_regressor(r, mode='multiplicative')
 
-                    mae_val = avg_rmse
+        # Fit model
+        try:
+            model.fit(ts_data[['ds','y']])
+        except:
+            # If fit fails for some reason, return a large value => "bad" trial
+            return 1e10
 
-                    # Update the param history with reward
-                    if asin is not None:
-                        update_param_history(
-                            prophet_param_history,
-                            asin,
-                            param_tuple,
-                            avg_rmse,
-                            mae_val
-                        )
+        # Prophet cross-validation can fail if there's not enough data => handle it
+        try:
+            df_cv = cross_validation(
+                model,
+                initial=cv_initial,
+                period=cv_period,
+                horizon=cv_horizon
+            )
+            df_perf = performance_metrics(df_cv, rolling_window=1)
+            rmse_val = df_perf['rmse'].iloc[0]
+        except ValueError:
+            # Not enough data or something else => penalize
+            rmse_val = 1e10
 
-                    if avg_rmse < best_rmse:
-                        best_rmse = avg_rmse
-                        best_params = {
-                            'changepoint_prior_scale': changepoint_prior_scale,
-                            'seasonality_prior_scale': seasonality_prior_scale,
-                            'holidays_prior_scale': holidays_prior_scale
-                        }
-                        best_rmse_values = rmse_values
+        return rmse_val
 
-                    if avg_rmse > EARLY_STOP_THRESHOLD:
-                        print("Early stopping triggered due to poor parameter performance.")
-                        POOR_PARAM_FOUND = True
-                        return best_params, best_rmse_values
+    # 2) Run the Optuna study
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
 
-                except Exception as e:
-                    print(f"Error during optimization: {e}")
-                    continue
+    # 3) Extract best hyperparams
+    best_params = study.best_trial.params
+    print(f"[Optuna] Best trial RMSE={study.best_trial.value:.4f} for ASIN={asin}, params={best_params}")
 
-    if best_params is None:
-        print(f"Prophet optimization failed for {asin}. Using default parameters.")
-        best_params = {
-            'changepoint_prior_scale': 0.1,
-            'seasonality_prior_scale': 1,
-            'holidays_prior_scale': 10
-        }
-        best_rmse_values = {}
+    # 4) (Optional) Re-train final model on entire ts_data with best_params
+    #    and compute a custom "RMSE vs. Amazon forecasts" if you want
+    final_model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        changepoint_prior_scale=best_params['changepoint_prior_scale'],
+        seasonality_prior_scale=best_params['seasonality_prior_scale'],
+        holidays_prior_scale=best_params['holidays_prior_scale'],
+        seasonality_mode=best_params['seasonality_mode'],
+        growth='linear'
+    )
+    final_model.fit(ts_data[['ds','y']])
 
-    # Record feedback for Prophet
-    asin_label = asin if asin is not None else 'unknown'
-    prophet_feedback[asin_label] = {
-        'best_params': best_params,
-        'rmse_values': best_rmse_values,
-        'total_tests': PARAM_COUNTER
-    }
+    # Quick forecast to compute your custom RMSE with Amazon data:
+    future = pd.date_range(
+        start=ts_data['ds'].max() + pd.Timedelta(weeks=1),
+        periods=horizon,
+        freq='W-SUN'
+    )
+    future_df = pd.DataFrame({'ds': future})
+    forecast = final_model.predict(future_df)
+    # Force integer forecast or round if you like:
+    forecast['MyForecast'] = forecast['yhat'].clip(lower=0).round()
+
+    # Compare "MyForecast" vs. Amazon streams:
+    best_rmse_values = {}
+    for forecast_type, values in forecast_data.items():
+        # pad or slice the array to horizon
+        horizon_vals = values[:horizon] if len(values) >= horizon else values
+        if len(horizon_vals) < horizon and len(horizon_vals) > 0:
+            horizon_vals = np.pad(horizon_vals, (0,horizon-len(horizon_vals)), 'constant', constant_values=horizon_vals[-1])
+        elif len(horizon_vals) == 0:
+            horizon_vals = np.zeros(horizon, dtype=int)
+
+        # compute RMSE
+        rmse = sqrt(mean_squared_error(horizon_vals, forecast['MyForecast']))
+        best_rmse_values[forecast_type] = rmse
+
+    print(f"[Optuna] Average RMSE vs. Amazon streams for ASIN {asin}: {np.mean(list(best_rmse_values.values())):.4f}")
+
     return best_params, best_rmse_values
 
+def forecast_with_optuna_params(ts_data, forecast_data, horizon=16, asin=None, n_trials=30):
+    """
+    Revised function that calls our Optuna-based hyperparam search,
+    then uses those best hyperparams to produce a final forecast.
+    
+    Returns:
+      final_forecast (DataFrame) with columns ['ds','MyForecast', 'yhat','yhat_upper']
+      prophet_model (fitted Prophet model)
+    """
+    # 1) Get best hyperparams
+    best_params, _ = optimize_prophet_params_with_optuna(ts_data, forecast_data, horizon, asin, n_trials=n_trials)
 
+    # 2) Build a Prophet model with those best params
+    model = Prophet(
+        yearly_seasonality      = True,
+        weekly_seasonality      = True,
+        daily_seasonality       = False,
+        changepoint_prior_scale = best_params['changepoint_prior_scale'],
+        seasonality_prior_scale = best_params['seasonality_prior_scale'],
+        holidays_prior_scale    = best_params['holidays_prior_scale'],
+        seasonality_mode        = best_params['seasonality_mode'],
+        growth                  = 'linear'
+    )
+
+    # 2b) If your code uses regressors, add them here:
+    # for r in regressor_cols:
+    #     model.add_regressor(r, mode='multiplicative')
+
+    model.fit(ts_data[['ds','y']])
+
+    # 3) Forecast for the next `horizon` weeks
+    future_dates = pd.date_range(
+        start=ts_data['ds'].max() + pd.Timedelta(weeks=1),
+        periods=horizon,
+        freq='W-SUN'
+    )
+    future_df = pd.DataFrame({'ds': future_dates})
+    forecast = model.predict(future_df)
+    forecast['MyForecast'] = forecast['yhat'].round().clip(lower=0).astype(int)
+
+    return forecast[['ds','MyForecast','yhat','yhat_upper']], model
 
 def calculate_rmse(forecast, forecast_data, horizon):
     """Calculate RMSE comparing our 'MyForecast' vs. Amazon forecast streams."""
@@ -2516,22 +2597,65 @@ def record_forecast_errors(asin, forecast_df, actual_df):
     print(f"Recorded forecast errors for ASIN {asin}: MAE={mae}, MAPE={mape}%")
 
 
-def update_prophet_model_with_feedback(asin, ts_data, forecast_data, param_grid, horizon, current_model=None):
+def update_prophet_model_with_feedback(
+    asin,
+    ts_data,
+    forecast_data,
+    horizon=16,
+    current_model=None,
+    n_trials=30
+):
     """
-    Update the Prophet model for a given ASIN using new actual data.
+    Update the Prophet model for a given ASIN using new actual data,
+    leveraging Optuna-based hyperparameter optimization.
+
+    Steps:
+      1) Use Optuna to find best hyperparams for the given ts_data + forecast_data.
+      2) Train a final Prophet model on ALL data using those best hyperparams.
+      3) Generate a horizon-week forecast (or however many weeks you want).
+      4) Save the model to disk (or model_cache) for future use.
     """
-    print(f"Updating Prophet model for ASIN {asin} with new data...")
-    best_params, _ = optimize_prophet_params(ts_data, forecast_data, param_grid, horizon=horizon)
-    forecast, updated_model = forecast_with_custom_params(
-        ts_data, forecast_data,
-        best_params['changepoint_prior_scale'],
-        best_params['seasonality_prior_scale'],
-        best_params['holidays_prior_scale'],
-        horizon=horizon
+    print(f"[Optuna-Update] Updating Prophet model for ASIN {asin} with new data...")
+
+    # 1) Run Bayesian optimization via Optuna
+    best_params, _ = optimize_prophet_params_with_optuna(
+        ts_data      = ts_data,
+        forecast_data= forecast_data,
+        horizon      = horizon,
+        asin         = asin,
+        n_trials     = n_trials
     )
+
+    # 2) Build a final Prophet model with the best hyperparams
+    updated_model = Prophet(
+        yearly_seasonality      = True,
+        weekly_seasonality      = True,
+        daily_seasonality       = False,
+        changepoint_prior_scale = best_params['changepoint_prior_scale'],
+        seasonality_prior_scale = best_params['seasonality_prior_scale'],
+        holidays_prior_scale    = best_params['holidays_prior_scale'],
+        seasonality_mode        = best_params['seasonality_mode'],
+        growth                  = 'linear'
+    )
+
+    updated_model.fit(ts_data[['ds','y']])
+
+    # 3) Forecast for the next 'horizon' weeks
+    future_dates = pd.date_range(
+        start=ts_data['ds'].max() + pd.Timedelta(weeks=1),
+        periods=horizon,
+        freq='W-SUN'
+    )
+    future_df = pd.DataFrame({'ds': future_dates})
+    forecast = updated_model.predict(future_df)
+    forecast['MyForecast'] = forecast['yhat'].clip(lower=0).round()
+
+    # 4) Save the updated model if desired
     save_model(updated_model, "Prophet", asin, ts_data)
-    print(f"Prophet model for ASIN {asin} updated.")
+    print(f"[Optuna-Update] Prophet model for ASIN {asin} updated with best_params={best_params}.")
+
     return forecast, updated_model
+
 
 ##############################
 # Analyze PO Order
@@ -3314,41 +3438,44 @@ def forecast_amazon_po_orders(future_df, logistic_model, regression_model, initi
     return pd.DataFrame(pred_rows)
 
 def apply_inventory_constraints(forecast_df, runrate_inventory):
-    """
-    Compare your unconstrained forecast to an 'adjusted' forecast that accounts
-    for possible inventory shortfalls or reorder surges.
-    """
     df = forecast_df.copy()
-    starting_inv = runrate_inventory  # from your runrate or initial inventory
+    starting_inv = runrate_inventory
     influences = []
     adj_forecasts = []
 
     for i in range(len(df)):
         row = df.iloc[i]
-        predicted_sales = row['MyForecast']  
+        predicted_sales = row.get('MyForecast', np.nan)
+
+        # If we can't get a numeric forecast, skip or treat as zero
+        if pd.isna(predicted_sales):
+            influences.append(0)
+            adj_forecasts.append(0)
+            continue  # or handle differently
 
         coverage = starting_inv / (predicted_sales + 1e-9)
-        
-        # naive rule: if coverage < 0.8, reduce the forecast by 10%
-        # if coverage > 2.0, increase forecast by 5%, etc. purely example
+
+        # Example logic: if coverage < 0.8 => reduce forecast 10%, etc.
+        # Simplified example:
         if coverage < 0.8:
             adj_sales = predicted_sales * 0.90
-        elif coverage > 2.0:
-            adj_sales = predicted_sales * 1.05
         else:
             adj_sales = predicted_sales
-        
-        # inventory_influence = (adj_sales - predicted_sales)
-        influences.append(round(adj_sales - predicted_sales))
+
+        # If either predicted_sales or adj_sales is NaN, handle it
+        if pd.isna(adj_sales):
+            adj_sales = 0
+        if pd.isna(predicted_sales):
+            predicted_sales = 0
+
+        influences.append(round(adj_sales - predicted_sales))  # Now safe
         adj_forecasts.append(round(adj_sales))
 
-        # reduce inventory by the actual adjusted sales
-        starting_inv = starting_inv - adj_sales
-        if starting_inv < 0:
-            starting_inv = 0
+        # reduce inventory by the adjusted sales
+        starting_inv = max(0, starting_inv - adj_sales)
 
     df['AdjustedForecast'] = adj_forecasts
-    df['inventory_influence'] = influences  
+    df['inventory_influence'] = influences
     return df
 
 def generate_future_forecast(training_data, periods=16):
@@ -3366,31 +3493,21 @@ def generate_future_forecast(training_data, periods=16):
     return forecast
 
 def generate_sales_forecast_for_asin(asin_df, periods=16):
-    """
-    Generate a future sales forecast for a given ASIN.
-    It takes the historical data (with 'Weekly_Sales') for that ASIN,
-    renames 'Weekly_Sales' to 'y' for Prophet, fits the model,
-    and creates a future DataFrame with exactly 'periods' rows.
-    """
     # Extract and rename the necessary columns
     train_df = asin_df[['ds', 'Weekly_Sales']].dropna().rename(columns={'Weekly_Sales': 'y'})
     
-    # Check if there are enough data points to train Prophet
-    if len(train_df) < 2:
-        print(f"Not enough data to train Prophet for ASIN {asin_df['ASIN'].iloc[0]}.")
-        # Create a dummy DataFrame with forecast dates only:
-        future_dates = pd.date_range(start=pd.Timestamp.today(), periods=periods, freq='W-SUN')
-        return pd.DataFrame({'ds': future_dates})
+    if len(train_df) < 2 or train_df['y'].std() == 0:
+        print("Not enough data or no variation to run Prophet. Returning fallback (empty DataFrame).")
+        fallback_df = pd.DataFrame(columns=['ds','MyForecast'])
+        return fallback_df  # SINGLE DF, not (df, None)
     
-    # Fit Prophet on the historical data
+    # Fit Prophet
     model = Prophet(yearly_seasonality=True, weekly_seasonality=True)
     model.fit(train_df[['ds', 'y']])
-    
-    # Create a future DataFrame with exactly 'periods' rows (exclude history)
     future = model.make_future_dataframe(periods=periods, freq='W-SUN', include_history=False)
     forecast = model.predict(future)
     forecast.rename(columns={'yhat': 'MyForecast'}, inplace=True)
-    return forecast
+    return forecast[['ds','MyForecast']]
 
 
 def main_po_forecast_pipeline():
@@ -3455,12 +3572,8 @@ def main_po_forecast_pipeline():
                 future_forecast_df = add_holiday_lead_time_features(future_forecast_df, holidays)
 
             # 8) Forecast Amazon PO Orders using the trained models
-            initial_inventory = 1000  # example starting inventory
             po_prediction = forecast_amazon_po_orders(
-                future_forecast_df,
-                logistic_model,
-                regression_model,
-                initial_inventory
+                future_forecast_df, logistic_model, regression_model, initial_inventory=1000
             )
             # Merge PO predictions with the future forecast
             final_result = future_forecast_df.merge(
@@ -3541,13 +3654,6 @@ def main():
     # Dictionary to store final forecasts (WITH PO)
     consolidated_forecasts_with_po = {}
 
-    # Parameter grid for Prophet
-    param_grid = {
-        'changepoint_prior_scale': [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-        'seasonality_prior_scale': [0.05, 0.1, 1, 2, 3, 4, 5],
-        'holidays_prior_scale': [5, 10, 15]
-    }
-
     # Get holiday data
     holidays = get_shifted_holidays()
 
@@ -3574,6 +3680,7 @@ def main():
     # ----------------------------------------------------------------------------
     po_file = "po database.xlsx"
     inventory_file = "inventory_data.xlsx"  # Pending file
+    # ^ Make sure you actually need 'po_file' duplicated below or if it's just the same variable
     po_file = "po database.xlsx"
     po_df = pd.read_excel(po_file)
     po_df.columns = po_df.columns.str.strip()
@@ -3589,7 +3696,6 @@ def main():
     po_df['Requested quantity'] = pd.to_numeric(po_df['Requested quantity'], errors='coerce').fillna(0)
 
     merged_df = merge_historical_data(sales_file, inventory_file, po_file)
-
 
     merged_df = detect_seasonal_periods(merged_df)  
     # Now call generate_po_coverage_report:
@@ -3679,7 +3785,7 @@ def main():
 
             fallback_df_with_po['Amazon Mean Forecast'] = amazon_mean_with_po
 
-            # Weighted fallback
+            # Weighted fallback (simple example)
             weight_amz_po = 0.9
             weight_sarima_po = 0.1
             final_vals_po = []
@@ -3688,6 +3794,7 @@ def main():
                 sarima_val_po = fallback_df_with_po['Fallback_SARIMA'].iloc[i]
                 combined_po = (weight_amz_po * mean_val_po) + (weight_sarima_po * sarima_val_po)
                 final_vals_po.append(int(round(max(combined_po, 0))))
+
             fallback_df_with_po['MyForecast'] = final_vals_po
             fallback_df_with_po['ASIN'] = asin
             fallback_df_with_po['Product Title'] = product_title
@@ -3710,7 +3817,6 @@ def main():
             def iso_week_label(d):
                 if pd.isna(d):
                     return "W?"
-                # Add 1 to the ISO week number and zero-pad to two digits.
                 return f"W{d.isocalendar().week + 1}"
 
             fallback_df_with_po.rename(columns={'ds': 'Week_Start_Date'}, inplace=True)
@@ -3812,13 +3918,16 @@ def main():
                         ts_data_with_po[['ds','y']], on='ds', how='left'
                     )
 
-                    # Blend with Amazon forecasts
+                    # -----------------------------------------------------------
+                    # BEGIN: Blend with Amazon forecasts using RMSE-based weights
+                    # -----------------------------------------------------------
                     if forecast_data:
+                        # 1) Attach Amazon forecast columns for the next 'horizon' weeks
                         for ftype, values in forecast_data.items():
                             horizon_vals = values[:horizon] if len(values) >= horizon else values
                             if len(horizon_vals) < horizon and len(horizon_vals) > 0:
                                 horizon_vals = np.pad(
-                                    horizon_vals, (0,horizon-len(horizon_vals)), 
+                                    horizon_vals, (0, horizon - len(horizon_vals)), 
                                     'constant', constant_values=horizon_vals[-1]
                                 )
                             elif len(horizon_vals) == 0:
@@ -3836,21 +3945,54 @@ def main():
                             else:
                                 print(f"Warning: Unrecognized forecast type '{ftype}'. Skipping.")
 
-                        # Weighted blend
-                        MEAN_WEIGHT = 0.7
-                        P70_WEIGHT = 0.2
-                        P80_WEIGHT = 0.1
-                        blended_amz_with_po = (
-                            MEAN_WEIGHT * comparison_with_po['Amazon Mean Forecast'] +
-                            P70_WEIGHT * comparison_with_po.get('Amazon P70 Forecast', 0) +
-                            P80_WEIGHT * comparison_with_po.get('Amazon P80 Forecast', 0)
-                        ).clip(lower=0)
+                        # 2) Compute RMSE for each available Amazon forecast vs. 'y'
+                        #    Use only rows that have actual 'y'
+                        amz_cols = [
+                            'Amazon Mean Forecast',
+                            'Amazon P70 Forecast',
+                            'Amazon P80 Forecast',
+                            'Amazon P90 Forecast'
+                        ]
+                        amz_cols = [c for c in amz_cols if c in comparison_with_po.columns]
+                        if amz_cols:
+                            window_df = comparison_with_po.dropna(subset=['y'])
+                            rmse_dict = {}
+                            for col in amz_cols:
+                                rmse_dict[col] = compute_rmse(window_df['y'], comparison_with_po[col])
 
-                        FALLBACK_RATIO = 0.3
-                        comparison_with_po['MyForecast'] = (
-                            (1 - FALLBACK_RATIO)*comparison_with_po['MyForecast'] +
-                            FALLBACK_RATIO*blended_amz_with_po
-                        ).clip(lower=0)
+                            # Convert RMSE to 1/RMSE -> weight
+                            inv_rmse = {}
+                            for col, val in rmse_dict.items():
+                                if val < 1e-9:
+                                    inv_rmse[col] = 1e9
+                                else:
+                                    inv_rmse[col] = 1.0 / val
+                            sum_inv = sum(inv_rmse.values())
+                            weights_dict = {c: inv_rmse[c] / sum_inv for c in amz_cols}
+
+                            print("\n=== Dynamic Weights Based on RMSE ===")
+                            for col in amz_cols:
+                                print(f"  {col}: weight={weights_dict[col]:.3f}  (RMSE={rmse_dict[col]:.2f})")
+
+                            # Weighted ensemble of Amazon columns
+                            blended_amz = np.zeros(len(comparison_with_po))
+                            for c in amz_cols:
+                                blended_amz += weights_dict[c] * comparison_with_po[c].fillna(0)
+
+                            blended_amz = np.maximum(blended_amz, 0)
+                            comparison_with_po['Ensemble_Amazon'] = blended_amz
+
+                            # 3) Merge ensemble with MyForecast via fallback ratio
+                            FALLBACK_RATIO = 0.3
+                            comparison_with_po['MyForecast'] = (
+                                (1 - FALLBACK_RATIO)*comparison_with_po['MyForecast'] +
+                                FALLBACK_RATIO      * comparison_with_po['Ensemble_Amazon']
+                            ).clip(lower=0)
+                        else:
+                            print("No Amazon forecast columns found. Skipping dynamic weighting.")
+                    # -----------------------------------------------------------
+                    # END: RMSE-based weighting for Amazon forecasts
+                    # -----------------------------------------------------------
 
                     # Adjust out-of-range
                     comparison_with_po = adjust_forecast_if_out_of_range(
@@ -3906,7 +4048,6 @@ def main():
                     # 2) Guarantee 'Week'
                     comparison_with_po['Week_Start_Date'] = pd.to_datetime(comparison_with_po['Week_Start_Date'], errors='coerce')
 
-                    # Now compute the ISO week
                     def iso_week_label(d):
                         if pd.isna(d):
                             return "W??"
@@ -3914,7 +4055,6 @@ def main():
 
                     comparison_with_po['Week'] = comparison_with_po['Week_Start_Date'].apply(iso_week_label)
                     comparison_with_po['Week_Start_Date'] = comparison_with_po['Week_Start_Date'].dt.strftime('%Y-%m-%d')
-
 
                     # 3) Trend
                     comparison_with_po['Trend'] = determine_seasonal_trend(comparison_with_po['MyForecast'])
@@ -3927,7 +4067,7 @@ def main():
 
                     for irow in range(len(comparison_with_po)):
                         fc_val = comparison_with_po.loc[irow, 'MyForecast']
-                        if fc_val <=0:
+                        if fc_val <= 0:
                             coverage_list.append(float('inf'))
                             reorder_urg_list.append("Normal")
                             stockout_risk_list.append("Low")
@@ -3936,13 +4076,11 @@ def main():
                         coverage = starting_inv / float(fc_val)
                         coverage_list.append(round(coverage,2))
 
-                        # Mark reorder urgency if coverage < 1.0
                         if coverage < 1.0:
                             reorder_urg_list.append("Urgent")
                         else:
                             reorder_urg_list.append("Normal")
 
-                        # Mark stockout risk if coverage < 0.5
                         if coverage < 0.5:
                             stockout_risk_list.append("High")
                         else:
@@ -3951,8 +4089,8 @@ def main():
                         starting_inv = max(0, starting_inv - fc_val)
 
                     comparison_with_po['Inventory Coverage'] = coverage_list
-                    comparison_with_po['Reorder Urgency'] = reorder_urg_list
-                    comparison_with_po['Stockout Risk'] = stockout_risk_list
+                    comparison_with_po['Reorder Urgency']    = reorder_urg_list
+                    comparison_with_po['Stockout Risk']      = stockout_risk_list
 
                     # 5) Sales Trend => arrow labels
                     historical_sales_52 = ts_data_with_po.sort_values('ds')['y'].tail(52).tolist()
@@ -3969,9 +4107,11 @@ def main():
                     comparison_with_po = comparison_with_po.sort_values(
                         'Week_Start_Date', na_position='last'
                     ).reset_index(drop=True)
+
                     def sea_idx_func(row):
                         w_i = row.name + 1
                         return compute_seasonality_index(w_i, average_annual_sales=10000.0)
+
                     comparison_with_po['Seasonality Index'] = comparison_with_po.apply(sea_idx_func, axis=1)
 
                     # 7) Lifecycle Stage from slope
@@ -4037,23 +4177,15 @@ def main():
                     print(f"[WITH PO][Prophet] No valid prophet model for {asin}, skipping.")
                     continue
 
-                print(f"[WITH PO][Prophet] Training a new model for ASIN {asin} ...")
-                best_params_po, _ = optimize_prophet_params(
-                    ts_data=ts_data_with_po,
-                    forecast_data=forecast_data,
-                    param_grid=param_grid,
+                print(f"[WITH PO][Prophet] Training a new model with Optuna for ASIN {asin} ...")
+                forecast_po, trained_prophet_model_po = forecast_with_optuna_params(
+                    ts_data_with_po,
+                    forecast_data,
                     horizon=horizon,
-                    asin=asin
+                    asin=asin,
+                    n_trials=30  
                 )
 
-                forecast_po, trained_prophet_model_po = forecast_with_custom_params(
-                    ts_data=ts_data_with_po,
-                    forecast_data=forecast_data,
-                    changepoint_prior_scale=best_params_po['changepoint_prior_scale'],
-                    seasonality_prior_scale=best_params_po['seasonality_prior_scale'],
-                    holidays_prior_scale=best_params_po['holidays_prior_scale'],
-                    horizon=horizon
-                )
                 if trained_prophet_model_po is not None:
                     save_model(trained_prophet_model_po, "Prophet_WITH_PO", asin, ts_data_with_po)
                 else:
