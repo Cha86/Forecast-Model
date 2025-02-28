@@ -1,4 +1,5 @@
 import pandas as pd
+import os
 import numpy as np
 from collections import Counter
 from prophet import Prophet
@@ -30,6 +31,8 @@ from math import ceil
 import optuna
 
 warnings.filterwarnings("ignore")
+
+os.environ["TMPDIR"] = "C:/Temp"
 
 forecast_params_used = {}
 
@@ -809,33 +812,30 @@ def generate_future_exog(holidays, steps, last_date):
     exog_future = exog_future.astype(int)
     return exog_future
 
-def choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=None):
+def choose_forecast_model(ts_data, threshold=20, holidays=None):
     """
-    Basic decision for model selection:
-    - If dataset size <= threshold, use SARIMA.
-    - Else, default to Prophet.
-    
-    We now return either:
-      (fitted_sarima_model, "SARIMA")
-    or
-      ("Prophet", "Prophet")
-    so that the calling code can see if it's 'SARIMA' or 'Prophet'.
+    If dataset size <= threshold => SARIMA,
+    else => Prophet but with a dynamic setup for yearly_seasonality.
     """
     asin = ts_data['asin'].iloc[0] if 'asin' in ts_data.columns else "UnknownASIN"
-
     if len(ts_data) <= threshold:
-        print(f"Dataset size ({len(ts_data)}) is <= threshold ({threshold}). Using SARIMA.")
+        print(f"Dataset size ({len(ts_data)}) <= threshold ({threshold}). Using SARIMA.")
+        from statsmodels.tsa.statespace.sarimax import SARIMAX
         fitted_model, best_params = fit_sarima_model(ts_data, holidays, seasonal_period=52, asin=asin)
         if fitted_model is not None:
             save_model(fitted_model, "SARIMA", asin, ts_data)
             return fitted_model, "SARIMA"
         else:
             print(f"SARIMA model fitting failed for {asin}, skipping.")
-            # Return a placeholder so that the calling code doesn't crash
             return (None, "SARIMA_Failed")
     else:
-        print(f"Dataset size ({len(ts_data)}) is > threshold ({threshold}). Using Prophet.")
-        return ("Prophet", "Prophet")
+        print(f"Dataset size ({len(ts_data)}) > threshold. Using Prophet with dynamic seasonality.")
+        # Build a Prophet model with dynamic approach:
+        model = dynamic_prophet_setup(ts_data)
+        if model is None:
+            print(f"No Prophet model created (not enough data). Fallback needed for {asin}.")
+            return (None, "Prophet_Failed")
+        return (model, "Prophet")
 
 def generate_date_from_week(row):
     """Convert year-week format into a datetime object for the beginning of that week."""
@@ -1248,7 +1248,7 @@ def optimize_prophet_params_with_optuna(ts_data, forecast_data, horizon=16, asin
         changepoint_prior_scale = trial.suggest_loguniform('changepoint_prior_scale', 0.001, 5.0)
         seasonality_prior_scale = trial.suggest_loguniform('seasonality_prior_scale', 0.001, 5.0)
         holidays_prior_scale    = trial.suggest_float('holidays_prior_scale', 0.0, 20.0)
-        seasonality_mode        = trial.suggest_categorical('seasonality_mode', ['additive', 'multiplicative'])
+        seasonality_mode        = trial.suggest_categorical('seasonality_mode', ['additive','multiplicative'])
         
         # Initialize Prophet with these hyperparams
         model = Prophet(
@@ -3496,19 +3496,24 @@ def generate_sales_forecast_for_asin(asin_df, periods=16):
     # Extract and rename the necessary columns
     train_df = asin_df[['ds', 'Weekly_Sales']].dropna().rename(columns={'Weekly_Sales': 'y'})
     
+    # Check if there are enough data points and variation
     if len(train_df) < 2 or train_df['y'].std() == 0:
         print("Not enough data or no variation to run Prophet. Returning fallback (empty DataFrame).")
-        fallback_df = pd.DataFrame(columns=['ds','MyForecast'])
-        return fallback_df  # SINGLE DF, not (df, None)
+        return pd.DataFrame(columns=['ds','MyForecast'])
     
-    # Fit Prophet
+    # Initialize and fit Prophet – wrap in try/except to catch initialization issues
     model = Prophet(yearly_seasonality=True, weekly_seasonality=True)
-    model.fit(train_df[['ds', 'y']])
+    try:
+        model.fit(train_df[['ds', 'y']])
+    except Exception as e:
+        print(f"Prophet model fitting failed for ASIN due to: {e}. Returning fallback forecast.")
+        return pd.DataFrame(columns=['ds','MyForecast'])
+    
+    # Create future DataFrame and predict
     future = model.make_future_dataframe(periods=periods, freq='W-SUN', include_history=False)
     forecast = model.predict(future)
     forecast.rename(columns={'yhat': 'MyForecast'}, inplace=True)
     return forecast[['ds','MyForecast']]
-
 
 def main_po_forecast_pipeline():
     # 1) Merge historical data (sales, inventory, PO)
@@ -3616,6 +3621,156 @@ def main_po_forecast_pipeline():
     print(f"\nAll forecasts saved to '{output_file}'")
     print("PO Forecast pipeline complete.")
 
+
+def dynamic_prophet_setup(ts_data):
+    """
+    Decide whether to enable yearly_seasonality based on number of weeks in ts_data.
+    For extremely short series (<12 weeks), we might skip big seasonalities altogether.
+    """
+    # Convert date range to number of weeks
+    if len(ts_data) < 2:
+        # Not enough points for any real model
+        print("Data < 2 points. Prophet is unlikely to work well.")
+        return None
+
+    total_weeks = (ts_data['ds'].max() - ts_data['ds'].min()).days // 7
+    if total_weeks < 12:
+        print(f"Only {total_weeks} weeks => disabling yearly & possibly fallback.")
+        model = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            growth='linear'
+        )
+    elif total_weeks < 52:
+        print(f"{total_weeks} weeks => skip annual cycle, keep weekly.")
+        model = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            growth='linear'
+        )
+    else:
+        print(f"{total_weeks} weeks => using annual + weekly.")
+        model = Prophet(
+            yearly_seasonality=True,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            growth='linear'
+        )
+    return model
+
+
+def dynamic_cross_val(model, df):
+    """
+    Dynamically compute 'initial', 'period', and 'horizon' for Prophet cross_validation 
+    based on data length. If there's too little data, we skip CV.
+    """
+    if len(df) < 10:
+        print("Too few data points for cross-validation, skipping.")
+        return None, None
+
+    total_weeks = (df['ds'].max() - df['ds'].min()).days // 7
+    # e.g. initial ~ 50% of data, horizon ~ 20%, period ~ 20%
+    initial_weeks = int(total_weeks * 0.5)
+    horizon_weeks = int(total_weeks * 0.2)
+    period_weeks  = int(total_weeks * 0.2)
+
+    # Safeguard for minimal windows
+    if initial_weeks < 4 or horizon_weeks < 2:
+        print("Data too short for meaningful cross-validation. Skipping CV.")
+        return None, None
+
+    initial_str = f"{initial_weeks * 7} days"
+    horizon_str = f"{horizon_weeks * 7} days"
+    period_str  = f"{period_weeks * 7} days"
+
+    print(f"Using cross-validation with initial={initial_str}, horizon={horizon_str}, period={period_str}")
+    try:
+        df_cv = cross_validation(
+            model, 
+            initial=initial_str,
+            horizon=horizon_str,
+            period=period_str
+        )
+        df_perf = performance_metrics(df_cv, rolling_window=1)
+        return df_cv, df_perf
+    except ValueError as e:
+        print(f"Cross-validation failed: {e}")
+        return None, None
+    
+def handle_prophet_cross_val_dynamically(model, ts_data):
+    """
+    If we want to do cross-validation with the dynamic approach, 
+    do it here. Otherwise, skip if the data is too small.
+    """
+    df_cv, df_perf = dynamic_cross_val(model, ts_data)
+    if df_cv is not None and df_perf is not None:
+        print("Dynamic cross-validation performance:")
+        print(df_perf[['mae', 'rmse']])
+    return df_cv, df_perf
+
+def blend_amazon_forecasts_rmses(
+    comparison_df,
+    forecast_data
+):
+    """
+    For each Amazon forecast column in `comparison_df`, compute RMSE vs. the
+    actual historical 'y'. Then convert that to a weight = 1/rmse_i / sum(1/rmse_j).
+    This modifies 'MyForecast' by blending with an ensemble of Amazon columns.
+    """
+    # Identify Amazon columns (e.g. 'Amazon Mean Forecast', 'Amazon P70 Forecast' etc.)
+    amz_cols = []
+    for col in ["Amazon Mean Forecast", "Amazon P70 Forecast", "Amazon P80 Forecast", "Amazon P90 Forecast"]:
+        if col in comparison_df.columns:
+            amz_cols.append(col)
+
+    if not amz_cols:
+        print("No recognized Amazon forecast columns found, skipping RMSE-based blending.")
+        return comparison_df
+
+    # We only compute RMSE on the portion where we have an actual 'y'
+    historical_mask = ~comparison_df['y'].isna()
+    if not historical_mask.any():
+        print("No historical y to compare with for RMSE-based weighting. Skipping.")
+        return comparison_df
+
+    # Now compute RMSE vs y
+    rmse_dict = {}
+    for col in amz_cols:
+        rmse_val = compute_rmse(
+            comparison_df.loc[historical_mask, 'y'], 
+            comparison_df.loc[historical_mask, col]
+        )
+        rmse_dict[col] = rmse_val
+
+    # Convert rmse to weight = (1/rmse_i) / sum(1/rmse_j)
+    inv_rmse = {}
+    for col, val in rmse_dict.items():
+        if val < 1e-9:
+            inv_rmse[col] = 1e9  # near-zero error => huge weight
+        else:
+            inv_rmse[col] = 1.0 / val
+    sum_inv = sum(inv_rmse.values())
+    weights_dict = {c: inv_rmse[c]/sum_inv for c in inv_rmse}
+
+    print("\n=== Dynamic Weights from 1/RMSE ===")
+    for col in weights_dict:
+        print(f"{col}: weight={weights_dict[col]:.3f}, RMSE={rmse_dict[col]:.2f}")
+
+    # Weighted sum of Amazon columns => "amazon_ensemble"
+    comparison_df['amazon_ensemble'] = 0.0
+    for c in amz_cols:
+        comparison_df['amazon_ensemble'] += weights_dict[c] * comparison_df[c]
+
+    # Then do fallback blend: MyForecast = (1 - fallback_ratio)*MyForecast + fallback_ratio*amazon_ensemble
+    fallback_ratio = 0.3
+    comparison_df['MyForecast'] = (
+        (1.0 - fallback_ratio)*comparison_df['MyForecast'] + fallback_ratio*comparison_df['amazon_ensemble']
+    ).clip(lower=0)
+
+    return comparison_df
+
 ##############################
 # Main
 ##############################
@@ -3663,7 +3818,16 @@ def main():
         test_ts_data = prepare_time_series_with_lags(valid_data, test_asin, lag_weeks=1)
         if not test_ts_data.empty and len(test_ts_data.dropna()) >= 2:
             print(f"Performing cross-validation on ASIN {test_asin} Prophet model (for test only).")
-            cross_validate_prophet_model(test_ts_data, initial='180 days', period='90 days', horizon='90 days')
+
+            ## NEW/CHANGED CODE HERE: Use dynamic_prophet_setup + dynamic_cross_val 
+            dynamic_model = dynamic_prophet_setup(test_ts_data)  # Creates Prophet w/ or w/o yearly seasonality
+            if dynamic_model is not None:
+                dynamic_model.fit(test_ts_data[['ds', 'y']])
+                df_cv, df_perf = dynamic_cross_val(dynamic_model, test_ts_data) 
+                if df_perf is not None:
+                    print("Dynamic CV performance metrics:\n", df_perf)
+            else:
+                print(f"Not enough data to form a dynamic Prophet model for {test_asin}.")
         else:
             print(f"Not enough data for {test_asin} to perform cross-validation test.")
 
@@ -3679,8 +3843,7 @@ def main():
     # 2) Load and prepare global PO data (for merging per ASIN)
     # ----------------------------------------------------------------------------
     po_file = "po database.xlsx"
-    inventory_file = "inventory_data.xlsx"  # Pending file
-    # ^ Make sure you actually need 'po_file' duplicated below or if it's just the same variable
+    inventory_file = "inventory_data.xlsx"  
     po_file = "po database.xlsx"
     po_df = pd.read_excel(po_file)
     po_df.columns = po_df.columns.str.strip()
@@ -3698,7 +3861,6 @@ def main():
     merged_df = merge_historical_data(sales_file, inventory_file, po_file)
 
     merged_df = detect_seasonal_periods(merged_df)  
-    # Now call generate_po_coverage_report:
     generate_po_coverage_report(
         merged_df,
         output_folder="po_coverage_analysis",
@@ -4170,14 +4332,11 @@ def main():
 
             else:
                 # == PROPHET WITH PO block ==
-                if model_with_po is None:
-                    print(f"[WITH PO][Prophet] Model is None for {asin}, skipping.")
-                    continue
-                if model_with_po == "Prophet_Failed":
-                    print(f"[WITH PO][Prophet] No valid prophet model for {asin}, skipping.")
+                if model_with_po is None or model_with_po == "Prophet_Failed":
+                    print(f"[WITH PO][Dynamic Prophet] No valid prophet model for {asin}, skipping.")
                     continue
 
-                print(f"[WITH PO][Prophet] Training a new model with Optuna for ASIN {asin} ...")
+                print(f"[WITH PO][Dynamic Prophet] Training a new model with Optuna for ASIN {asin} ...")
                 forecast_po, trained_prophet_model_po = forecast_with_optuna_params(
                     ts_data_with_po,
                     forecast_data,
@@ -4189,16 +4348,16 @@ def main():
                 if trained_prophet_model_po is not None:
                     save_model(trained_prophet_model_po, "Prophet_WITH_PO", asin, ts_data_with_po)
                 else:
-                    print(f"[WITH PO][Prophet] Failed to train new model for {asin}.")
+                    print(f"[WITH PO][Dynamic Prophet] Failed to train new model for {asin}.")
                     continue
 
                 if 'forecast_po' not in locals() or forecast_po.empty:
-                    print(f"[WITH PO][Prophet] Forecast is empty for ASIN {asin}, skipping.")
+                    print(f"[WITH PO][Dynamic Prophet] Forecast is empty for ASIN {asin}, skipping.")
                     continue
 
                 comparison_with_po = format_output_with_forecasts(forecast_po, forecast_data, horizon=horizon)
                 best_weights_po, best_rmse_po = auto_find_best_weights(forecast_po, comparison_with_po, step=0.05)
-                print(f"[WITH PO][Prophet] Auto best weights for ASIN {asin}: {best_weights_po} (RMSE={best_rmse_po})")
+                print(f"[WITH PO][Dynamic Prophet] Auto best weights for ASIN {asin}: {best_weights_po} (RMSE={best_rmse_po})")
 
                 forecast_po = adjust_forecast_weights(forecast_po.copy(), *best_weights_po)
                 comparison_with_po = format_output_with_forecasts(forecast_po, forecast_data, horizon=horizon)
