@@ -3640,6 +3640,27 @@ def has_po_orders(asin, po_df):
     except Exception as e:
         return False
     
+def dynamic_prophet_setup(ts_data):
+    # Determine the number of weeks of data
+    num_weeks = ts_data['ds'].nunique()
+    if num_weeks < 52:
+        # For short series, disable yearly seasonality
+        model = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            seasonality_mode='multiplicative'
+        )
+        # Optionally, add a custom long-term seasonality if needed:
+        # model.add_seasonality(name='custom', period=num_weeks, fourier_order=3)
+    else:
+        # For series with over a year of data, use the default yearly seasonality
+        model = Prophet(
+            yearly_seasonality=True,
+            weekly_seasonality=True,
+            seasonality_mode='multiplicative'
+        )
+    return model
+    
 
 ##############################
 # Main
