@@ -3496,20 +3496,35 @@ def generate_future_forecast(training_data, periods=16):
     return forecast
 
 def generate_sales_forecast_for_asin(asin_df, periods=16):
-    # Extract and rename the necessary columns
+    """
+    Fit Prophet on the given asin_df and produce a forecast for 'periods' weeks.
+    If Prophet fails (e.g., insufficient data variance), we return an empty DataFrame.
+    """
+    # 1) Prepare training data
     train_df = asin_df[['ds', 'Weekly_Sales']].dropna().rename(columns={'Weekly_Sales': 'y'})
     
-    if len(train_df) < 2 or train_df['y'].std() == 0:
-        print("Not enough data or no variation to run Prophet. Returning fallback (empty DataFrame).")
-        fallback_df = pd.DataFrame(columns=['ds','MyForecast'])
-        return fallback_df  # SINGLE DF, not (df, None)
+    # Quick check: if too few points or no variance, skip
+    if len(train_df) < 2 or train_df['y'].nunique() < 2:
+        print("  Not enough valid data or no variance, skipping forecast.")
+        return pd.DataFrame(columns=['ds','MyForecast'])
     
-    # Fit Prophet
+    # 2) Create and fit model in a try-except
     model = Prophet(yearly_seasonality=True, weekly_seasonality=True)
-    model.fit(train_df[['ds', 'y']])
+    try:
+        model.fit(train_df[['ds', 'y']])
+    except RuntimeError as e:
+        # If Prophet fails, log and return empty
+        print("  Prophet model fitting failed for this ASIN. Skipping.")
+        return pd.DataFrame(columns=['ds','MyForecast'])
+    
+    # 3) Generate future dates & forecast
     future = model.make_future_dataframe(periods=periods, freq='W-SUN', include_history=False)
     forecast = model.predict(future)
+    
+    # 4) Rename yhat => MyForecast, clip negative
     forecast.rename(columns={'yhat': 'MyForecast'}, inplace=True)
+    forecast['MyForecast'] = forecast['MyForecast'].clip(lower=0).round()
+    
     return forecast[['ds','MyForecast']]
 
 def main_po_forecast_pipeline():
@@ -3565,7 +3580,14 @@ def main_po_forecast_pipeline():
             print(f"ASIN {asin} has only {sales_data_count} data points for Prophet. Creating dummy forecast.")
             future_forecast_df = pd.DataFrame(columns=['ds', 'MyForecast'])
         else:
-            future_forecast_df = generate_sales_forecast_for_asin(asin_df, periods=16)
+            # Wrap the call to Prophet in try-except to skip if initialization fails
+            try:
+                future_forecast_df = generate_sales_forecast_for_asin(asin_df, periods=16)
+            except RuntimeError as e:
+                print(f"Prophet model fitting failed for ASIN {asin}. Skipping. Error: {e}")
+                # Optionally skip the rest of this loop, or just produce an empty forecast
+                # Here we choose empty forecast:
+                continue
 
         # 7) Branch based on whether a logistic model was trained
         if logistic_model is None:
@@ -3620,10 +3642,10 @@ def main_po_forecast_pipeline():
         final_result.to_excel(writer, sheet_name=sheet_name, index=False)
         print(f"  Forecast for ASIN {asin} saved to sheet '{sheet_name}'.")
 
-    # 13) Also write historical coverage for all ASINs to a separate sheet
+    # 13) Also write historical coverage for all ASINs in one sheet
     coverage_df.to_excel(writer, sheet_name="HistoricalCoverage", index=False)
 
-    writer.save()
+    writer.close()
     print(f"\nAll forecasts saved to '{output_file}'")
     print("PO Forecast pipeline complete.")
 
