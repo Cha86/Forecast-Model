@@ -935,23 +935,27 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
             if forecast_type.endswith(' Forecast'):
                 forecast_type = forecast_type.replace(' Forecast', '')
             file_path = os.path.join(folder_path, file_name)
-            df = pd.read_excel(file_path)
-    
+            try:
+                df = pd.read_excel(file_path, engine='openpyxl')
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+                continue
+
             df.columns = df.columns.str.strip().str.upper()
             if 'ASIN' not in df.columns:
                 print(f"Error: Column 'ASIN' not found in {file_name}")
                 continue
-    
+
             asin_row = df[df['ASIN'].str.upper() == asin.upper()]
             if asin_row.empty:
                 print(f"Warning: ASIN {asin} not found in {file_name}")
                 continue
-    
+
             week_columns = [col for col in df.columns if 'W' in col.upper()]
             if not week_columns:
                 print(f"Warning: No week columns found in {file_name}")
                 continue
-    
+
             forecast_values = (
                 asin_row.iloc[0][week_columns]
                 .astype(str)
@@ -2664,10 +2668,68 @@ def update_prophet_model_with_feedback(
 # Analyze PO Order
 ##############################
 
+def optimize_po_prophet_params(weekly_for_prophet, n_trials=20):
+    """
+    Use Optuna to find the best Prophet hyperparams for weekly PO data.
+    Returns a dict of best hyperparams and the best RMSE from cross-validation.
+    """
+
+    # We'll define an objective function for Optuna:
+    def objective(trial):
+        # Suggest hyperparams from some ranges
+        changepoint_prior_scale = trial.suggest_float('changepoint_prior_scale', 0.001, 5.0, log=True)
+        seasonality_prior_scale = trial.suggest_float('seasonality_prior_scale', 0.1, 10.0, log=True)
+        holidays_prior_scale    = trial.suggest_float('holidays_prior_scale', 0.0, 20.0)
+        seasonality_mode        = trial.suggest_categorical('seasonality_mode', ['additive', 'multiplicative'])
+
+        # Build a Prophet model with these params
+        model = Prophet(
+            changepoint_prior_scale=changepoint_prior_scale,
+            seasonality_prior_scale=seasonality_prior_scale,
+            holidays_prior_scale   =holidays_prior_scale,
+            seasonality_mode       =seasonality_mode,
+            weekly_seasonality     =True,
+            daily_seasonality      =False,
+            yearly_seasonality     =False,  # you can set True if you have multi-year PO data
+        )
+
+        # Fit the model
+        try:
+            model.fit(weekly_for_prophet[['ds','y']])
+        except Exception:
+            # If fitting fails, return a large error
+            return float('inf')
+
+        # Try cross-validation
+        try:
+            df_cv = cross_validation(
+                model,
+                initial='120 days',  # or some fraction of your data
+                horizon='60 days',   # about 8-9 weeks if weekly
+                period='30 days'     # for example
+            )
+            df_perf = performance_metrics(df_cv, rolling_window=1)
+            rmse = df_perf['rmse'].iloc[0]
+        except Exception:
+            # If CV fails, penalize
+            rmse = float('inf')
+
+        return rmse
+
+    # Create an Optuna study
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
+    
+    best_params = study.best_params
+    best_rmse   = study.best_value
+    print(f"[Optuna-PO] Best trial RMSE={best_rmse:.4f}, params={best_params}")
+
+    return best_params, best_rmse
+
 def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, output_folder="po_analysis_by_asin"):
     """
     Analyze PO orders by each ASIN, generating weekly/monthly requested quantity charts,
-    and fit a Prophet model to forecast future PO volume.
+    and fit a *tuned* Prophet model (via Optuna) to forecast future PO volume.
     Writes an Excel file for each ASIN (with sheets for Weekly Quantity, Monthly Trend, and PO Forecast),
     and returns a dictionary (po_forecasts_dict) containing each ASIN's PO forecast (columns: [ds, PO_Forecast]).
     """
@@ -2697,13 +2759,13 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         asin_df['Order Week'] = asin_df['Order_Week_Period'].apply(lambda p: p.end_time)
         weekly_agg = (asin_df.groupby('Order Week', as_index=False)['Requested quantity']
                       .sum().rename(columns={'Requested quantity': 'Weekly_PO_Qty'}))
-        # Monthly aggregation (if needed)
+        # Monthly aggregation
         asin_df['Order_Month_Period'] = asin_df['Order date'].dt.to_period('M')
         asin_df['Order Month'] = asin_df['Order_Month_Period'].apply(lambda p: p.end_time)
         monthly_trend = (asin_df.groupby('Order Month', as_index=False)['Requested quantity']
                          .sum().rename(columns={'Requested quantity': 'Monthly_PO_Qty'}))
 
-        # Plot weekly and monthly charts (unchanged)
+        # Plot weekly chart
         plt.figure(figsize=(10,6))
         plt.plot(weekly_agg['Order Week'], weekly_agg['Weekly_PO_Qty'], marker='o')
         plt.title(f'Weekly Requested Quantities for ASIN {asin}')
@@ -2716,6 +2778,7 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(weekly_chart)
         plt.close()
 
+        # Plot monthly chart
         plt.figure(figsize=(10,6))
         plt.plot(monthly_trend['Order Month'], monthly_trend['Monthly_PO_Qty'], marker='o', color='green')
         plt.title(f'Monthly Requested Quantities for ASIN {asin}')
@@ -2728,29 +2791,49 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(monthly_chart)
         plt.close()
 
-        # Prophet forecast on weekly data
+        # Prophet forecast on weekly data, using Optuna for hyperparam tuning
         forecast_po = pd.DataFrame()
         if len(weekly_agg) >= 2:
             try:
                 weekly_for_prophet = weekly_agg.rename(columns={'Order Week': 'ds', 'Weekly_PO_Qty': 'y'}).copy()
                 weekly_for_prophet['ds'] = pd.to_datetime(weekly_for_prophet['ds'], errors='coerce')
                 weekly_for_prophet = weekly_for_prophet.dropna(subset=['ds','y']).sort_values('ds')
-                m = Prophet(weekly_seasonality=True)
-                m.fit(weekly_for_prophet[['ds','y']])
-                future = m.make_future_dataframe(periods=8, freq='W-SUN')
-                forecast_po = m.predict(future)
-                forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round().astype(int)
-                # Optionally plot forecast
-                fig = m.plot(forecast_po, xlabel='Date', ylabel='PO Qty')
-                plt.title(f'Prophet Forecast - PO Qty for ASIN {asin}')
-                forecast_chart = os.path.join(output_folder, f"{asin}_po_forecast.png")
-                fig.savefig(forecast_chart)
-                plt.close(fig)
+
+                if len(weekly_for_prophet) < 2:
+                    print(f"Not enough PO data to forecast for ASIN {asin}.")
+                else:
+                    # 1) Use Optuna
+                    best_params, best_rmse = optimize_po_prophet_params(weekly_for_prophet, n_trials=20)
+
+                    # 2) Build final Prophet model with best_params
+                    model = Prophet(
+                        changepoint_prior_scale=best_params['changepoint_prior_scale'],
+                        seasonality_prior_scale=best_params['seasonality_prior_scale'],
+                        holidays_prior_scale   =best_params['holidays_prior_scale'],
+                        seasonality_mode       =best_params['seasonality_mode'],
+                        weekly_seasonality     =True,
+                        daily_seasonality      =False,
+                        yearly_seasonality     =False
+                    )
+                    model.fit(weekly_for_prophet[['ds','y']])
+
+                    # 3) Forecast 8 future weeks
+                    future = model.make_future_dataframe(periods=8, freq='W-SUN')
+                    forecast_po = model.predict(future)
+                    forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round().astype(int)
+
+                    # Optionally plot forecast
+                    fig = model.plot(forecast_po, xlabel='Date', ylabel='PO Qty')
+                    plt.title(f'Prophet (Optuna-Tuned) Forecast - PO Qty for ASIN {asin}')
+                    forecast_chart = os.path.join(output_folder, f"{asin}_po_forecast.png")
+                    fig.savefig(forecast_chart)
+                    plt.close(fig)
             except Exception as ex:
                 print(f"Prophet forecast failed for ASIN {asin}: {ex}")
+
         po_forecasts_dict[asin] = forecast_po[['ds','PO_Forecast']].copy() if not forecast_po.empty else pd.DataFrame()
 
-        # Write an Excel file for this ASIN (optional)
+        # Write an Excel file for this ASIN
         excel_path = os.path.join(output_folder, f"{asin}_po_data.xlsx")
         with pd.ExcelWriter(excel_path) as writer:
             weekly_agg.to_excel(writer, sheet_name='Weekly Quantity', index=False)
@@ -2762,6 +2845,42 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
     print(f"Generated PO analysis Excel reports for {len(unique_asins)} ASINs in folder '{output_folder}'.")
     print("Returning po_forecasts_dict for in-memory usage.")
     return po_forecasts_dict
+
+def remove_fallback_if_4wk_lower(fallback_df, ts_data_with_po, amazon_mean_array):
+    """
+    If the last 4 weeks' average actual sales is lower than the average of Amazon's Mean forecast,
+    remove or bypass the fallback weighting in 'fallback_df'.
+
+    fallback_df:      DataFrame containing your fallback forecast columns (e.g. 'MyForecast', 'Amazon Mean Forecast', etc.)
+    ts_data_with_po:  The time series DataFrame with actual 'y' values
+    amazon_mean_array: The array/list of Amazon's Mean forecast values used in the fallback
+    """
+
+    # 1) Compute the last 4 weeks' average actual sales from ts_data_with_po
+    last_4_weeks = ts_data_with_po.sort_values('ds').tail(4)['y']
+    if len(last_4_weeks) < 4:
+        print("Not enough data to check last 4 weeks. Skipping fallback removal check.")
+        return
+
+    last_4_sales_mean = last_4_weeks.mean()
+
+    # 2) Compute the average of the Amazon Mean forecast used in the fallback
+    if len(amazon_mean_array) == 0:
+        print("Amazon mean array is empty, skipping fallback removal check.")
+        return
+    amazon_mean_val = float(np.mean(amazon_mean_array))
+
+    # 3) If last_4_sales_mean < amazon_mean_val => remove fallback weighting
+    if last_4_sales_mean < amazon_mean_val:
+        print(f"remove_fallback_if_4wk_lower: last_4wk_mean={last_4_sales_mean:.1f} < amazon_mean={amazon_mean_val:.1f}. Removing fallback restriction.")
+        # EXAMPLE: override MyForecast with the Amazon Mean Forecast entirely
+        if 'Amazon Mean Forecast' in fallback_df.columns:
+            fallback_df['MyForecast'] = fallback_df['Amazon Mean Forecast']
+        else:
+            print("Warning: 'Amazon Mean Forecast' column missing, cannot override fallback.")
+    else:
+        print(f"remove_fallback_if_4wk_lower: last_4wk_mean={last_4_sales_mean:.1f} >= amazon_mean={amazon_mean_val:.1f}. Fallback remains.")
+
 
 ##############################
 # Compare PO Orders with Forecasts
@@ -3541,111 +3660,109 @@ def main_po_forecast_pipeline():
         print("No valid ASINs found in merged data. Exiting.")
         return
 
-    # Load PO data separately to use for checking if an ASIN has any PO orders
+    # Load PO data separately for checking if an ASIN has any PO orders
     po_df = pd.read_excel("po database.xlsx")
     po_df.columns = po_df.columns.str.strip()
 
-    # 3) Prepare an Excel writer to save all forecasts in one file
+    # 3) Prepare an Excel writer to save all forecasts in one file using a context manager
     output_file = "All_ASIN_PO_Forecasts.xlsx"
-    writer = pd.ExcelWriter(output_file, engine='openpyxl')
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
 
-    # 4) Also store a DataFrame with historical coverage for all ASINs in one sheet
-    coverage_df = merged_df[['ds', 'ASIN', 'coverage']].dropna()
+        # 4) Also store a DataFrame with historical coverage for all ASINs in one sheet
+        coverage_df = merged_df[['ds', 'ASIN', 'coverage']].dropna()
 
-    # 5) Loop over each ASIN individually
-    for asin in asins:
-        # Skip ASIN if no PO orders exist
-        if not has_po_orders(asin, po_df):
-            print(f"Skipping ASIN {asin} since there are no PO orders.")
-            continue
-
-        print(f"\n=== Processing ASIN: {asin} ===")
-        # Subset the merged data for this ASIN
-        asin_df = merged_df[merged_df['ASIN'] == asin].copy()
-        if asin_df.empty:
-            print(f"  ASIN {asin} is empty after filtering. Skipping.")
-            continue
-
-        # (Optional) Add holiday lead time features to historical data
-        holidays = get_shifted_holidays()
-        if 'ds' in asin_df.columns:
-            asin_df = add_holiday_lead_time_features(asin_df, holidays)
-
-        # 6) Train logistic + regression model for this ASIN
-        logistic_model, regression_model = train_amazon_po_model(asin_df)
-
-        # Check if there are at least 2 valid 'Weekly_Sales' data points
-        sales_data_count = len(asin_df.dropna(subset=['Weekly_Sales']))
-        if sales_data_count < 2:
-            print(f"ASIN {asin} has only {sales_data_count} data points for Prophet. Creating dummy forecast.")
-            future_forecast_df = pd.DataFrame(columns=['ds', 'MyForecast'])
-        else:
-            # Wrap the call to Prophet in try-except to skip if initialization fails
-            try:
-                future_forecast_df = generate_sales_forecast_for_asin(asin_df, periods=16)
-            except RuntimeError as e:
-                print(f"Prophet model fitting failed for ASIN {asin}. Skipping. Error: {e}")
-                # Optionally skip the rest of this loop, or just produce an empty forecast
-                # Here we choose empty forecast:
+        # 5) Loop over each ASIN individually
+        for asin in asins:
+            # Skip ASIN if no PO orders exist
+            if not has_po_orders(asin, po_df):
+                print(f"Skipping ASIN {asin} since there are no PO orders.")
                 continue
 
-        # 7) Branch based on whether a logistic model was trained
-        if logistic_model is None:
-            print(f"  No logistic model for ASIN {asin}. Creating dummy PO forecast.")
-            po_prediction = forecast_amazon_po_orders(
-                future_forecast_df, None, None, initial_inventory=1000
-            )
-            final_result = future_forecast_df.merge(
-                po_prediction[['ds', 'Predicted_PO_Qty', 'Coverage_Sim', 'Inventory_After_PO', 'Order_Probability']],
-                on='ds', how='left'
-            )
-        else:
-            # (Optional) Add holiday lead time features to the future forecast
-            if 'ds' in future_forecast_df.columns:
-                future_forecast_df = add_holiday_lead_time_features(future_forecast_df, holidays)
+            print(f"\n=== Processing ASIN: {asin} ===")
+            # Subset the merged data for this ASIN
+            asin_df = merged_df[merged_df['ASIN'] == asin].copy()
+            if asin_df.empty:
+                print(f"  ASIN {asin} is empty after filtering. Skipping.")
+                continue
 
-            # 8) Forecast Amazon PO Orders using the trained models
-            po_prediction = forecast_amazon_po_orders(
-                future_forecast_df, logistic_model, regression_model, initial_inventory=1000
-            )
-            # Merge PO predictions with the future forecast
-            final_result = future_forecast_df.merge(
-                po_prediction[['ds', 'Predicted_PO_Qty', 'Coverage_Sim', 'Inventory_After_PO', 'Order_Probability']],
-                on='ds', how='left'
-            )
+            # (Optional) Add holiday lead time features to historical data
+            holidays = get_shifted_holidays()
+            if 'ds' in asin_df.columns:
+                asin_df = add_holiday_lead_time_features(asin_df, holidays)
 
-        # 9) Optionally apply inventory constraints
-        final_result = apply_inventory_constraints(final_result, 1000)
+            # 6) Train logistic + regression model for this ASIN
+            logistic_model, regression_model = train_amazon_po_model(asin_df)
 
-        # 10) Add ASIN and Model columns (detected from data)
-        final_result['ASIN'] = asin
-        final_result['Model'] = "LogReg + Regr (PO Forecast)"
+            # Check if there are at least 2 valid 'Weekly_Sales' data points
+            sales_data_count = len(asin_df.dropna(subset=['Weekly_Sales']))
+            if sales_data_count < 2:
+                print(f"ASIN {asin} has only {sales_data_count} data points for Prophet. Creating dummy forecast.")
+                future_forecast_df = pd.DataFrame(columns=['ds', 'MyForecast'])
+            else:
+                # Wrap the call to Prophet in try-except to skip if initialization fails
+                try:
+                    future_forecast_df = generate_sales_forecast_for_asin(asin_df, periods=16)
+                except RuntimeError as e:
+                    print(f"Prophet model fitting failed for ASIN {asin}. Skipping. Error: {e}")
+                    continue
 
-        # 11) Keep only the desired columns
-        columns_to_keep = [
-            'ds', 
-            'ASIN',
-            'Model',
-            'MyForecast',         
-            'Predicted_PO_Qty',
-            'Coverage_Sim',
-            'Inventory_After_PO',
-            'Order_Probability'
-        ]
-        for c in columns_to_keep:
-            if c not in final_result.columns:
-                final_result[c] = np.nan
-        final_result = final_result[columns_to_keep]
+            # 7) Branch based on whether a logistic model was trained
+            if logistic_model is None:
+                print(f"  No logistic model for ASIN {asin}. Creating dummy PO forecast.")
+                po_prediction = forecast_amazon_po_orders(
+                    future_forecast_df, None, None, initial_inventory=1000
+                )
+                final_result = future_forecast_df.merge(
+                    po_prediction[['ds', 'Predicted_PO_Qty', 'Coverage_Sim', 'Inventory_After_PO', 'Order_Probability']],
+                    on='ds', how='left'
+                )
+            else:
+                # (Optional) Add holiday lead time features to the future forecast
+                if 'ds' in future_forecast_df.columns:
+                    future_forecast_df = add_holiday_lead_time_features(future_forecast_df, holidays)
 
-        # 12) Write this ASIN's forecast to a separate sheet
-        sheet_name = str(asin)[:31]  # limit to 31 characters
-        final_result.to_excel(writer, sheet_name=sheet_name, index=False)
-        print(f"  Forecast for ASIN {asin} saved to sheet '{sheet_name}'.")
+                # 8) Forecast Amazon PO Orders using the trained models
+                po_prediction = forecast_amazon_po_orders(
+                    future_forecast_df, logistic_model, regression_model, initial_inventory=1000
+                )
+                # Merge PO predictions with the future forecast
+                final_result = future_forecast_df.merge(
+                    po_prediction[['ds', 'Predicted_PO_Qty', 'Coverage_Sim', 'Inventory_After_PO', 'Order_Probability']],
+                    on='ds', how='left'
+                )
 
-    # 13) Also write historical coverage for all ASINs in one sheet
-    coverage_df.to_excel(writer, sheet_name="HistoricalCoverage", index=False)
+            # 9) Optionally apply inventory constraints
+            final_result = apply_inventory_constraints(final_result, 1000)
 
-    writer.close()
+            # 10) Add ASIN and Model columns (detected from data)
+            final_result['ASIN'] = asin
+            final_result['Model'] = "LogReg + Regr (PO Forecast)"
+
+            # 11) Keep only the desired columns
+            columns_to_keep = [
+                'ds', 
+                'ASIN',
+                'Model',
+                'MyForecast',         
+                'Predicted_PO_Qty',
+                'Coverage_Sim',
+                'Inventory_After_PO',
+                'Order_Probability'
+            ]
+            for c in columns_to_keep:
+                if c not in final_result.columns:
+                    final_result[c] = np.nan
+            final_result = final_result[columns_to_keep]
+
+            # 12) Write this ASIN's forecast to a separate sheet
+            sheet_name = str(asin)[:31]  # limit to 31 characters
+            final_result.to_excel(writer, sheet_name=sheet_name, index=False)
+            print(f"  Forecast for ASIN {asin} saved to sheet '{sheet_name}'.")
+
+        # 13) Also write historical coverage for all ASINs to a separate sheet
+        coverage_df.to_excel(writer, sheet_name="HistoricalCoverage", index=False)
+
+    # When the 'with' block ends, the file is automatically saved and closed.
     print(f"\nAll forecasts saved to '{output_file}'")
     print("PO Forecast pipeline complete.")
 
@@ -3785,6 +3902,47 @@ def main():
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
 
+        asin_po_df = po_df[po_df['ASIN'] == asin].copy()
+        if asin_po_df.empty:
+            print(f"No PO data for ASIN {asin}, skipping pure PO forecast.")
+        else:
+            asin_po_df['Week_Period'] = asin_po_df['Order date'].dt.to_period('W-SUN')
+            asin_po_df['ds'] = asin_po_df['Week_Period'].apply(lambda p: p.end_time)
+            weekly_po_agg = (
+                asin_po_df
+                .groupby('ds', as_index=False)['Requested quantity'].sum()
+                .rename(columns={'Requested quantity':'y'})
+            )
+            weekly_po_agg['ds'] = pd.to_datetime(weekly_po_agg['ds'], errors='coerce')
+            weekly_po_agg = weekly_po_agg.dropna(subset=['ds','y']).sort_values('ds')
+
+            if len(weekly_po_agg) < 2:
+                print(f"Not enough weekly PO data to do Optuna-based PO forecast for ASIN {asin}.")
+            else:
+                try:
+                    best_params_po, best_rmse_po = optimize_po_prophet_params(weekly_po_agg, n_trials=20)
+                    model_po = Prophet(
+                        changepoint_prior_scale = best_params_po['changepoint_prior_scale'],
+                        seasonality_prior_scale = best_params_po['seasonality_prior_scale'],
+                        holidays_prior_scale    = best_params_po['holidays_prior_scale'],
+                        seasonality_mode        = best_params_po['seasonality_mode'],
+                        weekly_seasonality      = True,
+                        daily_seasonality       = False,
+                        yearly_seasonality      = False
+                    )
+                    model_po.fit(weekly_po_agg[['ds','y']])
+
+                    # forecast next 8 weeks
+                    future_po = model_po.make_future_dataframe(periods=8, freq='W-SUN')
+                    forecast_po = model_po.predict(future_po)
+                    forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round()
+                    # Optionally store or write to Excel
+                    optuna_po_forecast_path = os.path.join(with_po_folder, f"{asin}_Optuna_PO_Forecast.xlsx")
+                    forecast_po[['ds','PO_Forecast']].to_excel(optuna_po_forecast_path, index=False)
+                    print(f"[Optuna-PO] Saved pure PO forecast => {optuna_po_forecast_path}")
+                except Exception as e_optuna_po:
+                    print(f"[Optuna-PO] Failed to tune or forecast pure PO for ASIN {asin}: {e_optuna_po}")
+
         # Load Amazon forecasts from folder
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
@@ -3797,17 +3955,14 @@ def main():
         ts_data_base = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
         print(f"Time series base data for ASIN {asin} prepared. Size: {len(ts_data_base)}")
 
-        # -------------------------
-        # 3.2) Merge PO Data
-        # -------------------------
-        asin_po_df = po_df[po_df['ASIN'] == asin].copy()
-        asin_po_df['OrderWeek'] = asin_po_df['Order date'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
-        weekly_po = asin_po_df.groupby('OrderWeek', as_index=False)['Requested quantity'].sum()
-        weekly_po.rename(columns={'Requested quantity': 'Weekly_PO_Qty'}, inplace=True)
+        asin_po_df2 = po_df[po_df['ASIN'] == asin].copy()
+        asin_po_df2['OrderWeek'] = asin_po_df2['Order date'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
+        weekly_po_2 = asin_po_df2.groupby('OrderWeek', as_index=False)['Requested quantity'].sum()
+        weekly_po_2.rename(columns={'Requested quantity': 'Weekly_PO_Qty'}, inplace=True)
 
         ts_data_with_po = ts_data_base.copy()
         ts_data_with_po['OrderWeek'] = ts_data_with_po['ds'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
-        ts_data_with_po = pd.merge(ts_data_with_po, weekly_po, on='OrderWeek', how='left')
+        ts_data_with_po = pd.merge(ts_data_with_po, weekly_po_2, on='OrderWeek', how='left')
         ts_data_with_po['Weekly_PO_Qty'] = ts_data_with_po['Weekly_PO_Qty'].fillna(0)
         print(f"Time series data (WITH PO) for ASIN {asin} prepared. Size: {len(ts_data_with_po)}")
 
@@ -3866,6 +4021,12 @@ def main():
             fallback_df_with_po['MyForecast'] = final_vals_po
             fallback_df_with_po['ASIN'] = asin
             fallback_df_with_po['Product Title'] = product_title
+
+            remove_fallback_if_4wk_lower(
+                fallback_df_with_po,
+                ts_data_with_po,
+                amazon_mean_with_po
+            )
 
             # Plot
             plt.figure(figsize=(10,6))
