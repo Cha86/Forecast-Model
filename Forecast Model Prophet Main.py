@@ -935,23 +935,27 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
             if forecast_type.endswith(' Forecast'):
                 forecast_type = forecast_type.replace(' Forecast', '')
             file_path = os.path.join(folder_path, file_name)
-            df = pd.read_excel(file_path)
-    
+            try:
+                df = pd.read_excel(file_path, engine='openpyxl')
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+                continue
+
             df.columns = df.columns.str.strip().str.upper()
             if 'ASIN' not in df.columns:
                 print(f"Error: Column 'ASIN' not found in {file_name}")
                 continue
-    
+
             asin_row = df[df['ASIN'].str.upper() == asin.upper()]
             if asin_row.empty:
                 print(f"Warning: ASIN {asin} not found in {file_name}")
                 continue
-    
+
             week_columns = [col for col in df.columns if 'W' in col.upper()]
             if not week_columns:
                 print(f"Warning: No week columns found in {file_name}")
                 continue
-    
+
             forecast_values = (
                 asin_row.iloc[0][week_columns]
                 .astype(str)
