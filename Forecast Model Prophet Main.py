@@ -935,27 +935,23 @@ def load_amazon_forecasts_from_folder(folder_path, asin):
             if forecast_type.endswith(' Forecast'):
                 forecast_type = forecast_type.replace(' Forecast', '')
             file_path = os.path.join(folder_path, file_name)
-            try:
-                df = pd.read_excel(file_path, engine='openpyxl')
-            except Exception as e:
-                print(f"Error reading {file_path}: {e}")
-                continue
-
+            df = pd.read_excel(file_path)
+    
             df.columns = df.columns.str.strip().str.upper()
             if 'ASIN' not in df.columns:
                 print(f"Error: Column 'ASIN' not found in {file_name}")
                 continue
-
+    
             asin_row = df[df['ASIN'].str.upper() == asin.upper()]
             if asin_row.empty:
                 print(f"Warning: ASIN {asin} not found in {file_name}")
                 continue
-
+    
             week_columns = [col for col in df.columns if 'W' in col.upper()]
             if not week_columns:
                 print(f"Warning: No week columns found in {file_name}")
                 continue
-
+    
             forecast_values = (
                 asin_row.iloc[0][week_columns]
                 .astype(str)
@@ -2484,28 +2480,67 @@ def adjust_forecast_if_out_of_range(
     asin,
     forecast_col_name='MyForecast',
     adjustment_threshold=0.3,
-    bypass_seasonality=True  # New flag to enable seasonal bypass
+    bypass_seasonality=True  # existing parameter
 ):
     """
-    Adjust 'MyForecast' if it is too far from Amazon Mean Forecast.
-    
-    If bypass_seasonality is True and a row is marked (via the 'seasonal_cluster'
-    column) as belonging to a known hot or cold selling season (e.g., 'high' or 'low'),
-    then bypass (skip) the adjustment for that row.
+    Adjust 'MyForecast' if it is too far from Amazon Mean Forecast,
+    unless either:
+      1) The last 4 weeks of actual sales are effectively zero (e.g. <1), or
+      2) The last 4 weeks of actual sales are lower than the Amazon Mean forecast.
+
+    In either case, we skip the out-of-range fallback logic.
     """
     global out_of_range_counter
     global out_of_range_stats
 
-    # --- Step 1: Flag rows that should bypass the adjustment ---
+    # --------------------------------------------------------------------------
+    # STEP A: Compute last 4-week average actual sales
+    # --------------------------------------------------------------------------
+    last_4_actual = 0
+    if 'y' in comparison.columns:
+        # Sort by ds (date), drop missing, take last 4
+        last_4_rows = comparison.dropna(subset=['y']).sort_values('ds').tail(4)
+        if not last_4_rows.empty:
+            last_4_actual = last_4_rows['y'].mean()
+
+    # --------------------------------------------------------------------------
+    # STEP B: Compute average Amazon Mean forecast if present
+    # --------------------------------------------------------------------------
+    mean_amz_forecast = 0
+    if 'Amazon Mean Forecast' in comparison.columns and len(comparison) > 0:
+        mean_amz_forecast = comparison['Amazon Mean Forecast'].mean()
+
+    # --------------------------------------------------------------------------
+    # STEP C: If last_4_actual < 1.0 => skip fallback logic
+    # --------------------------------------------------------------------------
+    if last_4_actual < 1.0:
+        print(f"For ASIN {asin}: Last 4-week actual avg is very low ({last_4_actual:.1f}). "
+              "=> Skipping out-of-range fallback entirely.")
+        return comparison
+
+    # --------------------------------------------------------------------------
+    # STEP D: If last_4_actual < mean_amz_forecast => skip fallback
+    # --------------------------------------------------------------------------
+    if last_4_actual < mean_amz_forecast:
+        print(f"For ASIN {asin}: Last 4-week actual avg ({last_4_actual:.1f}) "
+              f"is below Amazon Mean forecast avg ({mean_amz_forecast:.1f}). "
+              "=> Skipping out-of-range fallback.")
+        return comparison
+
+    # --------------------------------------------------------------------------
+    # EXISTING LOGIC: Seasonal bypass, local threshold, out-of-range adjust
+    # --------------------------------------------------------------------------
+
+    # 1) Flag rows that should bypass the adjustment
     if bypass_seasonality and 'seasonal_cluster' in comparison.columns:
-        # Mark rows where the seasonal_cluster indicates a seasonal effect
+        # Mark rows where seasonal_cluster indicates a strong effect (e.g., 'high' or 'low')
         comparison['bypass_adjustment'] = comparison['seasonal_cluster'].apply(
-            lambda x: x in ['high', 'low']  # Adjust these labels as needed
+            lambda x: x in ['high', 'low']
         )
     else:
         comparison['bypass_adjustment'] = False
 
-    # --- Step 2: Compute the local threshold based on recent vs overall averages ---
+    # 2) Compute local threshold based on recent vs overall averages
     if 'y' in comparison.columns:
         recent_5 = comparison.dropna(subset=['y']).sort_values('ds').tail(5)
         last_5_avg = recent_5['y'].mean() if len(recent_5) > 0 else 0
@@ -2514,43 +2549,45 @@ def adjust_forecast_if_out_of_range(
         last_5_avg = 0
         overall_avg = 0
 
+    # If recent sales are below the overall average, loosen threshold to 60%
     if last_5_avg < overall_avg:
-        local_threshold = 0.6  # Use a higher (looser) threshold if recent sales are low
-        print(f"Recent 5-wk avg is below overall avg, using threshold=60%")
+        local_threshold = 0.6
+        print(f"Recent 5-week avg is below overall avg, using threshold=60% for ASIN {asin}")
     else:
         local_threshold = adjustment_threshold
 
-    # --- Step 3: Identify rows that are "out of range" but are not in seasonal bypass ---
+    # 3) Identify rows out of range, not in seasonal bypass
     condition_adjust = (
         ((comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
          (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold)))
-        & (~comparison['bypass_adjustment'])  # Only adjust if not bypassed due to seasonality
+        & (~comparison['bypass_adjustment'])  # skip if bypassed
     )
     comparison['is_out_of_range'] = condition_adjust
 
-    # --- Step 4: Apply adjustment only to rows that are not bypassed ---
+    # 4) Apply adjustment only to rows that are not bypassed
     if comparison['is_out_of_range'].any():
         num_adjustments = comparison['is_out_of_range'].sum()
         print(f"Adjusting {num_adjustments} out-of-range forecasts for ASIN {asin}.")
         out_of_range_counter[asin] += num_adjustments
+
         if asin not in out_of_range_stats:
             out_of_range_stats[asin] = {'total': 0, 'adjusted': 0}
         out_of_range_stats[asin]['total'] += len(comparison)
         out_of_range_stats[asin]['adjusted'] += num_adjustments
 
         idx = comparison['is_out_of_range']
-        # This adjustment clips the forecast to within (1 ± local_threshold) of Amazon Mean Forecast
+        # Clip the forecast to within (1 ± local_threshold) of Amazon Mean
         comparison.loc[idx, forecast_col_name] = (
-            comparison.loc[idx, 'Amazon Mean Forecast'] *
-            comparison.loc[idx, forecast_col_name] /
             comparison.loc[idx, 'Amazon Mean Forecast']
-        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) * \
-          comparison.loc[idx, 'Amazon Mean Forecast']
+            * comparison.loc[idx, forecast_col_name]
+            / comparison.loc[idx, 'Amazon Mean Forecast']
+        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) \
+          * comparison.loc[idx, 'Amazon Mean Forecast']
 
         # Ensure non-negative values
         comparison[forecast_col_name] = comparison[forecast_col_name].clip(lower=0)
 
-    # --- Step 5: Clean up temporary column ---
+    # 5) Clean up temporary column
     comparison.drop(columns=['bypass_adjustment'], inplace=True)
     return comparison
 
@@ -2668,68 +2705,10 @@ def update_prophet_model_with_feedback(
 # Analyze PO Order
 ##############################
 
-def optimize_po_prophet_params(weekly_for_prophet, n_trials=20):
-    """
-    Use Optuna to find the best Prophet hyperparams for weekly PO data.
-    Returns a dict of best hyperparams and the best RMSE from cross-validation.
-    """
-
-    # We'll define an objective function for Optuna:
-    def objective(trial):
-        # Suggest hyperparams from some ranges
-        changepoint_prior_scale = trial.suggest_float('changepoint_prior_scale', 0.001, 5.0, log=True)
-        seasonality_prior_scale = trial.suggest_float('seasonality_prior_scale', 0.1, 10.0, log=True)
-        holidays_prior_scale    = trial.suggest_float('holidays_prior_scale', 0.0, 20.0)
-        seasonality_mode        = trial.suggest_categorical('seasonality_mode', ['additive', 'multiplicative'])
-
-        # Build a Prophet model with these params
-        model = Prophet(
-            changepoint_prior_scale=changepoint_prior_scale,
-            seasonality_prior_scale=seasonality_prior_scale,
-            holidays_prior_scale   =holidays_prior_scale,
-            seasonality_mode       =seasonality_mode,
-            weekly_seasonality     =True,
-            daily_seasonality      =False,
-            yearly_seasonality     =False,  # you can set True if you have multi-year PO data
-        )
-
-        # Fit the model
-        try:
-            model.fit(weekly_for_prophet[['ds','y']])
-        except Exception:
-            # If fitting fails, return a large error
-            return float('inf')
-
-        # Try cross-validation
-        try:
-            df_cv = cross_validation(
-                model,
-                initial='120 days',  # or some fraction of your data
-                horizon='60 days',   # about 8-9 weeks if weekly
-                period='30 days'     # for example
-            )
-            df_perf = performance_metrics(df_cv, rolling_window=1)
-            rmse = df_perf['rmse'].iloc[0]
-        except Exception:
-            # If CV fails, penalize
-            rmse = float('inf')
-
-        return rmse
-
-    # Create an Optuna study
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=n_trials)
-    
-    best_params = study.best_params
-    best_rmse   = study.best_value
-    print(f"[Optuna-PO] Best trial RMSE={best_rmse:.4f}, params={best_params}")
-
-    return best_params, best_rmse
-
 def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, output_folder="po_analysis_by_asin"):
     """
     Analyze PO orders by each ASIN, generating weekly/monthly requested quantity charts,
-    and fit a *tuned* Prophet model (via Optuna) to forecast future PO volume.
+    and fit a Prophet model to forecast future PO volume.
     Writes an Excel file for each ASIN (with sheets for Weekly Quantity, Monthly Trend, and PO Forecast),
     and returns a dictionary (po_forecasts_dict) containing each ASIN's PO forecast (columns: [ds, PO_Forecast]).
     """
@@ -2759,13 +2738,13 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         asin_df['Order Week'] = asin_df['Order_Week_Period'].apply(lambda p: p.end_time)
         weekly_agg = (asin_df.groupby('Order Week', as_index=False)['Requested quantity']
                       .sum().rename(columns={'Requested quantity': 'Weekly_PO_Qty'}))
-        # Monthly aggregation
+        # Monthly aggregation (if needed)
         asin_df['Order_Month_Period'] = asin_df['Order date'].dt.to_period('M')
         asin_df['Order Month'] = asin_df['Order_Month_Period'].apply(lambda p: p.end_time)
         monthly_trend = (asin_df.groupby('Order Month', as_index=False)['Requested quantity']
                          .sum().rename(columns={'Requested quantity': 'Monthly_PO_Qty'}))
 
-        # Plot weekly chart
+        # Plot weekly and monthly charts (unchanged)
         plt.figure(figsize=(10,6))
         plt.plot(weekly_agg['Order Week'], weekly_agg['Weekly_PO_Qty'], marker='o')
         plt.title(f'Weekly Requested Quantities for ASIN {asin}')
@@ -2778,7 +2757,6 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(weekly_chart)
         plt.close()
 
-        # Plot monthly chart
         plt.figure(figsize=(10,6))
         plt.plot(monthly_trend['Order Month'], monthly_trend['Monthly_PO_Qty'], marker='o', color='green')
         plt.title(f'Monthly Requested Quantities for ASIN {asin}')
@@ -2791,49 +2769,29 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
         plt.savefig(monthly_chart)
         plt.close()
 
-        # Prophet forecast on weekly data, using Optuna for hyperparam tuning
+        # Prophet forecast on weekly data
         forecast_po = pd.DataFrame()
         if len(weekly_agg) >= 2:
             try:
                 weekly_for_prophet = weekly_agg.rename(columns={'Order Week': 'ds', 'Weekly_PO_Qty': 'y'}).copy()
                 weekly_for_prophet['ds'] = pd.to_datetime(weekly_for_prophet['ds'], errors='coerce')
                 weekly_for_prophet = weekly_for_prophet.dropna(subset=['ds','y']).sort_values('ds')
-
-                if len(weekly_for_prophet) < 2:
-                    print(f"Not enough PO data to forecast for ASIN {asin}.")
-                else:
-                    # 1) Use Optuna
-                    best_params, best_rmse = optimize_po_prophet_params(weekly_for_prophet, n_trials=20)
-
-                    # 2) Build final Prophet model with best_params
-                    model = Prophet(
-                        changepoint_prior_scale=best_params['changepoint_prior_scale'],
-                        seasonality_prior_scale=best_params['seasonality_prior_scale'],
-                        holidays_prior_scale   =best_params['holidays_prior_scale'],
-                        seasonality_mode       =best_params['seasonality_mode'],
-                        weekly_seasonality     =True,
-                        daily_seasonality      =False,
-                        yearly_seasonality     =False
-                    )
-                    model.fit(weekly_for_prophet[['ds','y']])
-
-                    # 3) Forecast 8 future weeks
-                    future = model.make_future_dataframe(periods=8, freq='W-SUN')
-                    forecast_po = model.predict(future)
-                    forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round().astype(int)
-
-                    # Optionally plot forecast
-                    fig = model.plot(forecast_po, xlabel='Date', ylabel='PO Qty')
-                    plt.title(f'Prophet (Optuna-Tuned) Forecast - PO Qty for ASIN {asin}')
-                    forecast_chart = os.path.join(output_folder, f"{asin}_po_forecast.png")
-                    fig.savefig(forecast_chart)
-                    plt.close(fig)
+                m = Prophet(weekly_seasonality=True)
+                m.fit(weekly_for_prophet[['ds','y']])
+                future = m.make_future_dataframe(periods=8, freq='W-SUN')
+                forecast_po = m.predict(future)
+                forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round().astype(int)
+                # Optionally plot forecast
+                fig = m.plot(forecast_po, xlabel='Date', ylabel='PO Qty')
+                plt.title(f'Prophet Forecast - PO Qty for ASIN {asin}')
+                forecast_chart = os.path.join(output_folder, f"{asin}_po_forecast.png")
+                fig.savefig(forecast_chart)
+                plt.close(fig)
             except Exception as ex:
                 print(f"Prophet forecast failed for ASIN {asin}: {ex}")
-
         po_forecasts_dict[asin] = forecast_po[['ds','PO_Forecast']].copy() if not forecast_po.empty else pd.DataFrame()
 
-        # Write an Excel file for this ASIN
+        # Write an Excel file for this ASIN (optional)
         excel_path = os.path.join(output_folder, f"{asin}_po_data.xlsx")
         with pd.ExcelWriter(excel_path) as writer:
             weekly_agg.to_excel(writer, sheet_name='Weekly Quantity', index=False)
@@ -2845,42 +2803,6 @@ def analyze_po_data_by_asin(po_file="po database.xlsx", product_filter=None, out
     print(f"Generated PO analysis Excel reports for {len(unique_asins)} ASINs in folder '{output_folder}'.")
     print("Returning po_forecasts_dict for in-memory usage.")
     return po_forecasts_dict
-
-def remove_fallback_if_4wk_lower(fallback_df, ts_data_with_po, amazon_mean_array):
-    """
-    If the last 4 weeks' average actual sales is lower than the average of Amazon's Mean forecast,
-    remove or bypass the fallback weighting in 'fallback_df'.
-
-    fallback_df:      DataFrame containing your fallback forecast columns (e.g. 'MyForecast', 'Amazon Mean Forecast', etc.)
-    ts_data_with_po:  The time series DataFrame with actual 'y' values
-    amazon_mean_array: The array/list of Amazon's Mean forecast values used in the fallback
-    """
-
-    # 1) Compute the last 4 weeks' average actual sales from ts_data_with_po
-    last_4_weeks = ts_data_with_po.sort_values('ds').tail(4)['y']
-    if len(last_4_weeks) < 4:
-        print("Not enough data to check last 4 weeks. Skipping fallback removal check.")
-        return
-
-    last_4_sales_mean = last_4_weeks.mean()
-
-    # 2) Compute the average of the Amazon Mean forecast used in the fallback
-    if len(amazon_mean_array) == 0:
-        print("Amazon mean array is empty, skipping fallback removal check.")
-        return
-    amazon_mean_val = float(np.mean(amazon_mean_array))
-
-    # 3) If last_4_sales_mean < amazon_mean_val => remove fallback weighting
-    if last_4_sales_mean < amazon_mean_val:
-        print(f"remove_fallback_if_4wk_lower: last_4wk_mean={last_4_sales_mean:.1f} < amazon_mean={amazon_mean_val:.1f}. Removing fallback restriction.")
-        # EXAMPLE: override MyForecast with the Amazon Mean Forecast entirely
-        if 'Amazon Mean Forecast' in fallback_df.columns:
-            fallback_df['MyForecast'] = fallback_df['Amazon Mean Forecast']
-        else:
-            print("Warning: 'Amazon Mean Forecast' column missing, cannot override fallback.")
-    else:
-        print(f"remove_fallback_if_4wk_lower: last_4wk_mean={last_4_sales_mean:.1f} >= amazon_mean={amazon_mean_val:.1f}. Fallback remains.")
-
 
 ##############################
 # Compare PO Orders with Forecasts
@@ -3902,47 +3824,6 @@ def main():
         product_title = valid_data[valid_data['asin'] == asin]['product title'].iloc[0]
         print(f"\nProcessing ASIN: {asin} - {product_title}")
 
-        asin_po_df = po_df[po_df['ASIN'] == asin].copy()
-        if asin_po_df.empty:
-            print(f"No PO data for ASIN {asin}, skipping pure PO forecast.")
-        else:
-            asin_po_df['Week_Period'] = asin_po_df['Order date'].dt.to_period('W-SUN')
-            asin_po_df['ds'] = asin_po_df['Week_Period'].apply(lambda p: p.end_time)
-            weekly_po_agg = (
-                asin_po_df
-                .groupby('ds', as_index=False)['Requested quantity'].sum()
-                .rename(columns={'Requested quantity':'y'})
-            )
-            weekly_po_agg['ds'] = pd.to_datetime(weekly_po_agg['ds'], errors='coerce')
-            weekly_po_agg = weekly_po_agg.dropna(subset=['ds','y']).sort_values('ds')
-
-            if len(weekly_po_agg) < 2:
-                print(f"Not enough weekly PO data to do Optuna-based PO forecast for ASIN {asin}.")
-            else:
-                try:
-                    best_params_po, best_rmse_po = optimize_po_prophet_params(weekly_po_agg, n_trials=20)
-                    model_po = Prophet(
-                        changepoint_prior_scale = best_params_po['changepoint_prior_scale'],
-                        seasonality_prior_scale = best_params_po['seasonality_prior_scale'],
-                        holidays_prior_scale    = best_params_po['holidays_prior_scale'],
-                        seasonality_mode        = best_params_po['seasonality_mode'],
-                        weekly_seasonality      = True,
-                        daily_seasonality       = False,
-                        yearly_seasonality      = False
-                    )
-                    model_po.fit(weekly_po_agg[['ds','y']])
-
-                    # forecast next 8 weeks
-                    future_po = model_po.make_future_dataframe(periods=8, freq='W-SUN')
-                    forecast_po = model_po.predict(future_po)
-                    forecast_po['PO_Forecast'] = forecast_po['yhat'].clip(lower=0).round()
-                    # Optionally store or write to Excel
-                    optuna_po_forecast_path = os.path.join(with_po_folder, f"{asin}_Optuna_PO_Forecast.xlsx")
-                    forecast_po[['ds','PO_Forecast']].to_excel(optuna_po_forecast_path, index=False)
-                    print(f"[Optuna-PO] Saved pure PO forecast => {optuna_po_forecast_path}")
-                except Exception as e_optuna_po:
-                    print(f"[Optuna-PO] Failed to tune or forecast pure PO for ASIN {asin}: {e_optuna_po}")
-
         # Load Amazon forecasts from folder
         forecast_data = load_amazon_forecasts_from_folder(forecasts_folder, asin)
         if not forecast_data:
@@ -3955,14 +3836,17 @@ def main():
         ts_data_base = prepare_time_series_with_lags(valid_data, asin, lag_weeks=1)
         print(f"Time series base data for ASIN {asin} prepared. Size: {len(ts_data_base)}")
 
-        asin_po_df2 = po_df[po_df['ASIN'] == asin].copy()
-        asin_po_df2['OrderWeek'] = asin_po_df2['Order date'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
-        weekly_po_2 = asin_po_df2.groupby('OrderWeek', as_index=False)['Requested quantity'].sum()
-        weekly_po_2.rename(columns={'Requested quantity': 'Weekly_PO_Qty'}, inplace=True)
+        # -------------------------
+        # 3.2) Merge PO Data
+        # -------------------------
+        asin_po_df = po_df[po_df['ASIN'] == asin].copy()
+        asin_po_df['OrderWeek'] = asin_po_df['Order date'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
+        weekly_po = asin_po_df.groupby('OrderWeek', as_index=False)['Requested quantity'].sum()
+        weekly_po.rename(columns={'Requested quantity': 'Weekly_PO_Qty'}, inplace=True)
 
         ts_data_with_po = ts_data_base.copy()
         ts_data_with_po['OrderWeek'] = ts_data_with_po['ds'].dt.to_period('W-SUN').apply(lambda p: p.start_time)
-        ts_data_with_po = pd.merge(ts_data_with_po, weekly_po_2, on='OrderWeek', how='left')
+        ts_data_with_po = pd.merge(ts_data_with_po, weekly_po, on='OrderWeek', how='left')
         ts_data_with_po['Weekly_PO_Qty'] = ts_data_with_po['Weekly_PO_Qty'].fillna(0)
         print(f"Time series data (WITH PO) for ASIN {asin} prepared. Size: {len(ts_data_with_po)}")
 
@@ -4021,12 +3905,6 @@ def main():
             fallback_df_with_po['MyForecast'] = final_vals_po
             fallback_df_with_po['ASIN'] = asin
             fallback_df_with_po['Product Title'] = product_title
-
-            remove_fallback_if_4wk_lower(
-                fallback_df_with_po,
-                ts_data_with_po,
-                amazon_mean_with_po
-            )
 
             # Plot
             plt.figure(figsize=(10,6))
