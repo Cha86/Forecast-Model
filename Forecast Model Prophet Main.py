@@ -2484,67 +2484,77 @@ def adjust_forecast_if_out_of_range(
     asin,
     forecast_col_name='MyForecast',
     adjustment_threshold=0.3,
-    bypass_seasonality=True  # existing parameter
+    bypass_seasonality=True,
+    window=6,
+    min_forecast=None,
+    max_forecast=None
 ):
     """
-    Adjust 'MyForecast' if it is too far from Amazon Mean Forecast,
-    unless either:
-      1) The last 4 weeks of actual sales are effectively zero (e.g. <1), or
-      2) The last 4 weeks of actual sales are lower than the Amazon Mean forecast.
-
-    In either case, we skip the out-of-range fallback logic.
+    Adjust 'MyForecast' if it is too far from Amazon Mean Forecast, unless either:
+      1) The average of the last `window` weeks of actual sales (column 'y') is extremely low (e.g. <1),
+         or
+      2) The average of the last `window` weeks of actual sales is lower than the overall Amazon Mean Forecast.
+    
+    In the case where recent actuals are lower than the Amazon forecast, we compute a dynamic reduction factor:
+    
+         reduction_factor = (average actual over last `window` weeks) / (average Amazon Mean forecast)
+    
+    A minimum reduction factor (e.g. 0.1) is enforced to avoid zeroing out the forecast.
+    
+    The adjusted forecast is then:
+    
+         New Forecast = round(Amazon Mean Forecast × reduction_factor)
+    
+    Optionally, if min_forecast and/or max_forecast are provided, the new forecast is clipped
+    to lie within that range.
+    
+    Otherwise, if dynamic reduction is not triggered, the function proceeds with the usual
+    seasonal adjustment logic.
     """
     global out_of_range_counter
     global out_of_range_stats
 
-    # --------------------------------------------------------------------------
-    # STEP A: Compute last 4-week average actual sales
-    # --------------------------------------------------------------------------
-    last_4_actual = 0
-    if 'y' in comparison.columns:
-        # Sort by ds (date), drop missing, take last 4
-        last_4_rows = comparison.dropna(subset=['y']).sort_values('ds').tail(4)
-        if not last_4_rows.empty:
-            last_4_actual = last_4_rows['y'].mean()
+    # --- Check if the Amazon Mean Forecast column exists ---
+    if 'Amazon Mean Forecast' not in comparison.columns:
+        print(f"Warning: 'Amazon Mean Forecast' column not found for ASIN {asin}. Skipping adjustment.")
+        return comparison
 
-    # --------------------------------------------------------------------------
-    # STEP B: Compute average Amazon Mean forecast if present
-    # --------------------------------------------------------------------------
+    # --- STEP A: Compute average actual sales over the last `window` weeks ---
+    recent_actual_avg = 0
+    if 'y' in comparison.columns:
+        recent_rows = comparison.dropna(subset=['y']).sort_values('ds').tail(window)
+        if not recent_rows.empty:
+            recent_actual_avg = recent_rows['y'].mean()
+
+    # --- STEP B: Compute overall average Amazon Mean Forecast ---
     mean_amz_forecast = 0
-    if 'Amazon Mean Forecast' in comparison.columns and len(comparison) > 0:
+    if len(comparison) > 0:
         mean_amz_forecast = comparison['Amazon Mean Forecast'].mean()
 
-    # --------------------------------------------------------------------------
-    # STEP C: If last_4_actual < 1.0 => skip fallback logic
-    # --------------------------------------------------------------------------
-    if last_4_actual < 1.0:
-        print(f"For ASIN {asin}: Last 4-week actual avg is very low ({last_4_actual:.1f}). "
-              "=> Skipping out-of-range fallback entirely.")
+    # --- STEP C: If recent actuals are lower than the Amazon forecast, apply dynamic reduction ---
+    if mean_amz_forecast > 0 and recent_actual_avg < mean_amz_forecast:
+        reduction_factor = recent_actual_avg / mean_amz_forecast
+        # Enforce a minimum reduction factor (e.g. 0.1)
+        if reduction_factor < 0.1:
+            reduction_factor = 0.1
+        print(f"For ASIN {asin}: Recent {window}-week actual avg = {recent_actual_avg:.1f}, "
+              f"Amazon Mean forecast avg = {mean_amz_forecast:.1f}. "
+              f"Applying dynamic reduction factor {reduction_factor:.2f}.")
+        new_forecast = (comparison['Amazon Mean Forecast'] * reduction_factor).round().clip(lower=0)
+        # Optionally clip new forecast to specified min and max values
+        if min_forecast is not None:
+            new_forecast = new_forecast.clip(lower=min_forecast)
+        if max_forecast is not None:
+            new_forecast = new_forecast.clip(upper=max_forecast)
+        comparison[forecast_col_name] = new_forecast
         return comparison
 
-    # --------------------------------------------------------------------------
-    # STEP D: If last_4_actual < mean_amz_forecast => skip fallback
-    # --------------------------------------------------------------------------
-    if last_4_actual < mean_amz_forecast:
-        print(f"For ASIN {asin}: Last 4-week actual avg ({last_4_actual:.1f}) "
-              f"is below Amazon Mean forecast avg ({mean_amz_forecast:.1f}). "
-              "=> Skipping out-of-range fallback.")
-        return comparison
-
-    # --------------------------------------------------------------------------
-    # EXISTING LOGIC: Seasonal bypass, local threshold, out-of-range adjust
-    # --------------------------------------------------------------------------
-
-    # 1) Flag rows that should bypass the adjustment
+    # --- STEP D: Otherwise, apply existing seasonal bypass and threshold logic ---
     if bypass_seasonality and 'seasonal_cluster' in comparison.columns:
-        # Mark rows where seasonal_cluster indicates a strong effect (e.g., 'high' or 'low')
-        comparison['bypass_adjustment'] = comparison['seasonal_cluster'].apply(
-            lambda x: x in ['high', 'low']
-        )
+        comparison['bypass_adjustment'] = comparison['seasonal_cluster'].apply(lambda x: x in ['high', 'low'])
     else:
         comparison['bypass_adjustment'] = False
 
-    # 2) Compute local threshold based on recent vs overall averages
     if 'y' in comparison.columns:
         recent_5 = comparison.dropna(subset=['y']).sort_values('ds').tail(5)
         last_5_avg = recent_5['y'].mean() if len(recent_5) > 0 else 0
@@ -2553,46 +2563,35 @@ def adjust_forecast_if_out_of_range(
         last_5_avg = 0
         overall_avg = 0
 
-    # If recent sales are below the overall average, loosen threshold to 60%
+    local_threshold = 0.6 if last_5_avg < overall_avg else adjustment_threshold
     if last_5_avg < overall_avg:
-        local_threshold = 0.6
         print(f"Recent 5-week avg is below overall avg, using threshold=60% for ASIN {asin}")
-    else:
-        local_threshold = adjustment_threshold
 
-    # 3) Identify rows out of range, not in seasonal bypass
     condition_adjust = (
         ((comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
          (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold)))
-        & (~comparison['bypass_adjustment'])  # skip if bypassed
+        & (~comparison['bypass_adjustment'])
     )
     comparison['is_out_of_range'] = condition_adjust
 
-    # 4) Apply adjustment only to rows that are not bypassed
     if comparison['is_out_of_range'].any():
         num_adjustments = comparison['is_out_of_range'].sum()
         print(f"Adjusting {num_adjustments} out-of-range forecasts for ASIN {asin}.")
         out_of_range_counter[asin] += num_adjustments
-
-        if asin not in out_of_range_stats:
-            out_of_range_stats[asin] = {'total': 0, 'adjusted': 0}
+        out_of_range_stats.setdefault(asin, {'total': 0, 'adjusted': 0})
         out_of_range_stats[asin]['total'] += len(comparison)
         out_of_range_stats[asin]['adjusted'] += num_adjustments
 
         idx = comparison['is_out_of_range']
-        # Clip the forecast to within (1 ± local_threshold) of Amazon Mean
-        comparison.loc[idx, forecast_col_name] = (
+        # Adjust the forecast values by clipping them to within (1 ± local_threshold) of the Amazon Mean Forecast
+        adjusted_values = (
             comparison.loc[idx, 'Amazon Mean Forecast']
             * comparison.loc[idx, forecast_col_name]
             / comparison.loc[idx, 'Amazon Mean Forecast']
-        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) \
-          * comparison.loc[idx, 'Amazon Mean Forecast']
+        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) * comparison.loc[idx, 'Amazon Mean Forecast']
+        comparison.loc[idx, forecast_col_name] = adjusted_values.clip(lower=0)
 
-        # Ensure non-negative values
-        comparison[forecast_col_name] = comparison[forecast_col_name].clip(lower=0)
-
-    # 5) Clean up temporary column
-    comparison.drop(columns=['bypass_adjustment'], inplace=True)
+    comparison.drop(columns=['bypass_adjustment'], inplace=True, errors='ignore')
     return comparison
 
 
