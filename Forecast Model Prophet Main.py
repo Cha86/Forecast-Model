@@ -2154,8 +2154,6 @@ def generate_combined_weekly_report(consolidated_forecasts):
     print(f"Combined 4-8-16 week report saved to {report_filename}")
 
 def save_consolidated_forecasts(output_path, consolidated_data, base_year=2025):
-    import numpy as np
-    import pandas as pd
     from openpyxl import Workbook
     from openpyxl.utils.dataframe import dataframe_to_rows
 
@@ -3115,7 +3113,6 @@ def compute_sales_slope(historical_sales_52):
 
 
 def generate_low_coverage_report(consolidated_data, coverage_threshold=1.0, output_file="low_inventory_report.xlsx"):
-    import pandas as pd
     
     flagged_rows = []
     
