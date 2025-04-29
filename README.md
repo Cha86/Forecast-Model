@@ -70,7 +70,7 @@ pip install -r requirements.txt     # generated below
 # 3.  Fire it up
 python Forecast\ Model\ Prophet\ Main.py   # or just `python main.py` if you rename
 
-
+```
 
 This is an example of what the output looks like for forecasting sales for one of the Motherboard models:
 ![image](https://github.com/user-attachments/assets/c72c0ba4-9f6f-4071-81e6-55470c523ad9)
