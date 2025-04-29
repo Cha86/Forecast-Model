@@ -5,6 +5,7 @@ Welcome to the Forecast-Model project!
 This repo is home to a robust time series forecasting tool, built primarily using Python's heavy-hitters: Prophet, SARIMA, and a sprinkle of custom optimization magic. It’s designed to predict sales trends, inventory needs, and purchase order (PO) requirements — all while keeping future operations running smoother than a freshly waxed surfboard. 🏄
 
 🚀 Project Purpose
+
 The goal of this project is to forecast future sales and inventory levels for a set of Amazon products (ASINs). This helps businesses:
 
 Plan purchase orders (POs) more efficiently
