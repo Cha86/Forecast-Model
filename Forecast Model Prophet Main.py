@@ -841,11 +841,11 @@ def choose_forecast_model(ts_data, threshold=FALLBACK_THRESHOLD, holidays=None):
         return ("Prophet", "Prophet")
 
 def generate_date_from_week(row):
-    """Convert year-week format into a datetime object for the beginning of that week."""
     week_str = row['week']
-    year = row['year']
-    week_number = int(week_str[1:])
-    return pd.to_datetime(f'{year}-W{week_number - 1}-0', format='%Y-W%U-%w')
+    year     = row['year']
+    week_num = int(week_str[1:])
+    # uses %U (Sunday‐based) and then does week_num-1
+    return pd.to_datetime(f'{year}-W{week_num - 1}-0', format='%Y-W%U-%w')
 
 def generate_date_from_inventory_week(row):
     """
@@ -1732,8 +1732,12 @@ def visualize_forecast_with_comparison(ts_data, comparison, summary_stats,
     plt.gcf().text(0.78, 0.5, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8), va='center')
     plt.subplots_adjust(right=0.75)
 
+    import re
     os.makedirs(folder_name, exist_ok=True)
-    graph_file_path = os.path.join(folder_name, f"{product_title.replace('/', '_')}_{asin}.png")
+
+    # sanitize product_title for Windows filenames
+    safe_title = re.sub(r'[<>:"/\\|?*\s]+', '_', product_title).strip('_')
+    graph_file_path = os.path.join(folder_name, f"{safe_title}_{asin}.png")
     plt.savefig(graph_file_path)
     plt.close()
     print(f"Graph saved to {graph_file_path}")
@@ -2600,20 +2604,23 @@ def adjust_forecast_if_out_of_range(
 
 def log_fallback_triggers(comparison, asin, product_title, fallback_file="fallback_triggers.csv"):
     """
-    Logs products where the fallback mechanism was triggered to a separate file.
+    Logs products where the fallback mechanism was triggered to a separate file,
+    based on the 'is_out_of_range' flag set in adjust_forecast_if_out_of_range().
     """
-    if 'is_still_out_of_range' not in comparison.columns:
-        print(f"No 'is_still_out_of_range' column present in DataFrame for ASIN: {asin}. No fallback to log.")
+    # Look for the flag your adjustment function actually creates:
+    if 'is_out_of_range' not in comparison.columns:
+        print(f"No 'is_out_of_range' column present in DataFrame for ASIN: {asin}. No fallback to log.")
         return
 
-    fallback_rows = comparison[comparison['is_still_out_of_range']]
+    # Rows where we adjusted the forecast
+    fallback_rows = comparison[comparison['is_out_of_range']]
     if not fallback_rows.empty:
         print(f"Outlier detected for ASIN: {asin}, Product: {product_title}")
         fallback_info = {
             "ASIN": [asin],
             "Product Title": [product_title],
-            "Outlier Weeks": [fallback_rows['ds'].tolist()],
-            "Total Adjustments": [fallback_rows.shape[0]]
+            "Outlier Weeks": [fallback_rows.get('ds', fallback_rows.get('Week')).tolist()],
+            "Total Adjustments": [len(fallback_rows)]
         }
 
         fallback_df = pd.DataFrame(fallback_info)
