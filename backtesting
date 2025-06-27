@@ -1,0 +1,104 @@
+# backtesting.py
+
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from math import sqrt
+
+def calculate_extended_metrics(actual, predicted):
+    """
+    Calculate extended metrics (RMSE, wQL, MASE, MAE, WAPE, etc.).
+    """
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    
+    # 1. Root Mean Squared Error (RMSE)
+    rmse = sqrt(mean_squared_error(actual, predicted))
+    
+    # 2. Mean Absolute Error (MAE)
+    mae = mean_absolute_error(actual, predicted)
+    
+    # 3. Weighted Quantile Loss (wQL) and Average wQL
+    alpha = 0.5  # Example quantile; adjust as needed
+    residuals = actual - predicted
+    quantile_loss = np.where(residuals >= 0, alpha * residuals, (1 - alpha) * -residuals)
+    wql = np.sum(np.abs(quantile_loss))
+    avg_wql = np.mean(np.abs(quantile_loss)) if len(quantile_loss) > 0 else 0
+    
+    # 4. Weighted Absolute Percentage Error (WAPE)
+    total_actual = np.sum(np.abs(actual))
+    if total_actual != 0:
+        wape = np.sum(np.abs(actual - predicted)) / total_actual * 100
+    else:
+        wape = 0
+    
+    # 5. Mean Absolute Scaled Error (MASE)
+    if len(actual) > 1:
+        naive_forecast = actual[:-1]
+        actual_shifted = actual[1:]
+        naive_error = np.abs(actual_shifted - naive_forecast)
+        mae_naive = np.mean(naive_error) if len(naive_error) > 0 else 1
+    else:
+        mae_naive = 1  # Avoid division by zero
+    
+    mase = mae / mae_naive if mae_naive != 0 else np.nan
+    
+    return {
+        "RMSE": rmse,
+        "MAE": mae,
+        "wQL": wql,
+        "Average wQL": avg_wql,
+        "MASE": mase,
+        "WAPE": wape
+    }
+
+def backtest_forecast(ts_data, model_function, horizon=16, folder_name="Training and Testing data"):
+    """
+    Perform backtesting by splitting the data into training and testing sets, forecasting, and evaluating.
+    """
+    os.makedirs(folder_name, exist_ok=True)
+    ts_data = ts_data.sort_values('ds').copy()
+    n = len(ts_data)
+    split_idx = int(n * 0.8)
+    train = ts_data.iloc[:split_idx].copy()
+    test = ts_data.iloc[split_idx:].copy()
+
+    fitted_model = model_function(train)
+
+    try:
+        last_date = train['ds'].iloc[-1]
+        steps = len(test)
+        test_forecast_df = pd.DataFrame({
+            'ds': test['ds'],
+            'MyForecast': [train['y'].iloc[-1]] * steps
+        })
+    except Exception as e:
+        print(f"Error in backtest forecasting step: {e}")
+        return
+
+    backtest_comparison = test_forecast_df.merge(test[['ds','y']], on='ds', how='left')
+
+    metrics = calculate_extended_metrics(backtest_comparison['y'], backtest_comparison['MyForecast'])
+    print("Backtest Metrics:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+
+    train_file = os.path.join(folder_name, "training_data.csv")
+    test_file = os.path.join(folder_name, "testing_data.csv")
+    train.to_csv(train_file, index=False)
+    test.to_csv(test_file, index=False)
+
+    plt.figure(figsize=(10,6))
+    plt.plot(train['ds'], train['y'], label='Training', color='blue')
+    plt.plot(test['ds'], test['y'], label='Testing Actual', color='orange')
+    plt.plot(backtest_comparison['ds'], backtest_comparison['MyForecast'], label='Testing Forecast', color='green')
+    plt.legend()
+    plt.title("Backtest: Training vs Testing Forecast")
+    plt.xlabel("Date")
+    plt.ylabel("Values")
+    backtest_plot_path = os.path.join(folder_name, "training_testing_graph.png")
+    plt.savefig(backtest_plot_path)
+    plt.close()
+    print(f"Training/Testing data and graph saved to '{folder_name}'.")

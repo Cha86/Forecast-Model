@@ -1,0 +1,136 @@
+# forecasting_utils.py
+
+import numpy as np
+import pandas as pd
+from math import sqrt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
+from config import (
+    out_of_range_counter,
+    out_of_range_stats,
+    forecast_params_used,
+    changepoint_counter,
+    seasonality_counter,
+    holiday_counter
+)
+
+def ensemble_forecast(sarima_preds, prophet_preds, xgb_preds, amazon_mean_preds, weights):
+    """
+    Create an ensemble forecast by combining multiple model predictions with specified weights.
+    """
+    return (
+        weights[0] * sarima_preds
+        + weights[1] * prophet_preds
+        + weights[2] * xgb_preds
+        + weights[3] * amazon_mean_preds
+    )
+
+def evaluate_forecast(actual, forecast):
+    """
+    Evaluate the forecast using RMSE.
+    """
+    return sqrt(mean_squared_error(actual, forecast))
+
+def adjust_forecast_if_out_of_range(
+    comparison, asin, forecast_col_name='MyForecast', adjustment_threshold=0.3
+):
+    """
+    Adjust 'MyForecast' if it is too far from Amazon Mean Forecast.
+    """
+    # Ensure required Amazon forecast columns are present
+    required_amazon_cols = ['Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast']
+    for col in required_amazon_cols:
+        if col not in comparison.columns:
+            print(f"Warning: Missing column '{col}'. Initializing it with zeros.")
+            comparison[col] = 0
+
+    # Debugging: Print Amazon forecast statistics
+    print("\nAmazon Forecast Statistics for Debugging:")
+    print(comparison[required_amazon_cols].head())
+
+    # Determine the historical median sales if available
+    historical_median = comparison['y'].median() if 'y' in comparison.columns else 0
+
+    # Adjust threshold based on historical sales
+    low_sales_threshold = 20
+    local_threshold = 0.6 if historical_median < low_sales_threshold else adjustment_threshold
+    if historical_median < low_sales_threshold:
+        print(f"Low historical sales detected (median: {historical_median}). Using higher threshold: {local_threshold*100}%")
+
+    # Identify forecasts that are out of the acceptable range
+    comparison['is_out_of_range'] = (
+        (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
+        (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
+    )
+
+    adjustment_mask = comparison['is_out_of_range']
+    total_forecasts = len(comparison)
+
+    if adjustment_mask.any():
+        num_adjustments = adjustment_mask.sum()
+        print(f"\nAdjusting {num_adjustments} out-of-range forecasts for ASIN {asin} using Amazon Mean Forecast.")
+
+        # Update global counters for reporting
+        out_of_range_counter[asin] += num_adjustments
+        if asin not in out_of_range_stats:
+            out_of_range_stats[asin] = {'total': 0, 'adjusted': 0}
+        out_of_range_stats[asin]['total'] += total_forecasts
+        out_of_range_stats[asin]['adjusted'] += num_adjustments
+
+        # Adjust 'MyForecast' to be within the ±30% range of 'Amazon Mean Forecast'
+        comparison.loc[adjustment_mask, forecast_col_name] = (
+            comparison.loc[adjustment_mask, 'Amazon Mean Forecast'] * 
+            comparison.loc[adjustment_mask, forecast_col_name] / 
+            comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
+        ).clip(lower=(1 - local_threshold), upper=(1 + local_threshold)) * comparison.loc[adjustment_mask, 'Amazon Mean Forecast']
+
+        # Ensure 'MyForecast' is non-negative after adjustment
+        comparison[forecast_col_name] = comparison[forecast_col_name].clip(lower=0)
+
+        # Recheck if any forecasts are still out of range after adjustment
+        comparison['is_still_out_of_range'] = (
+            (comparison[forecast_col_name] < comparison['Amazon Mean Forecast'] * (1 - local_threshold)) |
+            (comparison[forecast_col_name] > comparison['Amazon Mean Forecast'] * (1 + local_threshold))
+        )
+
+        if comparison['is_still_out_of_range'].any():
+            print("\nRows still out of range after primary adjustment:")
+            print(comparison.loc[comparison['is_still_out_of_range'], [
+                'ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast',
+                'Amazon P80 Forecast', 'Amazon P90 Forecast'
+            ]])
+
+    # Display adjusted forecasts for out-of-range rows
+    if adjustment_mask.any():
+        print("\nAdjusted forecasts for out-of-range rows:")
+        print(comparison.loc[adjustment_mask, [
+            'ds', forecast_col_name, 'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast'
+        ]])
+
+    # Final adjusted forecast data overview
+    available_columns = [
+        'Week', 'ASIN', forecast_col_name,
+        'Amazon Mean Forecast', 'Amazon P70 Forecast', 'Amazon P80 Forecast', 'Amazon P90 Forecast'
+    ]
+    existing_columns = [col for col in available_columns if col in comparison.columns]
+    if existing_columns:
+        print("\nFinal adjusted forecast data:")
+        print(comparison[existing_columns].head())
+    else:
+        print("Warning: None of the specified columns ('Week', 'ASIN') are in the DataFrame.")
+
+    # Clean up helper columns
+    if 'is_still_out_of_range' in comparison.columns:
+        comparison.drop(columns=['is_still_out_of_range'], inplace=True)
+    if 'is_out_of_range' in comparison.columns:
+        comparison.drop(columns=['is_out_of_range'], inplace=True)
+
+    return comparison
+
+def summarize_usage():
+    """
+    Summarize usage statistics, such as parameter counts and adjustments.
+    """
+    from config import PARAM_COUNTER, POOR_PARAM_FOUND
+    print(f"Total number of parameter sets tested: {PARAM_COUNTER}")
+    if POOR_PARAM_FOUND:
+        print("Note: Early stopping occurred for some ASINs due to poor parameter performance.")
