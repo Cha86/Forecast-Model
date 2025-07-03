@@ -28,6 +28,7 @@ from statsmodels.tsa.seasonal import STL
 from sklearn.cluster import KMeans
 from scipy.stats import linregress
 from math import ceil
+import datetime
 import optuna
 
 warnings.filterwarnings("ignore")
@@ -1223,89 +1224,62 @@ PARAM_COUNTER = 0
 POOR_PARAM_FOUND = False
 EARLY_STOP_THRESHOLD = 10_000
 
-def optimize_prophet_params_with_optuna(ts_data, forecast_data, horizon=16, asin=None, n_trials=30):
+def optimize_prophet_params_with_optuna(
+    ts_data, 
+    forecast_data, 
+    horizon=16, 
+    asin=None, 
+    n_trials=30
+):
     """
-    Use Optuna for Bayesian optimization of Prophet hyperparams.
-    Returns the best set of hyperparameters, plus an optional dictionary of RMSE values.
-
-    Parameters:
-      ts_data (DataFrame): historical time series for this ASIN with columns ['ds','y', ...].
-      forecast_data (dict): a dictionary of Amazon forecast arrays, e.g. {"Mean": [...], "P70": [...]}.
-      horizon (int): forecast horizon in weeks for cross-validation or hold-out tests.
-      asin (str): optional label for logging/feedback.
-      n_trials (int): how many optuna trials to run (the bigger, the more thorough).
-
-    Returns:
-      best_params (dict): best set of hyperparams from the Optuna study
-      best_rmse_values (dict): optional dictionary of model vs. Amazon RMSE metrics
+    Bayesian optimization of Prophet hyperparameters with Optuna,
+    narrower ranges, a monthly seasonality term, and weekly CV.
     """
+    ts_data = ts_data.sort_values('ds').copy()
 
-    # Ensure your time series is sorted and has valid ds,y
-    ts_data = ts_data.copy()
-    ts_data = ts_data.sort_values('ds')
+    # switch to weekly-based CV windows
+    cv_initial = '364 days'    # ~52 weeks
+    cv_period  = '182 days'    # ~26 weeks
+    cv_horizon = '112 days'    # ~16 weeks
 
-    # Optionally define your cross-validation settings
-    cv_initial = '365 days'  # or 52 weeks if weekly data
-    cv_period  = '180 days'  
-    cv_horizon = '90 days'   # you can adjust these if you have enough data
-
-    # 1) Prepare an objective function for Optuna:
     def objective(trial):
-        # Suggest hyperparams from a search space
-        changepoint_prior_scale = trial.suggest_loguniform('changepoint_prior_scale', 0.001, 5.0)
-        seasonality_prior_scale = trial.suggest_loguniform('seasonality_prior_scale', 0.001, 5.0)
-        holidays_prior_scale    = trial.suggest_float('holidays_prior_scale', 0.0, 20.0)
-        seasonality_mode        = trial.suggest_categorical('seasonality_mode', ['additive', 'multiplicative'])
-        
-        # Initialize Prophet with these hyperparams
-        model = Prophet(
+        cps = trial.suggest_loguniform('changepoint_prior_scale', 0.01, 0.5)
+        sps = trial.suggest_loguniform('seasonality_prior_scale', 1.0, 20.0)
+        hps = trial.suggest_float('holidays_prior_scale', 0.0, 10.0)
+        sm  = trial.suggest_categorical('seasonality_mode', ['additive','multiplicative'])
+
+        m = Prophet(
             yearly_seasonality=True,
             weekly_seasonality=True,
             daily_seasonality=False,
-            changepoint_prior_scale=changepoint_prior_scale,
-            seasonality_prior_scale=seasonality_prior_scale,
-            holidays_prior_scale=holidays_prior_scale,
-            seasonality_mode=seasonality_mode,
+            changepoint_prior_scale=cps,
+            seasonality_prior_scale=sps,
+            holidays_prior_scale=hps,
+            seasonality_mode=sm,
             growth='linear'
         )
+        # add our sharper monthly bump
+        m.add_seasonality(name='monthly', period=30.5, fourier_order=5)
 
-        # If you have regressors in your code, add them here EXACTLY as in your final model:
-        # for r in regressor_cols:
-        #     model.add_regressor(r, mode='multiplicative')
-
-        # Fit model
         try:
-            model.fit(ts_data[['ds','y']])
+            m.fit(ts_data[['ds','y']])
         except:
-            # If fit fails for some reason, return a large value => "bad" trial
             return 1e10
 
-        # Prophet cross-validation can fail if there's not enough data => handle it
         try:
-            df_cv = cross_validation(
-                model,
-                initial=cv_initial,
-                period=cv_period,
-                horizon=cv_horizon
-            )
+            df_cv   = cross_validation(m, initial=cv_initial, period=cv_period, horizon=cv_horizon)
             df_perf = performance_metrics(df_cv, rolling_window=1)
-            rmse_val = df_perf['rmse'].iloc[0]
-        except ValueError:
-            # Not enough data or something else => penalize
-            rmse_val = 1e10
+            return df_perf['rmse'].iloc[0]
+        except:
+            return 1e10
 
-        return rmse_val
-
-    # 2) Run the Optuna study
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=n_trials)
 
-    # 3) Extract best hyperparams
     best_params = study.best_trial.params
-    print(f"[Optuna] Best trial RMSE={study.best_trial.value:.4f} for ASIN={asin}, params={best_params}")
+    print(f"[Optuna] Best RMSE={study.best_trial.value:.3f} for ASIN={asin}, params={best_params}")
 
-    # 4) (Optional) Re-train final model on entire ts_data with best_params
-    #    and compute a custom "RMSE vs. Amazon forecasts" if you want
+    # retrain final model with those params + monthly seasonality
     final_model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
@@ -1316,35 +1290,27 @@ def optimize_prophet_params_with_optuna(ts_data, forecast_data, horizon=16, asin
         seasonality_mode=best_params['seasonality_mode'],
         growth='linear'
     )
+    final_model.add_seasonality(name='monthly', period=30.5, fourier_order=5)
     final_model.fit(ts_data[['ds','y']])
 
-    # Quick forecast to compute your custom RMSE with Amazon data:
-    future = pd.date_range(
-        start=ts_data['ds'].max() + pd.Timedelta(weeks=1),
-        periods=horizon,
-        freq='W-SUN'
-    )
-    future_df = pd.DataFrame({'ds': future})
-    forecast = final_model.predict(future_df)
-    # Force integer forecast or round if you like:
-    forecast['MyForecast'] = forecast['yhat'].clip(lower=0).round()
+    # forecast & compare
+    future = pd.DataFrame({
+        'ds': pd.date_range(
+            start=ts_data['ds'].max() + pd.Timedelta(weeks=1),
+            periods=horizon, freq='W-SUN'
+        )
+    })
+    fc = final_model.predict(future)
+    fc['MyForecast'] = fc['yhat'].clip(lower=0).round().astype(int)
 
-    # Compare "MyForecast" vs. Amazon streams:
     best_rmse_values = {}
-    for forecast_type, values in forecast_data.items():
-        # pad or slice the array to horizon
-        horizon_vals = values[:horizon] if len(values) >= horizon else values
-        if len(horizon_vals) < horizon and len(horizon_vals) > 0:
-            horizon_vals = np.pad(horizon_vals, (0,horizon-len(horizon_vals)), 'constant', constant_values=horizon_vals[-1])
-        elif len(horizon_vals) == 0:
-            horizon_vals = np.zeros(horizon, dtype=int)
+    for ftype, vals in forecast_data.items():
+        arr = np.array(vals[:horizon], dtype=int)
+        if len(arr) < horizon:
+            arr = np.pad(arr, (0,horizon-len(arr)), 'edge')
+        best_rmse_values[ftype] = sqrt(mean_squared_error(arr, fc['MyForecast']))
 
-        # compute RMSE
-        rmse = sqrt(mean_squared_error(horizon_vals, forecast['MyForecast']))
-        best_rmse_values[forecast_type] = rmse
-
-    print(f"[Optuna] Average RMSE vs. Amazon streams for ASIN {asin}: {np.mean(list(best_rmse_values.values())):.4f}")
-
+    print(f"[Optuna] Avg RMSE vs Amazon: {np.mean(list(best_rmse_values.values())):.3f}")
     return best_params, best_rmse_values
 
 def forecast_with_optuna_params(ts_data, forecast_data, horizon=16, asin=None, n_trials=30):
